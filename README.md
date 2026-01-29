@@ -1,5 +1,5 @@
 <p align="center">
-  <img alt="1024Chain" src="./docs/static/img/logo.svg" width="120" />
+  <img alt="1024Chain" src="./assets/1024logo-transparent.png" width="120" />
 </p>
 
 <h1 align="center">1024Chain</h1>
