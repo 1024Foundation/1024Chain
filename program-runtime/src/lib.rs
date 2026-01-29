@@ -1,23 +1,32 @@
-#![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(min_specialization))]
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
+#![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 #![deny(clippy::arithmetic_side_effects)]
 #![deny(clippy::indexing_slicing)]
-#![recursion_limit = "2048"]
 
-#[macro_use]
-extern crate eager;
-
-#[macro_use]
-extern crate solana_metrics;
-
-pub use solana_rbpf;
-pub mod compute_budget;
-pub mod compute_budget_processor;
+pub use solana_sbpf;
+pub mod cpi;
+pub mod execution_budget;
 pub mod invoke_context;
 pub mod loaded_programs;
-pub mod log_collector;
-pub mod message_processor;
-pub mod prioritization_fee;
-pub mod runtime_config;
+pub mod mem_pool;
+pub mod memory;
+pub mod serialization;
 pub mod stable_log;
 pub mod sysvar_cache;
-pub mod timings;
+
+// re-exports for macros
+pub mod __private {
+    pub use {
+        solana_account::ReadableAccount, solana_hash::Hash,
+        solana_instruction::error::InstructionError, solana_rent::Rent,
+        solana_transaction_context::TransactionContext,
+    };
+}

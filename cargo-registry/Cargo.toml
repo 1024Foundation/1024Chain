@@ -1,7 +1,7 @@
 [package]
-name = "solana-cargo-registry"
+name = "agave-cargo-registry"
 description = "Solana cargo registry"
-documentation = "https://docs.rs/solana-cargo-registry"
+documentation = "https://docs.rs/agave-cargo-registry"
 version = { workspace = true }
 authors = { workspace = true }
 repository = { workspace = true }
@@ -9,24 +9,37 @@ homepage = { workspace = true }
 license = { workspace = true }
 edition = { workspace = true }
 
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[features]
+default = ["remote-wallet-hidraw"]
+agave-unstable-api = []
+dev-context-only-utils = []
+remote-wallet-hidraw = ["solana-remote-wallet/linux-static-hidraw"]
+remote-wallet-libusb = ["solana-remote-wallet/linux-static-libusb"]
+
 [dependencies]
+agave-logger = { workspace = true }
 clap = { workspace = true }
 flate2 = { workspace = true }
 hex = { workspace = true }
 hyper = { workspace = true, features = ["full"] }
 log = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 solana-clap-utils = { workspace = true }
 solana-cli = { workspace = true }
 solana-cli-config = { workspace = true }
 solana-cli-output = { workspace = true }
-solana-logger = { workspace = true }
-solana-remote-wallet = { workspace = true, features = ["default"] }
+solana-commitment-config = { workspace = true }
+solana-keypair = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-remote-wallet = { workspace = true }
 solana-rpc-client = { workspace = true, features = ["default"] }
 solana-rpc-client-api = { workspace = true }
-solana-sdk = { workspace = true }
+solana-signer = { workspace = true }
 solana-version = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
@@ -34,12 +47,3 @@ tokio = { workspace = true, features = ["full"] }
 toml = { workspace = true }
 
 [dev-dependencies]
-
-[package.metadata.docs.rs]
-targets = ["x86_64-unknown-linux-gnu"]
-
-[build-dependencies]
-rustc_version = { workspace = true }
-
-[features]
-dev-context-only-utils = []

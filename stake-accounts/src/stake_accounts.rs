@@ -1,20 +1,30 @@
-use solana_sdk::{
-    clock::SECONDS_PER_DAY,
-    instruction::Instruction,
-    message::Message,
-    pubkey::Pubkey,
-    stake::{
-        self,
+use {
+    solana_account::{state_traits::StateMut, ReadableAccount},
+    solana_clock::SECONDS_PER_DAY,
+    solana_instruction::Instruction,
+    solana_message::Message,
+    solana_pubkey::Pubkey,
+    solana_stake_interface::{
+        self as stake,
         instruction::{self as stake_instruction, LockupArgs},
-        state::{Authorized, Lockup, StakeAuthorize},
+        state::{Authorized, Lockup, StakeAuthorize, StakeStateV2},
     },
 };
-
 const DAYS_PER_YEAR: f64 = 365.25;
 const SECONDS_PER_YEAR: i64 = (SECONDS_PER_DAY as f64 * DAYS_PER_YEAR) as i64;
 
 pub(crate) fn derive_stake_account_address(base_pubkey: &Pubkey, i: usize) -> Pubkey {
     Pubkey::create_with_seed(base_pubkey, &i.to_string(), &stake::program::id()).unwrap()
+}
+
+fn from<T: ReadableAccount + StateMut<StakeStateV2>>(account: &T) -> Option<StakeStateV2> {
+    account.state().ok()
+}
+
+pub(crate) fn lockup_from<T: ReadableAccount + StateMut<StakeStateV2>>(
+    account: &T,
+) -> Option<Lockup> {
+    from(account).and_then(|state: StakeStateV2| state.lockup())
 }
 
 // Return derived addresses
@@ -283,25 +293,47 @@ pub(crate) fn move_stake_accounts(
 mod tests {
     use {
         super::*,
-        solana_runtime::{bank::Bank, bank_client::BankClient},
-        solana_sdk::{
-            account::{AccountSharedData, ReadableAccount},
-            client::SyncClient,
-            genesis_config::create_genesis_config,
-            signature::{Keypair, Signer},
-            stake::state::StakeStateV2,
-        },
-        solana_stake_program::stake_state,
-        std::sync::Arc,
+        solana_account::{AccountSharedData, ReadableAccount},
+        solana_client_traits::SyncClient,
+        solana_genesis_config::create_genesis_config,
+        solana_keypair::Keypair,
+        solana_runtime::{bank::Bank, bank_client::BankClient, bank_forks::BankForks},
+        solana_signer::Signer,
+        solana_stake_interface::state::StakeStateV2,
+        solana_sysvar::epoch_rewards::EpochRewards,
+        std::sync::{Arc, RwLock},
     };
 
-    fn create_bank(lamports: u64) -> (Arc<Bank>, Keypair, u64, u64) {
+    fn authorized_from(account: &AccountSharedData) -> Option<Authorized> {
+        from(account).and_then(|state: StakeStateV2| state.authorized())
+    }
+
+    fn create_bank(lamports: u64) -> (Arc<Bank>, Arc<RwLock<BankForks>>, Keypair, u64, u64) {
         let (mut genesis_config, mint_keypair) = create_genesis_config(lamports);
-        genesis_config.fee_rate_governor = solana_sdk::fee_calculator::FeeRateGovernor::new(0, 0);
-        let bank = Bank::new_with_bank_forks_for_tests(&genesis_config).0;
+        genesis_config.fee_rate_governor = solana_fee_calculator::FeeRateGovernor::new(0, 0);
+
+        for (pubkey, account) in
+            solana_program_binaries::by_id(&stake::program::id(), &genesis_config.rent)
+                .unwrap()
+                .into_iter()
+        {
+            genesis_config.add_account(pubkey, account);
+        }
+
+        let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        bank.squash();
+        let bank = Bank::new_from_parent(bank, &Pubkey::new_unique(), 1);
+        bank.set_sysvar_for_tests(&EpochRewards::default());
+
         let stake_rent = bank.get_minimum_balance_for_rent_exemption(StakeStateV2::size_of());
         let system_rent = bank.get_minimum_balance_for_rent_exemption(0);
-        (bank, mint_keypair, stake_rent, system_rent)
+        (
+            bank.into(),
+            bank_forks,
+            mint_keypair,
+            stake_rent,
+            system_rent,
+        )
     }
 
     fn create_account<C: SyncClient>(
@@ -348,14 +380,14 @@ mod tests {
                 let address = derive_stake_account_address(base_pubkey, i);
                 let account =
                     AccountSharedData::from(client.get_account(&address).unwrap().unwrap());
-                (address, stake_state::lockup_from(&account).unwrap())
+                (address, lockup_from(&account).unwrap())
             })
             .collect()
     }
 
     #[test]
     fn test_new_derived_stake_account() {
-        let (bank, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
+        let (bank, _bank_forks, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
         let funding_pubkey = funding_keypair.pubkey();
         let bank_client = BankClient::new_shared(bank);
         let fee_payer_keypair = create_account(&bank_client, &funding_keypair, system_rent);
@@ -364,8 +396,8 @@ mod tests {
         let base_keypair = Keypair::new();
         let base_pubkey = base_keypair.pubkey();
         let lamports = stake_rent + 1;
-        let stake_authority_pubkey = solana_sdk::pubkey::new_rand();
-        let withdraw_authority_pubkey = solana_sdk::pubkey::new_rand();
+        let stake_authority_pubkey = solana_pubkey::new_rand();
+        let withdraw_authority_pubkey = solana_pubkey::new_rand();
 
         let message = new_stake_account(
             &fee_payer_pubkey,
@@ -385,14 +417,14 @@ mod tests {
 
         let account = get_account_at(&bank_client, &base_pubkey, 0);
         assert_eq!(account.lamports(), lamports);
-        let authorized = stake_state::authorized_from(&account).unwrap();
+        let authorized = authorized_from(&account).unwrap();
         assert_eq!(authorized.staker, stake_authority_pubkey);
         assert_eq!(authorized.withdrawer, withdraw_authority_pubkey);
     }
 
     #[test]
     fn test_authorize_stake_accounts() {
-        let (bank, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
+        let (bank, _bank_forks, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
         let funding_pubkey = funding_keypair.pubkey();
         let bank_client = BankClient::new_shared(bank);
         let fee_payer_keypair = create_account(&bank_client, &funding_keypair, system_rent);
@@ -423,8 +455,8 @@ mod tests {
             .send_and_confirm_message(&signers, message)
             .unwrap();
 
-        let new_stake_authority_pubkey = solana_sdk::pubkey::new_rand();
-        let new_withdraw_authority_pubkey = solana_sdk::pubkey::new_rand();
+        let new_stake_authority_pubkey = solana_pubkey::new_rand();
+        let new_withdraw_authority_pubkey = solana_pubkey::new_rand();
         let messages = authorize_stake_accounts(
             &fee_payer_pubkey,
             &base_pubkey,
@@ -447,14 +479,14 @@ mod tests {
         }
 
         let account = get_account_at(&bank_client, &base_pubkey, 0);
-        let authorized = stake_state::authorized_from(&account).unwrap();
+        let authorized = authorized_from(&account).unwrap();
         assert_eq!(authorized.staker, new_stake_authority_pubkey);
         assert_eq!(authorized.withdrawer, new_withdraw_authority_pubkey);
     }
 
     #[test]
     fn test_lockup_stake_accounts() {
-        let (bank, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
+        let (bank, _bank_forks, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
         let funding_pubkey = funding_keypair.pubkey();
         let bank_client = BankClient::new_shared(bank);
         let fee_payer_keypair = create_account(&bank_client, &funding_keypair, system_rent);
@@ -507,7 +539,7 @@ mod tests {
         }
 
         let account = get_account_at(&bank_client, &base_pubkey, 0);
-        let lockup = stake_state::lockup_from(&account).unwrap();
+        let lockup = lockup_from(&account).unwrap();
         assert_eq!(lockup.custodian, custodian_pubkey);
         assert_eq!(lockup.unix_timestamp, 1);
         assert_eq!(lockup.epoch, 0);
@@ -545,7 +577,7 @@ mod tests {
 
     #[test]
     fn test_rebase_stake_accounts() {
-        let (bank, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
+        let (bank, _bank_forks, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
         let funding_pubkey = funding_keypair.pubkey();
         let bank_client = BankClient::new_shared(bank);
         let fee_payer_keypair = create_account(&bank_client, &funding_keypair, system_rent);
@@ -601,14 +633,14 @@ mod tests {
 
         // Ensure the new accounts are duplicates of the previous ones.
         let account = get_account_at(&bank_client, &new_base_pubkey, 0);
-        let authorized = stake_state::authorized_from(&account).unwrap();
+        let authorized = authorized_from(&account).unwrap();
         assert_eq!(authorized.staker, stake_authority_pubkey);
         assert_eq!(authorized.withdrawer, withdraw_authority_pubkey);
     }
 
     #[test]
     fn test_move_stake_accounts() {
-        let (bank, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
+        let (bank, _bank_forks, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
         let funding_pubkey = funding_keypair.pubkey();
         let bank_client = BankClient::new_shared(bank);
         let fee_payer_keypair = create_account(&bank_client, &funding_keypair, system_rent);
@@ -642,8 +674,8 @@ mod tests {
 
         let new_base_keypair = Keypair::new();
         let new_base_pubkey = new_base_keypair.pubkey();
-        let new_stake_authority_pubkey = solana_sdk::pubkey::new_rand();
-        let new_withdraw_authority_pubkey = solana_sdk::pubkey::new_rand();
+        let new_stake_authority_pubkey = solana_pubkey::new_rand();
+        let new_withdraw_authority_pubkey = solana_pubkey::new_rand();
         let balances = get_balances(&bank_client, &base_pubkey, num_accounts);
         let messages = move_stake_accounts(
             &fee_payer_pubkey,
@@ -670,7 +702,7 @@ mod tests {
 
         // Ensure the new accounts have the new authorities.
         let account = get_account_at(&bank_client, &new_base_pubkey, 0);
-        let authorized = stake_state::authorized_from(&account).unwrap();
+        let authorized = authorized_from(&account).unwrap();
         assert_eq!(authorized.staker, new_stake_authority_pubkey);
         assert_eq!(authorized.withdrawer, new_withdraw_authority_pubkey);
     }

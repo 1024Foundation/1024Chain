@@ -4,12 +4,11 @@ use {
         keypair::ASK_KEYWORD,
     },
     chrono::DateTime,
-    solana_sdk::{
-        clock::{Epoch, Slot},
-        hash::Hash,
-        pubkey::{Pubkey, MAX_SEED_LEN},
-        signature::{read_keypair_file, Signature},
-    },
+    solana_clock::{Epoch, Slot},
+    solana_hash::Hash,
+    solana_keypair::read_keypair_file,
+    solana_pubkey::{Pubkey, MAX_SEED_LEN},
+    solana_signature::Signature,
     std::{fmt::Display, ops::RangeBounds, str::FromStr},
 };
 
@@ -34,6 +33,7 @@ where
     T: FromStr,
     T::Err: Display,
 {
+    #[allow(deprecated)]
     is_parsable_generic::<T, &str>(string)
 }
 
@@ -67,6 +67,7 @@ where
     note = "please use `clap::value_parser!(Pubkey)` instead"
 )]
 pub fn is_pubkey(string: &str) -> Result<(), String> {
+    #[allow(deprecated)]
     is_parsable_generic::<Pubkey, _>(string)
 }
 
@@ -79,6 +80,7 @@ pub fn is_hash<T>(string: T) -> Result<(), String>
 where
     T: AsRef<str> + Display,
 {
+    #[allow(deprecated)]
     is_parsable_generic::<Hash, _>(string)
 }
 
@@ -99,12 +101,15 @@ where
 // Return an error if a keypair file cannot be parsed
 #[deprecated(
     since = "1.18.0",
-    note = "please use `SignerSourceParserBuilder::default().allow_file_path().allow_prompt().allow_legacy().build()` instead"
+    note = "please use \
+            `SignerSourceParserBuilder::default().allow_file_path().allow_prompt().allow_legacy().\
+            build()` instead"
 )]
 pub fn is_keypair_or_ask_keyword<T>(string: T) -> Result<(), String>
 where
     T: AsRef<str> + Display,
 {
+    #[allow(deprecated)]
     if string.as_ref() == ASK_KEYWORD {
         return Ok(());
     }
@@ -116,16 +121,20 @@ where
 // Return an error if a `SignerSourceKind::Prompt` cannot be parsed
 #[deprecated(
     since = "1.18.0",
-    note = "please use `SignerSourceParserBuilder::default().allow_prompt().allow_legacy().build()` instead"
+    note = "please use \
+            `SignerSourceParserBuilder::default().allow_prompt().allow_legacy().build()` instead"
 )]
 pub fn is_prompt_signer_source(string: &str) -> Result<(), String> {
+    #[allow(deprecated)]
     if string == ASK_KEYWORD {
         return Ok(());
     }
-    match SignerSource::parse(string)
+    #[allow(deprecated)]
+    let signer_source_kind = SignerSource::parse(string)
         .map_err(|err| format!("{err}"))?
-        .kind
-    {
+        .kind;
+    match signer_source_kind {
+        #[allow(deprecated)]
         SignerSourceKind::Prompt => Ok(()),
         _ => Err(format!(
             "Unable to parse input as `prompt:` URI scheme or `ASK` keyword: {string}"
@@ -136,7 +145,9 @@ pub fn is_prompt_signer_source(string: &str) -> Result<(), String> {
 // Return an error if string cannot be parsed as pubkey string or keypair file location
 #[deprecated(
     since = "1.18.0",
-    note = "please use `SignerSourceParserBuilder::default().allow_pubkey().allow_file_path().build()` instead"
+    note = "please use \
+            `SignerSourceParserBuilder::default().allow_pubkey().allow_file_path().build()` \
+            instead"
 )]
 #[allow(deprecated)]
 pub fn is_pubkey_or_keypair<T>(string: T) -> Result<(), String>
@@ -150,7 +161,7 @@ where
 // produce a pubkey()
 #[deprecated(
     since = "1.18.0",
-    note = "please use `SignerSourceParserBuilder::default().allow_pubkey().allow_file_path().build()` instead"
+    note = "please use `SignerSourceParserBuilder::default().allow_all().build()` instead"
 )]
 #[allow(deprecated)]
 pub fn is_valid_pubkey<T>(string: T) -> Result<(), String>
@@ -176,7 +187,7 @@ where
 // also provided and correct happens in parsing, not in validation.
 #[deprecated(
     since = "1.18.0",
-    note = "please use `SignerSourceParserBuilder::default().build()` instead"
+    note = "please use `SignerSourceParserBuilder::default().allow_all().build()` instead"
 )]
 #[allow(deprecated)]
 pub fn is_valid_signer<T>(string: T) -> Result<(), String>
@@ -239,7 +250,9 @@ pub fn is_url_or_moniker<T>(string: T) -> Result<(), String>
 where
     T: AsRef<str> + Display,
 {
-    match url::Url::parse(&normalize_to_url_if_moniker(string.as_ref())) {
+    #[allow(deprecated)]
+    let normalized = normalize_to_url_if_moniker(string.as_ref());
+    match url::Url::parse(&normalized) {
         Ok(url) => {
             if url.has_host() {
                 Ok(())
@@ -270,6 +283,7 @@ pub fn is_epoch<T>(epoch: T) -> Result<(), String>
 where
     T: AsRef<str> + Display,
 {
+    #[allow(deprecated)]
     is_parsable_generic::<Epoch, _>(epoch)
 }
 
@@ -281,6 +295,7 @@ pub fn is_slot<T>(slot: T) -> Result<(), String>
 where
     T: AsRef<str> + Display,
 {
+    #[allow(deprecated)]
     is_parsable_generic::<Slot, _>(slot)
 }
 
@@ -309,6 +324,7 @@ pub fn is_port<T>(port: T) -> Result<(), String>
 where
     T: AsRef<str> + Display,
 {
+    #[allow(deprecated)]
     is_parsable_generic::<u16, _>(port)
 }
 

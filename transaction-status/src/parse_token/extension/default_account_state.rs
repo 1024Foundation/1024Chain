@@ -1,6 +1,7 @@
 use {
     super::*,
-    spl_token_2022::extension::default_account_state::instruction::{
+    solana_account_decoder::parse_token::convert_account_state,
+    spl_token_2022_interface::extension::default_account_state::instruction::{
         decode_instruction, DefaultAccountStateInstruction,
     },
 };
@@ -22,7 +23,7 @@ pub(in crate::parse_token) fn parse_default_account_state_instruction(
                 instruction_type: format!("initialize{instruction_type}"),
                 info: json!({
                     "mint": account_keys[account_indexes[0] as usize].to_string(),
-                    "accountState": UiAccountState::from(account_state),
+                    "accountState": convert_account_state(account_state),
                 }),
             })
         }
@@ -30,7 +31,7 @@ pub(in crate::parse_token) fn parse_default_account_state_instruction(
             check_num_token_accounts(account_indexes, 2)?;
             let mut value = json!({
                 "mint": account_keys[account_indexes[0] as usize].to_string(),
-                "accountState": UiAccountState::from(account_state),
+                "accountState": convert_account_state(account_state),
             });
             let map = value.as_object_mut().unwrap();
             parse_signers(
@@ -53,12 +54,12 @@ pub(in crate::parse_token) fn parse_default_account_state_instruction(
 mod test {
     use {
         super::*,
-        solana_sdk::pubkey::Pubkey,
-        spl_token_2022::{
+        solana_message::Message,
+        solana_pubkey::Pubkey,
+        spl_token_2022_interface::{
             extension::default_account_state::instruction::{
                 initialize_default_account_state, update_default_account_state,
             },
-            solana_program::message::Message,
             state::AccountState,
         },
     };
@@ -67,7 +68,7 @@ mod test {
     fn test_parse_default_account_state_instruction() {
         let mint_pubkey = Pubkey::new_unique();
         let init_default_account_state_ix = initialize_default_account_state(
-            &spl_token_2022::id(),
+            &spl_token_2022_interface::id(),
             &mint_pubkey,
             &AccountState::Frozen,
         )
@@ -92,7 +93,7 @@ mod test {
         // Single mint freeze_authority
         let mint_freeze_authority = Pubkey::new_unique();
         let update_default_account_state_ix = update_default_account_state(
-            &spl_token_2022::id(),
+            &spl_token_2022_interface::id(),
             &mint_pubkey,
             &mint_freeze_authority,
             &[],
@@ -122,7 +123,7 @@ mod test {
         let multisig_signer0 = Pubkey::new_unique();
         let multisig_signer1 = Pubkey::new_unique();
         let update_default_account_state_ix = update_default_account_state(
-            &spl_token_2022::id(),
+            &spl_token_2022_interface::id(),
             &mint_pubkey,
             &multisig_pubkey,
             &[&multisig_signer0, &multisig_signer1],

@@ -1,21 +1,19 @@
 use {
-    crate::bench_tps_client::*,
     log::*,
     rayon::prelude::*,
+    solana_commitment_config::CommitmentConfig,
+    solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_core::gen_keys::GenKeys,
+    solana_hash::Hash,
+    solana_keypair::Keypair,
     solana_measure::measure::Measure,
-    solana_sdk::{
-        commitment_config::CommitmentConfig,
-        compute_budget::ComputeBudgetInstruction,
-        hash::Hash,
-        message::Message,
-        nonce::State,
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-        signer::signers::Signers,
-        system_instruction,
-        transaction::Transaction,
-    },
+    solana_message::Message,
+    solana_nonce::state::State,
+    solana_pubkey::Pubkey,
+    solana_signer::{signers::Signers, Signer},
+    solana_system_interface::instruction as system_instruction,
+    solana_tps_client::*,
+    solana_transaction::Transaction,
     std::{
         collections::HashSet,
         marker::Send,
@@ -28,12 +26,12 @@ use {
     },
 };
 
-pub fn get_latest_blockhash<T: BenchTpsClient + ?Sized>(client: &T) -> Hash {
+pub fn get_latest_blockhash<T: TpsClient + ?Sized>(client: &T) -> Hash {
     loop {
         match client.get_latest_blockhash() {
             Ok(blockhash) => return blockhash,
             Err(err) => {
-                info!("Couldn't get last blockhash: {:?}", err);
+                info!("Couldn't get last blockhash: {err:?}");
                 sleep(Duration::from_secs(1));
             }
         };
@@ -59,7 +57,7 @@ pub fn generate_keypairs(seed_keypair: &Keypair, count: u64) -> (Vec<Keypair>, u
 /// fund the dests keys by spending all of the source keys into MAX_SPENDS_PER_TX
 /// on every iteration.  This allows us to replay the transfers because the source is either empty,
 /// or full
-pub fn fund_keys<T: 'static + BenchTpsClient + Send + Sync + ?Sized>(
+pub fn fund_keys<T: 'static + TpsClient + Send + Sync + ?Sized>(
     client: Arc<T>,
     source: &Keypair,
     dests: &[Keypair],
@@ -99,7 +97,7 @@ pub fn fund_keys<T: 'static + BenchTpsClient + Send + Sync + ?Sized>(
     }
 }
 
-pub fn generate_durable_nonce_accounts<T: 'static + BenchTpsClient + Send + Sync + ?Sized>(
+pub fn generate_durable_nonce_accounts<T: 'static + TpsClient + Send + Sync + ?Sized>(
     client: Arc<T>,
     authority_keypairs: &[Keypair],
 ) -> Vec<Keypair> {
@@ -112,7 +110,7 @@ pub fn generate_durable_nonce_accounts<T: 'static + BenchTpsClient + Send + Sync
     let (mut nonce_keypairs, _extra) = generate_keypairs(seed_keypair, count as u64);
     nonce_keypairs.truncate(count);
 
-    info!("Creating {} nonce accounts...", count);
+    info!("Creating {count} nonce accounts...");
     let to_fund: Vec<NonceCreateSigners> = authority_keypairs
         .iter()
         .zip(nonce_keypairs.iter())
@@ -126,7 +124,7 @@ pub fn generate_durable_nonce_accounts<T: 'static + BenchTpsClient + Send + Sync
     nonce_keypairs
 }
 
-pub fn withdraw_durable_nonce_accounts<T: 'static + BenchTpsClient + Send + Sync + ?Sized>(
+pub fn withdraw_durable_nonce_accounts<T: 'static + TpsClient + Send + Sync + ?Sized>(
     client: Arc<T>,
     authority_keypairs: &[Keypair],
     nonce_keypairs: &[Keypair],
@@ -149,7 +147,7 @@ const MAX_SPENDS_PER_TX: u64 = 4;
 // assume 4MB network buffers, and 512 byte packets
 const FUND_CHUNK_LEN: usize = 4 * 1024 * 1024 / 512;
 
-fn verify_funding_transfer<T: BenchTpsClient + ?Sized>(
+fn verify_funding_transfer<T: TpsClient + ?Sized>(
     client: &Arc<T>,
     tx: &Transaction,
     amount: u64,
@@ -157,7 +155,7 @@ fn verify_funding_transfer<T: BenchTpsClient + ?Sized>(
     for a in &tx.message().account_keys[1..] {
         match client.get_balance_with_commitment(a, CommitmentConfig::processed()) {
             Ok(balance) => return balance >= amount,
-            Err(err) => error!("failed to get balance {:?}", err),
+            Err(err) => error!("failed to get balance {err:?}"),
         }
     }
     false
@@ -173,11 +171,11 @@ trait SendBatchTransactions<'a, T: Sliceable + Send + Sync> {
     );
     fn send_transactions<C, F>(&mut self, client: &Arc<C>, to_lamports: u64, log_progress: F)
     where
-        C: 'static + BenchTpsClient + Send + Sync + ?Sized,
+        C: 'static + TpsClient + Send + Sync + ?Sized,
         F: Fn(usize, usize);
     fn sign(&mut self, blockhash: Hash);
-    fn send<C: BenchTpsClient + ?Sized>(&self, client: &Arc<C>);
-    fn verify<C: 'static + BenchTpsClient + Send + Sync + ?Sized>(
+    fn send<C: TpsClient + ?Sized>(&self, client: &Arc<C>);
+    fn verify<C: 'static + TpsClient + Send + Sync + ?Sized>(
         &mut self,
         client: &Arc<C>,
         to_lamports: u64,
@@ -193,7 +191,7 @@ trait Sliceable {
     fn get_pubkey(&self) -> Pubkey;
 }
 
-impl<'a, T: Sliceable + Send + Sync> SendBatchTransactions<'a, T> for Vec<(T, Transaction)>
+impl<T: Sliceable + Send + Sync> SendBatchTransactions<'_, T> for Vec<(T, Transaction)>
 where
     <T as Sliceable>::Slice: Signers,
 {
@@ -211,7 +209,7 @@ where
 
     fn send_transactions<C, F>(&mut self, client: &Arc<C>, to_lamports: u64, log_progress: F)
     where
-        C: 'static + BenchTpsClient + Send + Sync + ?Sized,
+        C: 'static + TpsClient + Send + Sync + ?Sized,
         F: Fn(usize, usize),
     {
         let mut tries: usize = 0;
@@ -233,7 +231,7 @@ where
             //  retry
             tries += 1;
         }
-        info!("transactions sent in {} tries", tries);
+        info!("transactions sent in {tries} tries");
     }
 
     fn sign(&mut self, blockhash: Hash) {
@@ -245,7 +243,7 @@ where
         debug!("sign {} txs: {}us", self.len(), sign_txs.as_us());
     }
 
-    fn send<C: BenchTpsClient + ?Sized>(&self, client: &Arc<C>) {
+    fn send<C: TpsClient + ?Sized>(&self, client: &Arc<C>) {
         let mut send_txs = Measure::start("send_and_clone_txs");
         let batch: Vec<_> = self.iter().map(|(_keypair, tx)| tx.clone()).collect();
         let result = client.send_batch(batch);
@@ -257,7 +255,7 @@ where
         }
     }
 
-    fn verify<C: 'static + BenchTpsClient + Send + Sync + ?Sized>(
+    fn verify<C: 'static + TpsClient + Send + Sync + ?Sized>(
         &mut self,
         client: &Arc<C>,
         to_lamports: u64,
@@ -297,16 +295,16 @@ where
                     if failed_verify > 100 && failed_verify > verified_txs {
                         too_many_failures.store(true, Ordering::Relaxed);
                         warn!(
-                            "Too many failed transfers... {} remaining, {} verified, {} failures",
-                            remaining_count, verified_txs, failed_verify
+                            "Too many failed transfers... {remaining_count} remaining, \
+                             {verified_txs} verified, {failed_verify} failures"
                         );
                     }
                     if remaining_count > 0 {
                         let mut time_l = time.lock().unwrap();
                         if time_l.elapsed().as_secs() > 2 {
                             info!(
-                                "Verifying transfers... {} remaining, {} verified, {} failures",
-                                remaining_count, verified_txs, failed_verify
+                                "Verifying transfers... {remaining_count} remaining, \
+                                 {verified_txs} verified, {failed_verify} failures"
                             );
                             *time_l = Instant::now();
                         }
@@ -326,8 +324,8 @@ where
             let failed_verify = failed_verify.load(Ordering::Relaxed);
             let remaining_count = starting_txs.saturating_sub(verified_txs + failed_verify);
             info!(
-                "Verifying transfers... {} remaining, {} verified, {} failures",
-                remaining_count, verified_txs, failed_verify
+                "Verifying transfers... {remaining_count} remaining, {verified_txs} verified, \
+                 {failed_verify} failures"
             );
             sleep(Duration::from_millis(100));
         }
@@ -349,7 +347,7 @@ impl<'a> Sliceable for FundingSigners<'a> {
 }
 
 trait FundingTransactions<'a>: SendBatchTransactions<'a, FundingSigners<'a>> {
-    fn fund<T: 'static + BenchTpsClient + Send + Sync + ?Sized>(
+    fn fund<T: 'static + TpsClient + Send + Sync + ?Sized>(
         &mut self,
         client: &Arc<T>,
         to_fund: &FundingChunk<'a>,
@@ -359,7 +357,7 @@ trait FundingTransactions<'a>: SendBatchTransactions<'a, FundingSigners<'a>> {
 }
 
 impl<'a> FundingTransactions<'a> for FundingContainer<'a> {
-    fn fund<T: 'static + BenchTpsClient + Send + Sync + ?Sized>(
+    fn fund<T: 'static + TpsClient + Send + Sync + ?Sized>(
         &mut self,
         client: &Arc<T>,
         to_fund: &FundingChunk<'a>,
@@ -411,7 +409,7 @@ impl<'a> Sliceable for NonceCreateSigners<'a> {
 }
 
 trait NonceTransactions<'a>: SendBatchTransactions<'a, NonceCreateSigners<'a>> {
-    fn create_accounts<T: 'static + BenchTpsClient + Send + Sync + ?Sized>(
+    fn create_accounts<T: 'static + TpsClient + Send + Sync + ?Sized>(
         &mut self,
         client: &Arc<T>,
         to_fund: &'a NonceCreateChunk<'a>,
@@ -420,7 +418,7 @@ trait NonceTransactions<'a>: SendBatchTransactions<'a, NonceCreateSigners<'a>> {
 }
 
 impl<'a> NonceTransactions<'a> for NonceCreateContainer<'a> {
-    fn create_accounts<T: 'static + BenchTpsClient + Send + Sync + ?Sized>(
+    fn create_accounts<T: 'static + TpsClient + Send + Sync + ?Sized>(
         &mut self,
         client: &Arc<T>,
         to_fund: &'a NonceCreateChunk<'a>,
@@ -468,14 +466,14 @@ impl<'a> Sliceable for NonceWithdrawSigners<'a> {
 }
 
 trait NonceWithdrawTransactions<'a>: SendBatchTransactions<'a, NonceWithdrawSigners<'a>> {
-    fn withdraw_accounts<T: 'static + BenchTpsClient + Send + Sync + ?Sized>(
+    fn withdraw_accounts<T: 'static + TpsClient + Send + Sync + ?Sized>(
         &mut self,
         client: &Arc<T>,
         to_withdraw: &'a NonceWithdrawChunk<'a>,
     );
 }
 impl<'a> NonceWithdrawTransactions<'a> for NonceWithdrawContainer<'a> {
-    fn withdraw_accounts<T: 'static + BenchTpsClient + Send + Sync + ?Sized>(
+    fn withdraw_accounts<T: 'static + TpsClient + Send + Sync + ?Sized>(
         &mut self,
         client: &Arc<T>,
         to_withdraw: &'a NonceWithdrawChunk<'a>,

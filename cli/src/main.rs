@@ -212,6 +212,10 @@ pub fn parse_args<'a>(
         !DEFAULT_TPU_ENABLE_UDP
     };
 
+    let skip_preflight = matches.is_present("skip_preflight");
+
+    let use_tpu_client = matches.is_present("use_tpu_client");
+
     Ok((
         CliConfig {
             command,
@@ -225,19 +229,21 @@ pub fn parse_args<'a>(
             output_format,
             commitment,
             send_transaction_config: RpcSendTransactionConfig {
+                skip_preflight,
                 preflight_commitment: Some(commitment.commitment),
                 ..RpcSendTransactionConfig::default()
             },
             confirm_transaction_initial_timeout,
             address_labels,
             use_quic,
+            use_tpu_client,
         },
         signers,
     ))
 }
 
 fn main() -> Result<(), Box<dyn error::Error>> {
-    solana_logger::setup_with_default("off");
+    agave_logger::setup_with_default("off");
     let matches = get_clap_app(
         crate_name!(),
         crate_description!(),

@@ -1,39 +1,38 @@
 use {
     super::leader_slot_timing_metrics::LeaderExecuteAndCommitTimings,
     itertools::Itertools,
+    solana_cost_model::cost_model::CostModel,
     solana_ledger::{
-        blockstore_processor::TransactionStatusSender, token_balances::collect_token_balances,
+        blockstore_processor::TransactionStatusSender,
+        transaction_balances::compile_collected_balances,
     },
     solana_measure::measure_us,
     solana_runtime::{
-        bank::{Bank, CommitTransactionCounts, TransactionBalancesSet},
+        bank::{Bank, ProcessedTransactionCounts},
         bank_utils,
         prioritization_fee_cache::PrioritizationFeeCache,
         transaction_batch::TransactionBatch,
+        vote_sender_types::ReplayVoteSender,
     },
-    solana_sdk::{hash::Hash, pubkey::Pubkey, saturating_add_assign},
+    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
     solana_svm::{
-        account_loader::TransactionLoadResult,
-        transaction_results::{TransactionExecutionResult, TransactionResults},
+        transaction_balances::BalanceCollector,
+        transaction_commit_result::{TransactionCommitResult, TransactionCommitResultExtensions},
+        transaction_processing_result::TransactionProcessingResult,
     },
-    solana_transaction_status::{
-        token_balances::TransactionTokenBalancesSet, TransactionTokenBalance,
-    },
-    solana_vote::vote_sender_types::ReplayVoteSender,
-    std::{collections::HashMap, sync::Arc},
+    solana_transaction_error::TransactionError,
+    std::{num::Saturating, sync::Arc},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommitTransactionDetails {
-    Committed { compute_units: u64 },
-    NotCommitted,
-}
-
-#[derive(Default)]
-pub(super) struct PreBalanceInfo {
-    pub native: Vec<Vec<u64>>,
-    pub token: Vec<Vec<TransactionTokenBalance>>,
-    pub mint_decimals: HashMap<Pubkey, u8>,
+    Committed {
+        compute_units: u64,
+        loaded_accounts_data_size: u32,
+        fee_payer_post_balance: u64,
+        result: Result<(), TransactionError>,
+    },
+    NotCommitted(TransactionError),
 }
 
 #[derive(Clone)]
@@ -60,73 +59,63 @@ impl Committer {
         self.transaction_status_sender.is_some()
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn commit_transactions(
         &self,
-        batch: &TransactionBatch,
-        loaded_transactions: &mut [TransactionLoadResult],
-        execution_results: Vec<TransactionExecutionResult>,
-        last_blockhash: Hash,
-        lamports_per_signature: u64,
+        batch: &TransactionBatch<impl TransactionWithMeta>,
+        processing_results: Vec<TransactionProcessingResult>,
         starting_transaction_index: Option<usize>,
-        bank: &Arc<Bank>,
-        pre_balance_info: &mut PreBalanceInfo,
+        bank: &Bank,
+        balance_collector: Option<BalanceCollector>,
         execute_and_commit_timings: &mut LeaderExecuteAndCommitTimings,
-        signature_count: u64,
-        executed_transactions_count: usize,
-        executed_non_vote_transactions_count: usize,
-        executed_with_successful_result_count: usize,
+        processed_counts: &ProcessedTransactionCounts,
     ) -> (u64, Vec<CommitTransactionDetails>) {
-        let executed_transactions = execution_results
-            .iter()
-            .zip(batch.sanitized_transactions())
-            .filter_map(|(execution_result, tx)| execution_result.was_executed().then_some(tx))
-            .collect_vec();
-
-        let (tx_results, commit_time_us) = measure_us!(bank.commit_transactions(
+        let (commit_results, commit_time_us) = measure_us!(bank.commit_transactions(
             batch.sanitized_transactions(),
-            loaded_transactions,
-            execution_results,
-            last_blockhash,
-            lamports_per_signature,
-            CommitTransactionCounts {
-                committed_transactions_count: executed_transactions_count as u64,
-                committed_non_vote_transactions_count: executed_non_vote_transactions_count as u64,
-                committed_with_failure_result_count: executed_transactions_count
-                    .saturating_sub(executed_with_successful_result_count)
-                    as u64,
-                signature_count,
-            },
+            processing_results,
+            processed_counts,
             &mut execute_and_commit_timings.execute_timings,
         ));
         execute_and_commit_timings.commit_us = commit_time_us;
 
-        let commit_transaction_statuses = tx_results
-            .execution_results
+        let commit_transaction_statuses = commit_results
             .iter()
-            .map(|execution_result| match execution_result.details() {
-                Some(details) => CommitTransactionDetails::Committed {
-                    compute_units: details.executed_units,
+            .map(|commit_result| match commit_result {
+                // reports actual execution CUs, and actual loaded accounts size for
+                // transaction committed to block. qos_service uses these information to adjust
+                // reserved block space.
+                Ok(committed_tx) => CommitTransactionDetails::Committed {
+                    compute_units: committed_tx.executed_units,
+                    loaded_accounts_data_size: committed_tx
+                        .loaded_account_stats
+                        .loaded_accounts_data_size,
+                    result: committed_tx.status.clone(),
+                    fee_payer_post_balance: committed_tx.fee_payer_post_balance,
                 },
-                None => CommitTransactionDetails::NotCommitted,
+                Err(err) => CommitTransactionDetails::NotCommitted(err.clone()),
             })
             .collect();
 
         let ((), find_and_send_votes_us) = measure_us!({
             bank_utils::find_and_send_votes(
                 batch.sanitized_transactions(),
-                &tx_results,
+                &commit_results,
                 Some(&self.replay_vote_sender),
             );
+
+            let committed_transactions = commit_results
+                .iter()
+                .zip(batch.sanitized_transactions())
+                .filter_map(|(commit_result, tx)| commit_result.was_committed().then_some(tx));
+            self.prioritization_fee_cache
+                .update(bank, committed_transactions);
+
             self.collect_balances_and_send_status_batch(
-                tx_results,
+                commit_results,
                 bank,
                 batch,
-                pre_balance_info,
+                balance_collector,
                 starting_transaction_index,
             );
-            self.prioritization_fee_cache
-                .update(bank, executed_transactions.into_iter());
         });
         execute_and_commit_timings.find_and_send_votes_us = find_and_send_votes_us;
         (commit_time_us, commit_transaction_statuses)
@@ -134,44 +123,66 @@ impl Committer {
 
     fn collect_balances_and_send_status_batch(
         &self,
-        tx_results: TransactionResults,
-        bank: &Arc<Bank>,
-        batch: &TransactionBatch,
-        pre_balance_info: &mut PreBalanceInfo,
+        commit_results: Vec<TransactionCommitResult>,
+        bank: &Bank,
+        batch: &TransactionBatch<impl TransactionWithMeta>,
+        balance_collector: Option<BalanceCollector>,
         starting_transaction_index: Option<usize>,
     ) {
         if let Some(transaction_status_sender) = &self.transaction_status_sender {
-            let txs = batch.sanitized_transactions().to_vec();
-            let post_balances = bank.collect_balances(batch);
-            let post_token_balances =
-                collect_token_balances(bank, batch, &mut pre_balance_info.mint_decimals);
-            let mut transaction_index = starting_transaction_index.unwrap_or_default();
-            let batch_transaction_indexes: Vec<_> = tx_results
-                .execution_results
+            let sanitized_transactions = batch.sanitized_transactions();
+
+            // Clone `SanitizedTransaction` out of `RuntimeTransaction`, this is
+            // done to send over the status sender.
+            let txs = sanitized_transactions
                 .iter()
-                .map(|result| {
-                    if result.was_executed() {
-                        let this_transaction_index = transaction_index;
-                        saturating_add_assign!(transaction_index, 1);
-                        this_transaction_index
+                .map(|tx| tx.as_sanitized_transaction().into_owned())
+                .collect_vec();
+            let mut transaction_index = Saturating(starting_transaction_index.unwrap_or_default());
+            let (batch_transaction_indexes, tx_costs): (Vec<_>, Vec<_>) = commit_results
+                .iter()
+                .zip(sanitized_transactions.iter())
+                .map(|(commit_result, tx)| {
+                    if let Ok(committed_tx) = commit_result {
+                        let Saturating(this_transaction_index) = transaction_index;
+                        transaction_index += 1;
+
+                        let tx_cost = Some(
+                            CostModel::calculate_cost_for_executed_transaction(
+                                tx,
+                                committed_tx.executed_units,
+                                committed_tx.loaded_account_stats.loaded_accounts_data_size,
+                                &bank.feature_set,
+                            )
+                            .sum(),
+                        );
+
+                        (this_transaction_index, tx_cost)
                     } else {
-                        0
+                        (0, Some(0))
                     }
                 })
-                .collect();
+                .unzip();
+
+            // There are two cases where balance_collector could be None:
+            // * Balance recording is disabled. If that were the case, there would
+            //   be no TransactionStatusSender, and we would not be in this branch.
+            // * The batch was aborted in its entirety in SVM. In that case, there
+            //   would be zero processed transactions, and commit_transactions()
+            //   would not have been called at all.
+            // Therefore this should always be true.
+            debug_assert!(balance_collector.is_some());
+
+            let (balances, token_balances) =
+                compile_collected_balances(balance_collector.unwrap_or_default());
+
             transaction_status_sender.send_transaction_status_batch(
-                bank.clone(),
+                bank.slot(),
                 txs,
-                tx_results.execution_results,
-                TransactionBalancesSet::new(
-                    std::mem::take(&mut pre_balance_info.native),
-                    post_balances,
-                ),
-                TransactionTokenBalancesSet::new(
-                    std::mem::take(&mut pre_balance_info.token),
-                    post_token_balances,
-                ),
-                tx_results.rent_debits,
+                commit_results,
+                balances,
+                token_balances,
+                tx_costs,
                 batch_transaction_indexes,
             );
         }

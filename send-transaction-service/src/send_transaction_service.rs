@@ -1,25 +1,27 @@
 use {
-    crate::tpu_info::TpuInfo,
-    crossbeam_channel::{Receiver, RecvTimeoutError},
-    log::*,
-    solana_client::{
-        connection_cache::{ConnectionCache, Protocol},
-        tpu_connection::TpuConnection,
-    },
-    solana_measure::measure::Measure,
-    solana_runtime::{bank::Bank, bank_forks::BankForks},
-    solana_sdk::{
-        clock::Slot, hash::Hash, nonce_account, pubkey::Pubkey, saturating_add_assign,
-        signature::Signature, timing::AtomicInterval, transport::TransportError,
-    },
-    std::{
-        collections::{
-            hash_map::{Entry, HashMap},
-            HashSet,
+    crate::{
+        send_transaction_service_stats::{
+            SendTransactionServiceStats, SendTransactionServiceStatsReport,
         },
+        transaction_client::TransactionClient,
+    },
+    crossbeam_channel::{Receiver, RecvTimeoutError},
+    itertools::Itertools,
+    log::*,
+    solana_hash::Hash,
+    solana_nonce_account as nonce_account,
+    solana_pubkey::Pubkey,
+    solana_runtime::{
+        bank::Bank,
+        bank_forks::{BankForks, BankPair},
+    },
+    solana_signature::Signature,
+    std::{
+        collections::hash_map::{Entry, HashMap},
         net::SocketAddr,
+        num::Saturating,
         sync::{
-            atomic::{AtomicBool, AtomicU64, Ordering},
+            atomic::{AtomicBool, Ordering},
             Arc, Mutex, RwLock,
         },
         thread::{self, sleep, Builder, JoinHandle},
@@ -62,7 +64,9 @@ pub struct SendTransactionService {
 }
 
 pub struct TransactionInfo {
+    pub message_hash: Hash,
     pub signature: Signature,
+    pub blockhash: Hash,
     pub wire_transaction: Vec<u8>,
     pub last_valid_block_height: u64,
     pub durable_nonce_info: Option<(Pubkey, Hash)>,
@@ -74,7 +78,9 @@ pub struct TransactionInfo {
 
 impl TransactionInfo {
     pub fn new(
+        message_hash: Hash,
         signature: Signature,
+        blockhash: Hash,
         wire_transaction: Vec<u8>,
         last_valid_block_height: u64,
         durable_nonce_info: Option<(Pubkey, Hash)>,
@@ -82,7 +88,9 @@ impl TransactionInfo {
         last_sent_time: Option<Instant>,
     ) -> Self {
         Self {
+            message_hash,
             signature,
+            blockhash,
             wire_transaction,
             last_valid_block_height,
             durable_nonce_info,
@@ -90,6 +98,16 @@ impl TransactionInfo {
             retries: 0,
             last_sent_time,
         }
+    }
+
+    fn get_max_retries(
+        &self,
+        default_max_retries: Option<usize>,
+        service_max_retries: usize,
+    ) -> Option<usize> {
+        self.max_retries
+            .or(default_max_retries)
+            .map(|max_retries| max_retries.min(service_max_retries))
     }
 }
 
@@ -101,9 +119,10 @@ struct ProcessTransactionsResult {
     max_retries_elapsed: u64,
     failed: u64,
     retained: u64,
+    last_sent_time: Option<Instant>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub retry_rate_ms: u64,
     pub leader_forward_count: u64,
@@ -137,232 +156,11 @@ impl Default for Config {
 /// processing the transactions that need to be retried.
 pub const MAX_RETRY_SLEEP_MS: u64 = 1000;
 
-/// The leader info refresh rate.
-pub const LEADER_INFO_REFRESH_RATE_MS: u64 = 1000;
-
-/// A struct responsible for holding up-to-date leader information
-/// used for sending transactions.
-pub struct CurrentLeaderInfo<T>
-where
-    T: TpuInfo + std::marker::Send + 'static,
-{
-    /// The last time the leader info was refreshed
-    last_leader_refresh: Option<Instant>,
-
-    /// The leader info
-    leader_info: Option<T>,
-
-    /// How often to refresh the leader info
-    refresh_rate: Duration,
-}
-
-impl<T> CurrentLeaderInfo<T>
-where
-    T: TpuInfo + std::marker::Send + 'static,
-{
-    /// Get the leader info, refresh if expired
-    pub fn get_leader_info(&mut self) -> Option<&T> {
-        if let Some(leader_info) = self.leader_info.as_mut() {
-            let now = Instant::now();
-            let need_refresh = self
-                .last_leader_refresh
-                .map(|last| now.duration_since(last) >= self.refresh_rate)
-                .unwrap_or(true);
-
-            if need_refresh {
-                leader_info.refresh_recent_peers();
-                self.last_leader_refresh = Some(now);
-            }
-        }
-        self.leader_info.as_ref()
-    }
-
-    pub fn new(leader_info: Option<T>) -> Self {
-        Self {
-            last_leader_refresh: None,
-            leader_info,
-            refresh_rate: Duration::from_millis(LEADER_INFO_REFRESH_RATE_MS),
-        }
-    }
-}
-
-/// Metrics of the send-transaction-service.
-#[derive(Default)]
-struct SendTransactionServiceStats {
-    /// Count of the received transactions
-    received_transactions: AtomicU64,
-
-    /// Count of the received duplicate transactions
-    received_duplicate_transactions: AtomicU64,
-
-    /// Count of transactions sent in batch
-    sent_transactions: AtomicU64,
-
-    /// Count of transactions not being added to retry queue
-    /// due to queue size limit
-    retry_queue_overflow: AtomicU64,
-
-    /// retry queue size
-    retry_queue_size: AtomicU64,
-
-    /// The count of calls of sending transactions which can be in batch or single.
-    send_attempt_count: AtomicU64,
-
-    /// Time spent on transactions in micro seconds
-    send_us: AtomicU64,
-
-    /// Send failure count
-    send_failure_count: AtomicU64,
-
-    /// Count of nonced transactions
-    nonced_transactions: AtomicU64,
-
-    /// Count of rooted transactions
-    rooted_transactions: AtomicU64,
-
-    /// Count of expired transactions
-    expired_transactions: AtomicU64,
-
-    /// Count of transactions exceeding max retries
-    transactions_exceeding_max_retries: AtomicU64,
-
-    /// Count of retries of transactions
-    retries: AtomicU64,
-
-    /// Count of transactions failed
-    failed_transactions: AtomicU64,
-}
-
-#[derive(Default)]
-struct SendTransactionServiceStatsReport {
-    stats: SendTransactionServiceStats,
-    last_report: AtomicInterval,
-}
-
-impl SendTransactionServiceStatsReport {
-    /// report metrics of the send transaction service
-    fn report(&self) {
-        if self
-            .last_report
-            .should_update(SEND_TRANSACTION_METRICS_REPORT_RATE_MS)
-        {
-            datapoint_info!(
-                "send_transaction_service",
-                (
-                    "recv-tx",
-                    self.stats.received_transactions.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "recv-duplicate",
-                    self.stats
-                        .received_duplicate_transactions
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "sent-tx",
-                    self.stats.sent_transactions.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "retry-queue-overflow",
-                    self.stats.retry_queue_overflow.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "retry-queue-size",
-                    self.stats.retry_queue_size.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "send-us",
-                    self.stats.send_us.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "send-attempt-count",
-                    self.stats.send_attempt_count.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "send-failure-count",
-                    self.stats.send_failure_count.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "nonced-tx",
-                    self.stats.nonced_transactions.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "rooted-tx",
-                    self.stats.rooted_transactions.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "expired-tx",
-                    self.stats.expired_transactions.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "max-retries-exceeded-tx",
-                    self.stats
-                        .transactions_exceeding_max_retries
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "retries",
-                    self.stats.retries.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "failed-tx",
-                    self.stats.failed_transactions.swap(0, Ordering::Relaxed),
-                    i64
-                )
-            );
-        }
-    }
-}
-
-/// Report the send transaction memtrics for every 5 seconds.
-const SEND_TRANSACTION_METRICS_REPORT_RATE_MS: u64 = 5000;
-
 impl SendTransactionService {
-    pub fn new<T: TpuInfo + std::marker::Send + 'static>(
-        tpu_address: SocketAddr,
+    pub fn new_with_client<Client: TransactionClient + Clone + std::marker::Send + 'static>(
         bank_forks: &Arc<RwLock<BankForks>>,
-        leader_info: Option<T>,
         receiver: Receiver<TransactionInfo>,
-        connection_cache: &Arc<ConnectionCache>,
-        retry_rate_ms: u64,
-        leader_forward_count: u64,
-        exit: Arc<AtomicBool>,
-    ) -> Self {
-        let config = Config {
-            retry_rate_ms,
-            leader_forward_count,
-            ..Config::default()
-        };
-        Self::new_with_config(
-            tpu_address,
-            bank_forks,
-            leader_info,
-            receiver,
-            connection_cache,
-            config,
-            exit,
-        )
-    }
-
-    pub fn new_with_config<T: TpuInfo + std::marker::Send + 'static>(
-        tpu_address: SocketAddr,
-        bank_forks: &Arc<RwLock<BankForks>>,
-        leader_info: Option<T>,
-        receiver: Receiver<TransactionInfo>,
-        connection_cache: &Arc<ConnectionCache>,
+        client: Client,
         config: Config,
         exit: Arc<AtomicBool>,
     ) -> Self {
@@ -370,26 +168,20 @@ impl SendTransactionService {
 
         let retry_transactions = Arc::new(Mutex::new(HashMap::new()));
 
-        let leader_info_provider = Arc::new(Mutex::new(CurrentLeaderInfo::new(leader_info)));
-
         let receive_txn_thread = Self::receive_txn_thread(
-            tpu_address,
             receiver,
-            leader_info_provider.clone(),
-            connection_cache.clone(),
-            config.clone(),
+            client.clone(),
             retry_transactions.clone(),
+            config.clone(),
             stats_report.clone(),
             exit.clone(),
         );
 
         let retry_thread = Self::retry_thread(
-            tpu_address,
             bank_forks.clone(),
-            leader_info_provider,
-            connection_cache.clone(),
-            config,
+            client,
             retry_transactions,
+            config,
             stats_report,
             exit.clone(),
         );
@@ -401,29 +193,30 @@ impl SendTransactionService {
     }
 
     /// Thread responsible for receiving transactions from RPC clients.
-    fn receive_txn_thread<T: TpuInfo + std::marker::Send + 'static>(
-        tpu_address: SocketAddr,
+    fn receive_txn_thread<Client: TransactionClient + std::marker::Send + 'static>(
         receiver: Receiver<TransactionInfo>,
-        leader_info_provider: Arc<Mutex<CurrentLeaderInfo<T>>>,
-        connection_cache: Arc<ConnectionCache>,
-        config: Config,
+        client: Client,
         retry_transactions: Arc<Mutex<HashMap<Signature, TransactionInfo>>>,
+        Config {
+            batch_send_rate_ms,
+            batch_size,
+            retry_pool_max_size,
+            default_max_retries,
+            service_max_retries,
+            ..
+        }: Config,
         stats_report: Arc<SendTransactionServiceStatsReport>,
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let mut last_batch_sent = Instant::now();
         let mut transactions = HashMap::new();
 
-        info!(
-            "Starting send-transaction-service::receive_txn_thread with config {:?}",
-            config
-        );
+        debug!("Starting send-transaction-service::receive_txn_thread");
         Builder::new()
             .name("solStxReceive".to_string())
             .spawn(move || loop {
-                let recv_timeout_ms = config.batch_send_rate_ms;
                 let stats = &stats_report.stats;
-                let recv_result = receiver.recv_timeout(Duration::from_millis(recv_timeout_ms));
+                let recv_result = receiver.recv_timeout(Duration::from_millis(batch_send_rate_ms));
                 if exit.load(Ordering::Relaxed) {
                     break;
                 }
@@ -457,44 +250,49 @@ impl SendTransactionService {
                 }
 
                 if (!transactions.is_empty()
-                    && last_batch_sent.elapsed().as_millis() as u64 >= config.batch_send_rate_ms)
-                    || transactions.len() >= config.batch_size
+                    && last_batch_sent.elapsed().as_millis() as u64 >= batch_send_rate_ms)
+                    || transactions.len() >= batch_size
                 {
                     stats
                         .sent_transactions
                         .fetch_add(transactions.len() as u64, Ordering::Relaxed);
-                    Self::send_transactions_in_batch(
-                        &tpu_address,
-                        &transactions,
-                        leader_info_provider.lock().unwrap().get_leader_info(),
-                        &connection_cache,
-                        &config,
-                        stats,
-                    );
+                    let wire_transactions = transactions
+                        .values()
+                        .map(|transaction_info| transaction_info.wire_transaction.clone())
+                        .collect::<Vec<Vec<u8>>>();
+                    client.send_transactions_in_batch(wire_transactions, stats);
                     let last_sent_time = Instant::now();
                     {
                         // take a lock of retry_transactions and move the batch to the retry set.
                         let mut retry_transactions = retry_transactions.lock().unwrap();
-                        let transactions_to_retry = transactions.len();
-                        let mut transactions_added_to_retry: usize = 0;
+                        let mut transactions_to_retry: usize = 0;
+                        let mut transactions_added_to_retry = Saturating::<usize>(0);
                         for (signature, mut transaction_info) in transactions.drain() {
+                            // drop transactions with 0 max retries
+                            let max_retries = transaction_info
+                                .get_max_retries(default_max_retries, service_max_retries);
+                            if max_retries == Some(0) {
+                                continue;
+                            }
+                            transactions_to_retry += 1;
+
                             let retry_len = retry_transactions.len();
                             let entry = retry_transactions.entry(signature);
                             if let Entry::Vacant(_) = entry {
-                                if retry_len >= config.retry_pool_max_size {
+                                if retry_len >= retry_pool_max_size {
                                     break;
                                 } else {
                                     transaction_info.last_sent_time = Some(last_sent_time);
-                                    saturating_add_assign!(transactions_added_to_retry, 1);
+                                    transactions_added_to_retry += 1;
                                     entry.or_insert(transaction_info);
                                 }
                             }
                         }
-                        stats.retry_queue_overflow.fetch_add(
-                            transactions_to_retry.saturating_sub(transactions_added_to_retry)
-                                as u64,
-                            Ordering::Relaxed,
-                        );
+                        let Saturating(retry_queue_overflow) =
+                            Saturating(transactions_to_retry) - transactions_added_to_retry;
+                        stats
+                            .retry_queue_overflow
+                            .fetch_add(retry_queue_overflow as u64, Ordering::Relaxed);
                         stats
                             .retry_queue_size
                             .store(retry_transactions.len() as u64, Ordering::Relaxed);
@@ -507,154 +305,134 @@ impl SendTransactionService {
     }
 
     /// Thread responsible for retrying transactions
-    fn retry_thread<T: TpuInfo + std::marker::Send + 'static>(
-        tpu_address: SocketAddr,
+    fn retry_thread<Client: TransactionClient + std::marker::Send + 'static>(
         bank_forks: Arc<RwLock<BankForks>>,
-        leader_info_provider: Arc<Mutex<CurrentLeaderInfo<T>>>,
-        connection_cache: Arc<ConnectionCache>,
-        config: Config,
+        client: Client,
         retry_transactions: Arc<Mutex<HashMap<Signature, TransactionInfo>>>,
+        config: Config,
         stats_report: Arc<SendTransactionServiceStatsReport>,
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
-        info!(
-            "Starting send-transaction-service::retry_thread with config {:?}",
-            config
-        );
+        debug!("Starting send-transaction-service::retry_thread.");
+        let sharable_banks = bank_forks.read().unwrap().sharable_banks();
+        let retry_interval_ms_default = MAX_RETRY_SLEEP_MS.min(config.retry_rate_ms);
+        let mut retry_interval_ms = retry_interval_ms_default;
         Builder::new()
             .name("solStxRetry".to_string())
             .spawn(move || loop {
-                let retry_interval_ms = config.retry_rate_ms;
-                let stats = &stats_report.stats;
-                sleep(Duration::from_millis(
-                    MAX_RETRY_SLEEP_MS.min(retry_interval_ms),
-                ));
+                sleep(Duration::from_millis(retry_interval_ms));
                 if exit.load(Ordering::Relaxed) {
                     break;
                 }
                 let mut transactions = retry_transactions.lock().unwrap();
-                if !transactions.is_empty() {
+                if transactions.is_empty() {
+                    retry_interval_ms = retry_interval_ms_default;
+                } else {
+                    let stats = &stats_report.stats;
                     stats
                         .retry_queue_size
                         .store(transactions.len() as u64, Ordering::Relaxed);
-                    let (root_bank, working_bank) = {
-                        let bank_forks = bank_forks.read().unwrap();
-                        (bank_forks.root_bank(), bank_forks.working_bank())
-                    };
 
-                    let _result = Self::process_transactions(
+                    let BankPair {
+                        root_bank,
+                        working_bank,
+                    } = sharable_banks.load();
+                    let result = Self::process_transactions(
                         &working_bank,
                         &root_bank,
-                        &tpu_address,
                         &mut transactions,
-                        &leader_info_provider,
-                        &connection_cache,
+                        &client,
                         &config,
                         stats,
                     );
                     stats_report.report();
+
+                    // Adjust retry interval taking into account the time since the last send.
+                    retry_interval_ms = retry_interval_ms_default
+                        .checked_sub(
+                            result
+                                .last_sent_time
+                                .and_then(|last| Instant::now().checked_duration_since(last))
+                                .and_then(|interval| interval.as_millis().try_into().ok())
+                                .unwrap_or(0),
+                        )
+                        .unwrap_or(retry_interval_ms_default);
                 }
             })
             .unwrap()
     }
 
-    /// Process transactions in batch.
-    fn send_transactions_in_batch<T: TpuInfo>(
-        tpu_address: &SocketAddr,
-        transactions: &HashMap<Signature, TransactionInfo>,
-        leader_info: Option<&T>,
-        connection_cache: &Arc<ConnectionCache>,
-        config: &Config,
-        stats: &SendTransactionServiceStats,
-    ) {
-        // Processing the transactions in batch
-        let mut addresses = config
-            .tpu_peers
-            .as_ref()
-            .map(|addrs| addrs.iter().map(|a| (a, 0)).collect::<Vec<_>>())
-            .unwrap_or_default();
-        let leader_addresses = Self::get_tpu_addresses_with_slots(
-            tpu_address,
-            leader_info,
-            config,
-            connection_cache.protocol(),
-        );
-        addresses.extend(leader_addresses);
-
-        let wire_transactions = transactions
-            .iter()
-            .map(|(_, transaction_info)| {
-                debug!(
-                    "Sending transacation {} to (address, slot): {:?}",
-                    transaction_info.signature, addresses,
-                );
-                transaction_info.wire_transaction.as_ref()
-            })
-            .collect::<Vec<&[u8]>>();
-
-        for (address, _) in &addresses {
-            Self::send_transactions(address, &wire_transactions, connection_cache, stats);
-        }
-    }
-
     /// Retry transactions sent before.
-    fn process_transactions<T: TpuInfo + std::marker::Send + 'static>(
+    fn process_transactions<Client: TransactionClient + std::marker::Send + 'static>(
         working_bank: &Bank,
         root_bank: &Bank,
-        tpu_address: &SocketAddr,
         transactions: &mut HashMap<Signature, TransactionInfo>,
-        leader_info_provider: &Arc<Mutex<CurrentLeaderInfo<T>>>,
-        connection_cache: &Arc<ConnectionCache>,
-        config: &Config,
+        client: &Client,
+        &Config {
+            retry_rate_ms,
+            service_max_retries,
+            default_max_retries,
+            batch_size,
+            ..
+        }: &Config,
         stats: &SendTransactionServiceStats,
     ) -> ProcessTransactionsResult {
         let mut result = ProcessTransactionsResult::default();
 
-        let mut batched_transactions = HashSet::new();
-        let retry_rate = Duration::from_millis(config.retry_rate_ms);
+        let mut batched_transactions = Vec::new();
+        let mut exceeded_retries_transactions = Vec::new();
+        let retry_rate = Duration::from_millis(retry_rate_ms);
 
         transactions.retain(|signature, transaction_info| {
             if transaction_info.durable_nonce_info.is_some() {
                 stats.nonced_transactions.fetch_add(1, Ordering::Relaxed);
             }
-            if root_bank.has_signature(signature) {
-                info!("Transaction is rooted: {}", signature);
+            if root_bank
+                .get_committed_transaction_status_and_slot(
+                    &transaction_info.message_hash,
+                    &transaction_info.blockhash,
+                )
+                .is_some()
+            {
+                info!("Transaction is rooted: {signature}");
                 result.rooted += 1;
                 stats.rooted_transactions.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
-            let signature_status = working_bank.get_signature_status_slot(signature);
+            let signature_status = working_bank.get_committed_transaction_status_and_slot(
+                &transaction_info.message_hash,
+                &transaction_info.blockhash,
+            );
             if let Some((nonce_pubkey, durable_nonce)) = transaction_info.durable_nonce_info {
                 let nonce_account = working_bank.get_account(&nonce_pubkey).unwrap_or_default();
                 let now = Instant::now();
                 let expired = transaction_info
                     .last_sent_time
-                    .map(|last| now.duration_since(last) >= retry_rate)
+                    .and_then(|last| now.checked_duration_since(last))
+                    .map(|elapsed| elapsed >= retry_rate)
                     .unwrap_or(false);
                 let verify_nonce_account =
                     nonce_account::verify_nonce_account(&nonce_account, &durable_nonce);
                 if verify_nonce_account.is_none() && signature_status.is_none() && expired {
-                    info!("Dropping expired durable-nonce transaction: {}", signature);
+                    info!("Dropping expired durable-nonce transaction: {signature}");
                     result.expired += 1;
                     stats.expired_transactions.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
             }
             if transaction_info.last_valid_block_height < root_bank.block_height() {
-                info!("Dropping expired transaction: {}", signature);
+                info!("Dropping expired transaction: {signature}");
                 result.expired += 1;
                 stats.expired_transactions.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
 
-            let max_retries = transaction_info
-                .max_retries
-                .or(config.default_max_retries)
-                .map(|max_retries| max_retries.min(config.service_max_retries));
+            let max_retries =
+                transaction_info.get_max_retries(default_max_retries, service_max_retries);
 
             if let Some(max_retries) = max_retries {
                 if transaction_info.retries >= max_retries {
-                    info!("Dropping transaction due to max retries: {}", signature);
+                    info!("Dropping transaction due to max retries: {signature}");
                     result.max_retries_elapsed += 1;
                     stats
                         .transactions_exceeding_max_retries
@@ -668,27 +446,42 @@ impl SendTransactionService {
                     let now = Instant::now();
                     let need_send = transaction_info
                         .last_sent_time
-                        .map(|last| now.duration_since(last) >= retry_rate)
+                        .and_then(|last| now.checked_duration_since(last))
+                        .map(|elapsed| elapsed >= retry_rate)
                         .unwrap_or(true);
                     if need_send {
                         if transaction_info.last_sent_time.is_some() {
                             // Transaction sent before is unknown to the working bank, it might have been
-                            // dropped or landed in another fork.  Re-send it
+                            // dropped or landed in another fork. Re-send it.
 
-                            info!("Retrying transaction: {}", signature);
+                            info!("Retrying transaction: {signature}");
                             result.retried += 1;
                             transaction_info.retries += 1;
-                            stats.retries.fetch_add(1, Ordering::Relaxed);
                         }
 
-                        batched_transactions.insert(*signature);
+                        batched_transactions.push(*signature);
                         transaction_info.last_sent_time = Some(now);
+
+                        let max_retries = transaction_info
+                            .get_max_retries(default_max_retries, service_max_retries);
+                        if let Some(max_retries) = max_retries {
+                            if transaction_info.retries >= max_retries {
+                                exceeded_retries_transactions.push(*signature);
+                            }
+                        }
+                    } else if let Some(last) = transaction_info.last_sent_time {
+                        result.last_sent_time = Some(
+                            result
+                                .last_sent_time
+                                .map(|result_last| result_last.min(last))
+                                .unwrap_or(last),
+                        );
                     }
                     true
                 }
                 Some((_slot, status)) => {
-                    if status.is_err() {
-                        info!("Dropping failed transaction: {}", signature);
+                    if !status {
+                        info!("Dropping failed transaction: {signature}");
                         result.failed += 1;
                         stats.failed_transactions.fetch_add(1, Ordering::Relaxed);
                         false
@@ -700,117 +493,32 @@ impl SendTransactionService {
             }
         });
 
+        stats.retries.fetch_add(result.retried, Ordering::Relaxed);
+
         if !batched_transactions.is_empty() {
             // Processing the transactions in batch
-            let wire_transactions = transactions
+            let wire_transactions = batched_transactions
                 .iter()
-                .filter(|(signature, _)| batched_transactions.contains(signature))
-                .map(|(_, transaction_info)| transaction_info.wire_transaction.as_ref())
-                .collect::<Vec<&[u8]>>();
+                .filter_map(|signature| transactions.get(signature))
+                .map(|transaction_info| transaction_info.wire_transaction.clone());
 
-            let iter = wire_transactions.chunks(config.batch_size);
-            for chunk in iter {
-                let mut addresses = config
-                    .tpu_peers
-                    .as_ref()
-                    .map(|addrs| addrs.iter().collect::<Vec<_>>())
-                    .unwrap_or_default();
-                let mut leader_info_provider = leader_info_provider.lock().unwrap();
-                let leader_info = leader_info_provider.get_leader_info();
-                let leader_addresses = Self::get_tpu_addresses(
-                    tpu_address,
-                    leader_info,
-                    config,
-                    connection_cache.protocol(),
-                );
-                addresses.extend(leader_addresses);
-
-                for address in &addresses {
-                    Self::send_transactions(address, chunk, connection_cache, stats);
-                }
+            let iter = wire_transactions.chunks(batch_size);
+            for chunk in &iter {
+                let chunk = chunk.collect();
+                client.send_transactions_in_batch(chunk, stats);
             }
         }
-        result
-    }
 
-    fn send_transaction(
-        tpu_address: &SocketAddr,
-        wire_transaction: &[u8],
-        connection_cache: &Arc<ConnectionCache>,
-    ) -> Result<(), TransportError> {
-        let conn = connection_cache.get_connection(tpu_address);
-        conn.send_data_async(wire_transaction.to_vec())
-    }
-
-    fn send_transactions_with_metrics(
-        tpu_address: &SocketAddr,
-        wire_transactions: &[&[u8]],
-        connection_cache: &Arc<ConnectionCache>,
-    ) -> Result<(), TransportError> {
-        let wire_transactions = wire_transactions.iter().map(|t| t.to_vec()).collect();
-        let conn = connection_cache.get_connection(tpu_address);
-        conn.send_data_batch_async(wire_transactions)
-    }
-
-    fn send_transactions(
-        tpu_address: &SocketAddr,
-        wire_transactions: &[&[u8]],
-        connection_cache: &Arc<ConnectionCache>,
-        stats: &SendTransactionServiceStats,
-    ) {
-        let mut measure = Measure::start("send-us");
-        let result = if wire_transactions.len() == 1 {
-            Self::send_transaction(tpu_address, wire_transactions[0], connection_cache)
-        } else {
-            Self::send_transactions_with_metrics(tpu_address, wire_transactions, connection_cache)
-        };
-
-        if let Err(err) = result {
-            warn!(
-                "Failed to send transaction transaction to {}: {:?}",
-                tpu_address, err
-            );
-            stats.send_failure_count.fetch_add(1, Ordering::Relaxed);
+        result.max_retries_elapsed += exceeded_retries_transactions.len() as u64;
+        stats
+            .transactions_exceeding_max_retries
+            .fetch_add(result.max_retries_elapsed, Ordering::Relaxed);
+        for signature in exceeded_retries_transactions {
+            info!("Dropping transaction due to max retries: {signature}");
+            transactions.remove(&signature);
         }
 
-        measure.stop();
-        stats.send_us.fetch_add(measure.as_us(), Ordering::Relaxed);
-        stats.send_attempt_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn get_tpu_addresses<'a, T: TpuInfo>(
-        tpu_address: &'a SocketAddr,
-        leader_info: Option<&'a T>,
-        config: &'a Config,
-        protocol: Protocol,
-    ) -> Vec<&'a SocketAddr> {
-        let addresses = leader_info
-            .as_ref()
-            .map(|leader_info| leader_info.get_leader_tpus(config.leader_forward_count, protocol));
-        addresses
-            .map(|address_list| {
-                if address_list.is_empty() {
-                    vec![tpu_address]
-                } else {
-                    address_list
-                }
-            })
-            .unwrap_or_else(|| vec![tpu_address])
-    }
-
-    fn get_tpu_addresses_with_slots<'a, T: TpuInfo>(
-        tpu_address: &'a SocketAddr,
-        leader_info: Option<&'a T>,
-        config: &'a Config,
-        protocol: Protocol,
-    ) -> Vec<(&'a SocketAddr, Slot)> {
-        leader_info
-            .as_ref()
-            .map(|leader_info| {
-                leader_info.get_leader_tpus_with_slots(config.leader_forward_count, protocol)
-            })
-            .filter(|addresses| !addresses.is_empty())
-            .unwrap_or_else(|| vec![(tpu_address, 0)])
+        result
     }
 
     pub fn join(self) -> thread::Result<()> {
@@ -819,56 +527,69 @@ impl SendTransactionService {
         self.retry_thread.join()
     }
 }
-
 #[cfg(test)]
 mod test {
     use {
         super::*,
-        crate::tpu_info::NullTpuInfo,
-        crossbeam_channel::{bounded, unbounded},
-        solana_sdk::{
-            account::AccountSharedData,
-            genesis_config::create_genesis_config,
-            nonce::{self, state::DurableNonce},
-            pubkey::Pubkey,
-            signature::Signer,
-            system_program, system_transaction,
+        crate::{
+            test_utils::ClientWithCreator,
+            tpu_info::NullTpuInfo,
+            transaction_client::{ConnectionCacheClient, TpuClientNextClient},
         },
+        crossbeam_channel::{bounded, unbounded},
+        solana_account::AccountSharedData,
+        solana_genesis_config::create_genesis_config,
+        solana_nonce::{self as nonce, state::DurableNonce},
+        solana_pubkey::Pubkey,
+        solana_signer::Signer,
+        solana_system_interface::program as system_program,
+        solana_system_transaction as system_transaction,
         std::ops::Sub,
+        tokio::runtime::Handle,
     };
 
-    #[test]
-    fn service_exit() {
-        let tpu_address = "127.0.0.1:0".parse().unwrap();
+    fn service_exit<C: ClientWithCreator>(maybe_runtime: Option<Handle>) {
         let bank = Bank::default_for_tests();
         let bank_forks = BankForks::new_rw_arc(bank);
         let (sender, receiver) = unbounded();
 
-        let connection_cache = Arc::new(ConnectionCache::new("connection_cache_test"));
-        let send_transaction_service = SendTransactionService::new::<NullTpuInfo>(
-            tpu_address,
+        let client = C::create_client(maybe_runtime, "127.0.0.1:0".parse().unwrap(), None, 1);
+
+        let send_transaction_service = SendTransactionService::new_with_client(
             &bank_forks,
-            None,
             receiver,
-            &connection_cache,
-            1000,
-            1,
+            client.clone(),
+            Config {
+                retry_rate_ms: 1000,
+                ..Config::default()
+            },
             Arc::new(AtomicBool::new(false)),
         );
 
         drop(sender);
         send_transaction_service.join().unwrap();
+        client.stop();
     }
 
     #[test]
-    fn validator_exit() {
-        let tpu_address = "127.0.0.1:0".parse().unwrap();
+    fn service_exit_with_connection_cache() {
+        service_exit::<ConnectionCacheClient<NullTpuInfo>>(None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn service_exit_with_tpu_client_next() {
+        service_exit::<TpuClientNextClient>(Some(Handle::current()));
+    }
+
+    fn validator_exit<C: ClientWithCreator>(maybe_runtime: Option<Handle>) {
         let bank = Bank::default_for_tests();
         let bank_forks = BankForks::new_rw_arc(bank);
         let (sender, receiver) = bounded(0);
 
         let dummy_tx_info = || TransactionInfo {
+            message_hash: Hash::default(),
             signature: Signature::default(),
+            blockhash: Hash::default(),
             wire_transaction: vec![0; 128],
             last_valid_block_height: 0,
             durable_nonce_info: None,
@@ -878,15 +599,15 @@ mod test {
         };
 
         let exit = Arc::new(AtomicBool::new(false));
-        let connection_cache = Arc::new(ConnectionCache::new("connection_cache_test"));
-        let _send_transaction_service = SendTransactionService::new::<NullTpuInfo>(
-            tpu_address,
+        let client = C::create_client(maybe_runtime, "127.0.0.1:0".parse().unwrap(), None, 1);
+        let _send_transaction_service = SendTransactionService::new_with_client(
             &bank_forks,
-            None,
             receiver,
-            &connection_cache,
-            1000,
-            1,
+            client.clone(),
+            Config {
+                retry_rate_ms: 1000,
+                ..Config::default()
+            },
             exit.clone(),
         );
 
@@ -894,6 +615,7 @@ mod test {
 
         thread::spawn(move || {
             exit.store(true, Ordering::Relaxed);
+            client.stop();
         });
 
         let mut option = Ok(());
@@ -903,17 +625,24 @@ mod test {
     }
 
     #[test]
-    fn process_transactions() {
-        solana_logger::setup();
+    fn validator_exit_with_connection_cache() {
+        validator_exit::<ConnectionCacheClient<NullTpuInfo>>(None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn validator_exit_with_tpu_client_next() {
+        validator_exit::<TpuClientNextClient>(Some(Handle::current()));
+    }
+
+    fn process_transactions<C: ClientWithCreator>(maybe_runtime: Option<Handle>) {
+        agave_logger::setup();
 
         let (mut genesis_config, mint_keypair) = create_genesis_config(4);
-        genesis_config.fee_rate_governor = solana_sdk::fee_calculator::FeeRateGovernor::new(0, 0);
+        genesis_config.fee_rate_governor = solana_fee_calculator::FeeRateGovernor::new(0, 0);
         let (_, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
-        let tpu_address = "127.0.0.1:0".parse().unwrap();
-        let config = Config {
-            leader_forward_count: 1,
-            ..Config::default()
-        };
+
+        let leader_forward_count = 1;
+        let config = Config::default();
 
         let root_bank = Bank::new_from_parent(
             bank_forks.read().unwrap().working_bank(),
@@ -926,9 +655,17 @@ mod test {
             .insert(root_bank)
             .clone_without_scheduler();
 
-        let rooted_signature = root_bank
-            .transfer(1, &mint_keypair, &mint_keypair.pubkey())
-            .unwrap();
+        let (rooted_transaction, rooted_signature) = {
+            let transaction = system_transaction::transfer(
+                &mint_keypair,
+                &mint_keypair.pubkey(),
+                1,
+                root_bank.last_blockhash(),
+            );
+            root_bank.process_transaction(&transaction).unwrap();
+            let signature = transaction.signatures[0];
+            (transaction, signature)
+        };
 
         let working_bank = bank_forks
             .write()
@@ -940,28 +677,40 @@ mod test {
             ))
             .clone_without_scheduler();
 
-        let non_rooted_signature = working_bank
-            .transfer(2, &mint_keypair, &mint_keypair.pubkey())
-            .unwrap();
-
-        let failed_signature = {
-            let blockhash = working_bank.last_blockhash();
-            let transaction =
-                system_transaction::transfer(&mint_keypair, &Pubkey::default(), 1, blockhash);
+        let (non_rooted_transaction, non_rooted_signature) = {
+            let transaction = system_transaction::transfer(
+                &mint_keypair,
+                &mint_keypair.pubkey(),
+                2,
+                working_bank.last_blockhash(),
+            );
+            working_bank.process_transaction(&transaction).unwrap();
             let signature = transaction.signatures[0];
+            (transaction, signature)
+        };
+
+        let (failed_transaction, failed_signature) = {
+            let transaction = system_transaction::transfer(
+                &mint_keypair,
+                &Pubkey::default(),
+                1,
+                working_bank.last_blockhash(),
+            );
             working_bank.process_transaction(&transaction).unwrap_err();
-            signature
+            let signature = transaction.signatures[0];
+            (transaction, signature)
         };
 
         let mut transactions = HashMap::new();
 
         info!("Expired transactions are dropped...");
-        let leader_info_provider = Arc::new(Mutex::new(CurrentLeaderInfo::new(None)));
         let stats = SendTransactionServiceStats::default();
         transactions.insert(
             Signature::default(),
             TransactionInfo::new(
+                Hash::default(),
                 Signature::default(),
+                Hash::default(),
                 vec![],
                 root_bank.block_height() - 1,
                 None,
@@ -969,14 +718,18 @@ mod test {
                 Some(Instant::now()),
             ),
         );
-        let connection_cache = Arc::new(ConnectionCache::new("connection_cache_test"));
-        let result = SendTransactionService::process_transactions::<NullTpuInfo>(
+
+        let client = C::create_client(
+            maybe_runtime,
+            "127.0.0.1:0".parse().unwrap(),
+            config.tpu_peers.clone(),
+            leader_forward_count,
+        );
+        let result = SendTransactionService::process_transactions(
             &working_bank,
             &root_bank,
-            &tpu_address,
             &mut transactions,
-            &leader_info_provider,
-            &connection_cache,
+            &client,
             &config,
             &stats,
         );
@@ -993,7 +746,9 @@ mod test {
         transactions.insert(
             rooted_signature,
             TransactionInfo::new(
+                rooted_transaction.message.hash(),
                 rooted_signature,
+                rooted_transaction.message.recent_blockhash,
                 vec![],
                 working_bank.block_height(),
                 None,
@@ -1001,13 +756,11 @@ mod test {
                 Some(Instant::now()),
             ),
         );
-        let result = SendTransactionService::process_transactions::<NullTpuInfo>(
+        let result = SendTransactionService::process_transactions(
             &working_bank,
             &root_bank,
-            &tpu_address,
             &mut transactions,
-            &leader_info_provider,
-            &connection_cache,
+            &client,
             &config,
             &stats,
         );
@@ -1024,7 +777,9 @@ mod test {
         transactions.insert(
             failed_signature,
             TransactionInfo::new(
+                failed_transaction.message.hash(),
                 failed_signature,
+                failed_transaction.message.recent_blockhash,
                 vec![],
                 working_bank.block_height(),
                 None,
@@ -1032,13 +787,11 @@ mod test {
                 Some(Instant::now()),
             ),
         );
-        let result = SendTransactionService::process_transactions::<NullTpuInfo>(
+        let result = SendTransactionService::process_transactions(
             &working_bank,
             &root_bank,
-            &tpu_address,
             &mut transactions,
-            &leader_info_provider,
-            &connection_cache,
+            &client,
             &config,
             &stats,
         );
@@ -1055,7 +808,9 @@ mod test {
         transactions.insert(
             non_rooted_signature,
             TransactionInfo::new(
+                non_rooted_transaction.message.hash(),
                 non_rooted_signature,
+                non_rooted_transaction.message.recent_blockhash,
                 vec![],
                 working_bank.block_height(),
                 None,
@@ -1063,13 +818,11 @@ mod test {
                 Some(Instant::now()),
             ),
         );
-        let result = SendTransactionService::process_transactions::<NullTpuInfo>(
+        let result = SendTransactionService::process_transactions(
             &working_bank,
             &root_bank,
-            &tpu_address,
             &mut transactions,
-            &leader_info_provider,
-            &connection_cache,
+            &client,
             &config,
             &stats,
         );
@@ -1087,7 +840,9 @@ mod test {
         transactions.insert(
             Signature::default(),
             TransactionInfo::new(
+                Hash::default(),
                 Signature::default(),
+                Hash::default(),
                 vec![],
                 working_bank.block_height(),
                 None,
@@ -1096,13 +851,11 @@ mod test {
             ),
         );
 
-        let result = SendTransactionService::process_transactions::<NullTpuInfo>(
+        let result = SendTransactionService::process_transactions(
             &working_bank,
             &root_bank,
-            &tpu_address,
             &mut transactions,
-            &leader_info_provider,
-            &connection_cache,
+            &client,
             &config,
             &stats,
         );
@@ -1120,7 +873,9 @@ mod test {
         transactions.insert(
             Signature::from([1; 64]),
             TransactionInfo::new(
+                Hash::default(),
                 Signature::default(),
+                Hash::default(),
                 vec![],
                 working_bank.block_height(),
                 None,
@@ -1131,7 +886,9 @@ mod test {
         transactions.insert(
             Signature::from([2; 64]),
             TransactionInfo::new(
+                Hash::default(),
                 Signature::default(),
+                Hash::default(),
                 vec![],
                 working_bank.block_height(),
                 None,
@@ -1139,32 +896,11 @@ mod test {
                 Some(Instant::now().sub(Duration::from_millis(4000))),
             ),
         );
-        let result = SendTransactionService::process_transactions::<NullTpuInfo>(
+        let result = SendTransactionService::process_transactions(
             &working_bank,
             &root_bank,
-            &tpu_address,
             &mut transactions,
-            &leader_info_provider,
-            &connection_cache,
-            &config,
-            &stats,
-        );
-        assert_eq!(transactions.len(), 1);
-        assert_eq!(
-            result,
-            ProcessTransactionsResult {
-                retried: 1,
-                max_retries_elapsed: 1,
-                ..ProcessTransactionsResult::default()
-            }
-        );
-        let result = SendTransactionService::process_transactions::<NullTpuInfo>(
-            &working_bank,
-            &root_bank,
-            &tpu_address,
-            &mut transactions,
-            &leader_info_provider,
-            &connection_cache,
+            &client,
             &config,
             &stats,
         );
@@ -1172,24 +908,32 @@ mod test {
         assert_eq!(
             result,
             ProcessTransactionsResult {
-                max_retries_elapsed: 1,
+                retried: 1,
+                max_retries_elapsed: 2,
                 ..ProcessTransactionsResult::default()
             }
         );
+        client.stop();
     }
 
     #[test]
-    fn test_retry_durable_nonce_transactions() {
-        solana_logger::setup();
+    fn process_transactions_with_connection_cache() {
+        process_transactions::<ConnectionCacheClient<NullTpuInfo>>(None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_transactions_with_tpu_client_next() {
+        process_transactions::<TpuClientNextClient>(Some(Handle::current()));
+    }
+
+    fn retry_durable_nonce_transactions<C: ClientWithCreator>(maybe_runtime: Option<Handle>) {
+        agave_logger::setup();
 
         let (mut genesis_config, mint_keypair) = create_genesis_config(4);
-        genesis_config.fee_rate_governor = solana_sdk::fee_calculator::FeeRateGovernor::new(0, 0);
+        genesis_config.fee_rate_governor = solana_fee_calculator::FeeRateGovernor::new(0, 0);
         let (_, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
-        let tpu_address = "127.0.0.1:0".parse().unwrap();
-        let config = Config {
-            leader_forward_count: 1,
-            ..Config::default()
-        };
+        let leader_forward_count = 1;
+        let config = Config::default();
 
         let root_bank = Bank::new_from_parent(
             bank_forks.read().unwrap().working_bank(),
@@ -1202,13 +946,21 @@ mod test {
             .insert(root_bank)
             .clone_without_scheduler();
 
-        let rooted_signature = root_bank
-            .transfer(1, &mint_keypair, &mint_keypair.pubkey())
-            .unwrap();
+        let (rooted_transaction, rooted_signature) = {
+            let transaction = system_transaction::transfer(
+                &mint_keypair,
+                &mint_keypair.pubkey(),
+                1,
+                root_bank.last_blockhash(),
+            );
+            root_bank.process_transaction(&transaction).unwrap();
+            let signature = transaction.signatures[0];
+            (transaction, signature)
+        };
 
         let nonce_address = Pubkey::new_unique();
         let durable_nonce = DurableNonce::from_blockhash(&Hash::new_unique());
-        let nonce_state = nonce::state::Versions::new(nonce::State::Initialized(
+        let nonce_state = nonce::versions::Versions::new(nonce::state::State::Initialized(
             nonce::state::Data::new(Pubkey::default(), durable_nonce, 42),
         ));
         let nonce_account =
@@ -1224,19 +976,28 @@ mod test {
                 2,
             ))
             .clone_without_scheduler();
-        let non_rooted_signature = working_bank
-            .transfer(2, &mint_keypair, &mint_keypair.pubkey())
-            .unwrap();
+
+        let (non_rooted_transaction, non_rooted_signature) = {
+            let transaction = system_transaction::transfer(
+                &mint_keypair,
+                &mint_keypair.pubkey(),
+                2,
+                working_bank.last_blockhash(),
+            );
+            let signature = transaction.signatures[0];
+            working_bank.process_transaction(&transaction).unwrap();
+            (transaction, signature)
+        };
 
         let last_valid_block_height = working_bank.block_height() + 300;
 
-        let failed_signature = {
+        let (failed_transaction, failed_signature) = {
             let blockhash = working_bank.last_blockhash();
             let transaction =
                 system_transaction::transfer(&mint_keypair, &Pubkey::default(), 1, blockhash);
             let signature = transaction.signatures[0];
             working_bank.process_transaction(&transaction).unwrap_err();
-            signature
+            (transaction, signature)
         };
 
         let mut transactions = HashMap::new();
@@ -1245,7 +1006,9 @@ mod test {
         transactions.insert(
             rooted_signature,
             TransactionInfo::new(
+                rooted_transaction.message.hash(),
                 rooted_signature,
+                rooted_transaction.message.recent_blockhash,
                 vec![],
                 last_valid_block_height,
                 Some((nonce_address, *durable_nonce.as_hash())),
@@ -1253,16 +1016,18 @@ mod test {
                 Some(Instant::now()),
             ),
         );
-        let leader_info_provider = Arc::new(Mutex::new(CurrentLeaderInfo::new(None)));
         let stats = SendTransactionServiceStats::default();
-        let connection_cache = Arc::new(ConnectionCache::new("connection_cache_test"));
-        let result = SendTransactionService::process_transactions::<NullTpuInfo>(
+        let client = C::create_client(
+            maybe_runtime,
+            "127.0.0.1:0".parse().unwrap(),
+            config.tpu_peers.clone(),
+            leader_forward_count,
+        );
+        let result = SendTransactionService::process_transactions(
             &working_bank,
             &root_bank,
-            &tpu_address,
             &mut transactions,
-            &leader_info_provider,
-            &connection_cache,
+            &client,
             &config,
             &stats,
         );
@@ -1278,7 +1043,9 @@ mod test {
         transactions.insert(
             rooted_signature,
             TransactionInfo::new(
+                rooted_transaction.message.hash(),
                 rooted_signature,
+                rooted_transaction.message.recent_blockhash,
                 vec![],
                 last_valid_block_height,
                 Some((nonce_address, Hash::new_unique())),
@@ -1286,13 +1053,11 @@ mod test {
                 Some(Instant::now()),
             ),
         );
-        let result = SendTransactionService::process_transactions::<NullTpuInfo>(
+        let result = SendTransactionService::process_transactions(
             &working_bank,
             &root_bank,
-            &tpu_address,
             &mut transactions,
-            &leader_info_provider,
-            &connection_cache,
+            &client,
             &config,
             &stats,
         );
@@ -1310,7 +1075,9 @@ mod test {
         transactions.insert(
             Signature::default(),
             TransactionInfo::new(
+                Hash::default(),
                 Signature::default(),
+                Hash::default(),
                 vec![],
                 last_valid_block_height,
                 Some((nonce_address, Hash::new_unique())),
@@ -1318,13 +1085,11 @@ mod test {
                 Some(Instant::now().sub(Duration::from_millis(4000))),
             ),
         );
-        let result = SendTransactionService::process_transactions::<NullTpuInfo>(
+        let result = SendTransactionService::process_transactions(
             &working_bank,
             &root_bank,
-            &tpu_address,
             &mut transactions,
-            &leader_info_provider,
-            &connection_cache,
+            &client,
             &config,
             &stats,
         );
@@ -1340,7 +1105,9 @@ mod test {
         transactions.insert(
             Signature::default(),
             TransactionInfo::new(
+                Hash::default(),
                 Signature::default(),
+                Hash::default(),
                 vec![],
                 root_bank.block_height() - 1,
                 Some((nonce_address, *durable_nonce.as_hash())),
@@ -1348,13 +1115,11 @@ mod test {
                 Some(Instant::now()),
             ),
         );
-        let result = SendTransactionService::process_transactions::<NullTpuInfo>(
+        let result = SendTransactionService::process_transactions(
             &working_bank,
             &root_bank,
-            &tpu_address,
             &mut transactions,
-            &leader_info_provider,
-            &connection_cache,
+            &client,
             &config,
             &stats,
         );
@@ -1371,7 +1136,9 @@ mod test {
         transactions.insert(
             failed_signature,
             TransactionInfo::new(
+                failed_transaction.message.hash(),
                 failed_signature,
+                failed_transaction.message.recent_blockhash,
                 vec![],
                 last_valid_block_height,
                 Some((nonce_address, Hash::new_unique())), // runtime should advance nonce on failed transactions
@@ -1379,13 +1146,11 @@ mod test {
                 Some(Instant::now()),
             ),
         );
-        let result = SendTransactionService::process_transactions::<NullTpuInfo>(
+        let result = SendTransactionService::process_transactions(
             &working_bank,
             &root_bank,
-            &tpu_address,
             &mut transactions,
-            &leader_info_provider,
-            &connection_cache,
+            &client,
             &config,
             &stats,
         );
@@ -1402,7 +1167,9 @@ mod test {
         transactions.insert(
             non_rooted_signature,
             TransactionInfo::new(
+                non_rooted_transaction.message.hash(),
                 non_rooted_signature,
+                non_rooted_transaction.message.recent_blockhash,
                 vec![],
                 last_valid_block_height,
                 Some((nonce_address, Hash::new_unique())), // runtime advances nonce when transaction lands
@@ -1410,13 +1177,11 @@ mod test {
                 Some(Instant::now()),
             ),
         );
-        let result = SendTransactionService::process_transactions::<NullTpuInfo>(
+        let result = SendTransactionService::process_transactions(
             &working_bank,
             &root_bank,
-            &tpu_address,
             &mut transactions,
-            &leader_info_provider,
-            &connection_cache,
+            &client,
             &config,
             &stats,
         );
@@ -1435,7 +1200,9 @@ mod test {
         transactions.insert(
             Signature::default(),
             TransactionInfo::new(
+                Hash::default(),
                 Signature::default(),
+                Hash::default(),
                 vec![],
                 last_valid_block_height,
                 Some((nonce_address, *durable_nonce.as_hash())),
@@ -1443,13 +1210,11 @@ mod test {
                 Some(Instant::now().sub(Duration::from_millis(4000))),
             ),
         );
-        let result = SendTransactionService::process_transactions::<NullTpuInfo>(
+        let result = SendTransactionService::process_transactions(
             &working_bank,
             &root_bank,
-            &tpu_address,
             &mut transactions,
-            &leader_info_provider,
-            &connection_cache,
+            &client,
             &config,
             &stats,
         );
@@ -1467,19 +1232,17 @@ mod test {
             transaction.last_sent_time = Some(Instant::now().sub(Duration::from_millis(4000)));
         }
         let new_durable_nonce = DurableNonce::from_blockhash(&Hash::new_unique());
-        let new_nonce_state = nonce::state::Versions::new(nonce::State::Initialized(
+        let new_nonce_state = nonce::versions::Versions::new(nonce::state::State::Initialized(
             nonce::state::Data::new(Pubkey::default(), new_durable_nonce, 42),
         ));
         let nonce_account =
             AccountSharedData::new_data(43, &new_nonce_state, &system_program::id()).unwrap();
         working_bank.store_account(&nonce_address, &nonce_account);
-        let result = SendTransactionService::process_transactions::<NullTpuInfo>(
+        let result = SendTransactionService::process_transactions(
             &working_bank,
             &root_bank,
-            &tpu_address,
             &mut transactions,
-            &leader_info_provider,
-            &connection_cache,
+            &client,
             &config,
             &stats,
         );
@@ -1491,5 +1254,16 @@ mod test {
                 ..ProcessTransactionsResult::default()
             }
         );
+        client.stop();
+    }
+
+    #[test]
+    fn retry_durable_nonce_transactions_with_connection_cache() {
+        retry_durable_nonce_transactions::<ConnectionCacheClient<NullTpuInfo>>(None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_durable_nonce_transactions_with_tpu_client_next() {
+        retry_durable_nonce_transactions::<TpuClientNextClient>(Some(Handle::current()));
     }
 }

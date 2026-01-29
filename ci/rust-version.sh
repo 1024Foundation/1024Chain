@@ -15,7 +15,7 @@
 #   $ cargo +"$rust_nightly" build
 #
 
-if [[ -n $RUST_STABLE_VERSION ]]; then
+if [[ -n ${RUST_STABLE_VERSION:-} ]]; then
   stable_version="$RUST_STABLE_VERSION"
 else
   # read rust version from rust-toolchain.toml file
@@ -26,10 +26,10 @@ else
   stable_version=$(readCargoVariable channel "$base/../rust-toolchain.toml")
 fi
 
-if [[ -n $RUST_NIGHTLY_VERSION ]]; then
+if [[ -n ${RUST_NIGHTLY_VERSION:-} ]]; then
   nightly_version="$RUST_NIGHTLY_VERSION"
 else
-  nightly_version=2024-01-05
+  nightly_version=2025-02-16
 fi
 
 
@@ -37,7 +37,9 @@ export rust_stable="$stable_version"
 
 export rust_nightly=nightly-"$nightly_version"
 
-export ci_docker_image="solanalabs/ci:rust_${rust_stable}_${rust_nightly}"
+if [[ -n ${NO_INSTALL:-} ]]; then
+  return
+fi
 
 [[ -z $1 ]] || (
 
@@ -45,7 +47,7 @@ export ci_docker_image="solanalabs/ci:rust_${rust_stable}_${rust_nightly}"
     declare toolchain=$1
     if ! cargo +"$toolchain" -V > /dev/null; then
       echo "$0: Missing toolchain? Installing...: $toolchain" >&2
-      rustup install "$toolchain"
+      rustup install "$toolchain" --no-self-update
       cargo +"$toolchain" -V
     fi
   }

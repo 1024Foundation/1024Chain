@@ -14,8 +14,48 @@ if [[ -n $CI_PULL_REQUEST ]]; then
   pr_number=${BASH_REMATCH[1]}
   echo "get affected files from PR: $pr_number"
 
+  if [[ $BUILDKITE_REPO =~ ^https:\/\/github\.com\/([^\/]+)\/([^\/\.]+) ]]; then
+    owner="${BASH_REMATCH[1]}"
+    repo="${BASH_REMATCH[2]}"
+  elif [[ $BUILDKITE_REPO =~ ^git@github\.com:([^\/]+)\/([^\/\.]+) ]]; then
+    owner="${BASH_REMATCH[1]}"
+    repo="${BASH_REMATCH[2]}"
+  else
+    echo "couldn't parse owner and repo. use defaults"
+    owner="anza-xyz"
+    repo="agave"
+  fi
+
+  # ref: https://github.com/cli/cli/issues/5368#issuecomment-1087515074
+  #
+  # Variable value contains dollar prefixed words that look like bash variable
+  # references.  This is intentional.
+  # shellcheck disable=SC2016
+  query='
+  query($owner: String!, $repo: String!, $pr: Int!, $endCursor: String) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $pr) {
+        files(first: 100, after: $endCursor) {
+          pageInfo{ hasNextPage, endCursor }
+          nodes {
+            path
+          }
+        }
+      }
+    }
+  }'
+
   # get affected files
-  readarray -t affected_files < <(gh pr diff --name-only "$pr_number")
+  readarray -t affected_files < <(
+    gh api graphql \
+      -f query="$query" \
+      -F pr="$pr_number" \
+      -F owner="$owner" \
+      -F repo="$repo" \
+      --paginate \
+      --jq '.data.repository.pullRequest.files.nodes.[].path'
+  )
+
   if [[ ${#affected_files[*]} -eq 0 ]]; then
     echo "Unable to determine the files affected by this PR"
     exit 1
@@ -121,8 +161,8 @@ EOF
 
 trigger_secondary_step() {
   cat  >> "$output_file" <<"EOF"
-  - name: "Trigger Build on solana-secondary"
-    trigger: "solana-secondary"
+  - name: "Trigger Build on agave-secondary"
+    trigger: "agave-secondary"
     branches: "!pull/*"
     async: true
     soft_fail: true
@@ -141,8 +181,11 @@ wait_step() {
 
 all_test_steps() {
   command_step checks1 "ci/docker-run-default-image.sh ci/test-checks.sh" 20 check
-  command_step checks2 "ci/docker-run-default-image.sh ci/test-dev-context-only-utils.sh check-bins" 15 check
-  command_step checks3 "ci/docker-run-default-image.sh ci/test-dev-context-only-utils.sh check-all-targets" 15 check
+  command_step dcou-1-of-3 "ci/docker-run-default-image.sh ci/test-dev-context-only-utils.sh --partition 1/3" 20 check
+  command_step dcou-2-of-3 "ci/docker-run-default-image.sh ci/test-dev-context-only-utils.sh --partition 2/3" 20 check
+  command_step dcou-3-of-3 "ci/docker-run-default-image.sh ci/test-dev-context-only-utils.sh --partition 3/3" 20 check
+  command_step miri "ci/docker-run-default-image.sh ci/test-miri.sh" 5 check
+  command_step frozen-abi "ci/docker-run-default-image.sh ci/test-abi.sh" 15 check
   wait_step
 
   # Full test suite
@@ -174,10 +217,8 @@ all_test_steps() {
              ^ci/test-local-cluster.sh \
              ^core/build.rs \
              ^fetch-perf-libs.sh \
+             ^platform-tools-sdk/ \
              ^programs/ \
-             ^sdk/ \
-             cargo-build-bpf$ \
-             cargo-test-bpf$ \
              cargo-build-sbf$ \
              cargo-test-sbf$ \
       ; then
@@ -185,7 +226,6 @@ all_test_steps() {
   - command: "ci/docker-run-default-image.sh ci/test-stable-sbf.sh"
     name: "stable-sbf"
     timeout_in_minutes: 35
-    artifact_paths: "sbf-dumps.tar.bz2"
     agents:
       queue: "solana"
 EOF
@@ -194,59 +234,17 @@ EOF
       "Stable-SBF skipped as no relevant files were modified"
   fi
 
-  # Downstream backwards compatibility
+   # Shuttle tests
   if affects \
              .rs$ \
              Cargo.lock$ \
              Cargo.toml$ \
              ^ci/rust-version.sh \
-             ^ci/test-stable-perf.sh \
-             ^ci/test-stable.sh \
-             ^ci/test-local-cluster.sh \
-             ^core/build.rs \
-             ^fetch-perf-libs.sh \
-             ^programs/ \
-             ^sdk/ \
-             cargo-build-bpf$ \
-             cargo-test-bpf$ \
-             cargo-build-sbf$ \
-             cargo-test-sbf$ \
-             ^ci/downstream-projects \
-             .buildkite/scripts/build-downstream-projects.sh \
       ; then
-    .buildkite/scripts/build-downstream-projects.sh >> "$output_file"
+    command_step shuttle "ci/docker-run-default-image.sh ci/test-shuttle.sh" 10
   else
     annotate --style info \
-      "downstream-projects skipped as no relevant files were modified"
-  fi
-
-  # Wasm support
-  if affects \
-             ^ci/test-wasm.sh \
-             ^ci/test-stable.sh \
-             ^sdk/ \
-      ; then
-    command_step wasm "ci/docker-run-default-image.sh ci/test-wasm.sh" 20
-  else
-    annotate --style info \
-      "wasm skipped as no relevant files were modified"
-  fi
-
-  # Benches...
-  if affects \
-             .rs$ \
-             Cargo.lock$ \
-             Cargo.toml$ \
-             ^ci/rust-version.sh \
-             ^ci/test-coverage.sh \
-             ^ci/test-bench.sh \
-             ^ci/bench \
-             .buildkite/scripts/build-bench.sh \
-      ; then
-    .buildkite/scripts/build-bench.sh >> "$output_file"
-  else
-    annotate --style info --context test-bench \
-      "Bench skipped as no .rs files were modified"
+      "test-shuttle skipped as no relevant files were modified"
   fi
 
   # Coverage...
@@ -307,7 +305,7 @@ pull_or_push_steps() {
     all_test_steps
   fi
 
-  # docs changes run on Travis or Github actions...
+  # docs changes run on Github actions...
 }
 
 
@@ -315,7 +313,7 @@ if [[ -n $BUILDKITE_TAG ]]; then
   start_pipeline "Tag pipeline for $BUILDKITE_TAG"
 
   annotate --style info --context release-tag \
-    "https://github.com/solana-labs/solana/releases/$BUILDKITE_TAG"
+    "https://github.com/anza-xyz/agave/releases/$BUILDKITE_TAG"
 
   # Jump directly to the secondary build to publish release artifacts quickly
   trigger_secondary_step
@@ -333,12 +331,8 @@ if [[ $BUILDKITE_BRANCH =~ ^pull ]]; then
 
   # Add helpful link back to the corresponding Github Pull Request
   annotate --style info --context pr-backlink \
-    "Github Pull Request: https://github.com/solana-labs/solana/$BUILDKITE_BRANCH"
+    "Github Pull Request: https://github.com/anza-xyz/agave/$BUILDKITE_BRANCH"
 
-  if [[ $GITHUB_USER = "dependabot[bot]" ]]; then
-    command_step dependabot "ci/dependabot-pr.sh" 5
-    wait_step
-  fi
   pull_or_push_steps
   exit 0
 fi

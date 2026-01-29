@@ -1,18 +1,19 @@
 use {
     crate::repair::{quic_endpoint::RemoteRequest, serve_repair::ServeRepair},
+    bytes::Bytes,
     crossbeam_channel::{unbounded, Receiver, Sender},
-    solana_ledger::blockstore::Blockstore,
     solana_perf::{packet::PacketBatch, recycler::Recycler},
     solana_streamer::{
         socket::SocketAddrSpace,
         streamer::{self, StreamerReceiveStats},
     },
     std::{
-        net::UdpSocket,
+        net::{SocketAddr, UdpSocket},
         sync::{atomic::AtomicBool, Arc},
         thread::{self, Builder, JoinHandle},
         time::Duration,
     },
+    tokio::sync::mpsc::Sender as AsyncSender,
 };
 
 pub struct ServeRepairService {
@@ -20,11 +21,11 @@ pub struct ServeRepairService {
 }
 
 impl ServeRepairService {
-    pub fn new(
+    pub(crate) fn new(
         serve_repair: ServeRepair,
         remote_request_sender: Sender<RemoteRequest>,
         remote_request_receiver: Receiver<RemoteRequest>,
-        blockstore: Arc<Blockstore>,
+        repair_response_quic_sender: AsyncSender<(SocketAddr, Bytes)>,
         serve_repair_socket: UdpSocket,
         socket_addr_space: SocketAddrSpace,
         stats_reporter_sender: Sender<Box<dyn FnOnce() + Send>>,
@@ -32,11 +33,6 @@ impl ServeRepairService {
     ) -> Self {
         let (request_sender, request_receiver) = unbounded();
         let serve_repair_socket = Arc::new(serve_repair_socket);
-        trace!(
-            "ServeRepairService: id: {}, listening on: {:?}",
-            &serve_repair.my_id(),
-            serve_repair_socket.local_addr().unwrap()
-        );
         let t_receiver = streamer::receiver(
             "solRcvrServeRep".to_string(),
             serve_repair_socket.clone(),
@@ -44,9 +40,10 @@ impl ServeRepairService {
             request_sender,
             Recycler::default(),
             Arc::new(StreamerReceiveStats::new("serve_repair_receiver")),
-            Duration::from_millis(1), // coalesce
-            false,                    // use_pinned_memory
-            None,                     // in_vote_only_mode
+            Some(Duration::from_millis(1)), // coalesce
+            false,                          // use_pinned_memory
+            None,                           // in_vote_only_mode
+            false,                          // is_staked_service
         );
         let t_packet_adapter = Builder::new()
             .name(String::from("solServRAdapt"))
@@ -60,8 +57,12 @@ impl ServeRepairService {
             socket_addr_space,
             Some(stats_reporter_sender),
         );
-        let t_listen =
-            serve_repair.listen(blockstore, remote_request_receiver, response_sender, exit);
+        let t_listen = serve_repair.listen(
+            remote_request_receiver,
+            response_sender,
+            repair_response_quic_sender,
+            exit,
+        );
 
         let thread_hdls = vec![t_receiver, t_packet_adapter, t_responder, t_listen];
         Self { thread_hdls }
@@ -85,8 +86,7 @@ pub(crate) fn adapt_repair_requests_packets(
             let request = RemoteRequest {
                 remote_pubkey: None,
                 remote_address: packet.meta().socket_addr(),
-                bytes,
-                response_sender: None,
+                bytes: Bytes::from(bytes),
             };
             if remote_request_sender.send(request).is_err() {
                 return; // The receiver end of the channel is disconnected.

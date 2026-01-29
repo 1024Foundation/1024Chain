@@ -1,17 +1,23 @@
 use {
     crate::rpc::account_resolver,
     jsonrpc_core::{Error, Result},
+    solana_account::{AccountSharedData, ReadableAccount},
     solana_account_decoder::{
-        parse_account_data::AccountAdditionalData, parse_token::get_token_account_mint, UiAccount,
-        UiAccountData, UiAccountEncoding,
+        encode_ui_account,
+        parse_account_data::{AccountAdditionalDataV3, SplTokenAdditionalDataV2},
+        parse_token::get_token_account_mint,
+        UiAccount, UiAccountData, UiAccountEncoding,
     },
+    solana_pubkey::Pubkey,
     solana_rpc_client_api::response::RpcKeyedAccount,
     solana_runtime::bank::Bank,
-    solana_sdk::{
-        account::{AccountSharedData, ReadableAccount},
-        pubkey::Pubkey,
+    spl_token_2022_interface::{
+        extension::{
+            interest_bearing_mint::InterestBearingConfig, scaled_ui_amount::ScaledUiAmountConfig,
+            BaseStateWithExtensions, StateWithExtensions,
+        },
+        state::Mint,
     },
-    spl_token_2022::{extension::StateWithExtensions, state::Mint},
     std::{collections::HashMap, sync::Arc},
 };
 
@@ -30,11 +36,12 @@ pub fn get_parsed_token_account(
                 overwrite_accounts,
             )
         })
-        .map(|mint_account| AccountAdditionalData {
-            spl_token_decimals: get_mint_decimals(mint_account.data()).ok(),
+        .and_then(|mint_account| get_additional_mint_data(bank, mint_account.data()).ok())
+        .map(|data| AccountAdditionalDataV3 {
+            spl_token_additional_data: Some(data),
         });
 
-    UiAccount::encode(
+    encode_ui_account(
         pubkey,
         &account,
         UiAccountEncoding::JsonParsed,
@@ -50,18 +57,20 @@ pub fn get_parsed_token_accounts<I>(
 where
     I: Iterator<Item = (Pubkey, AccountSharedData)>,
 {
-    let mut mint_decimals: HashMap<Pubkey, u8> = HashMap::new();
+    let mut mint_data: HashMap<Pubkey, AccountAdditionalDataV3> = HashMap::new();
     keyed_accounts.filter_map(move |(pubkey, account)| {
-        let additional_data = get_token_account_mint(account.data()).map(|mint_pubkey| {
-            let spl_token_decimals = mint_decimals.get(&mint_pubkey).cloned().or_else(|| {
-                let (_, decimals) = get_mint_owner_and_decimals(&bank, &mint_pubkey).ok()?;
-                mint_decimals.insert(mint_pubkey, decimals);
-                Some(decimals)
-            });
-            AccountAdditionalData { spl_token_decimals }
+        let additional_data = get_token_account_mint(account.data()).and_then(|mint_pubkey| {
+            mint_data.get(&mint_pubkey).cloned().or_else(|| {
+                let (_, data) = get_mint_owner_and_additional_data(&bank, &mint_pubkey).ok()?;
+                let data = AccountAdditionalDataV3 {
+                    spl_token_additional_data: Some(data),
+                };
+                mint_data.insert(mint_pubkey, data);
+                Some(data)
+            })
         });
 
-        let maybe_encoded_account = UiAccount::encode(
+        let maybe_encoded_account = encode_ui_account(
             &pubkey,
             &account,
             UiAccountEncoding::JsonParsed,
@@ -81,22 +90,42 @@ where
 
 /// Analyze a mint Pubkey that may be the native_mint and get the mint-account owner (token
 /// program_id) and decimals
-pub fn get_mint_owner_and_decimals(bank: &Bank, mint: &Pubkey) -> Result<(Pubkey, u8)> {
-    if mint == &spl_token::native_mint::id() {
-        Ok((spl_token::id(), spl_token::native_mint::DECIMALS))
+pub(crate) fn get_mint_owner_and_additional_data(
+    bank: &Bank,
+    mint: &Pubkey,
+) -> Result<(Pubkey, SplTokenAdditionalDataV2)> {
+    if mint == &spl_token_interface::native_mint::id() {
+        Ok((
+            spl_token_interface::id(),
+            SplTokenAdditionalDataV2::with_decimals(spl_token_interface::native_mint::DECIMALS),
+        ))
     } else {
         let mint_account = bank.get_account(mint).ok_or_else(|| {
             Error::invalid_params("Invalid param: could not find mint".to_string())
         })?;
-        let decimals = get_mint_decimals(mint_account.data())?;
-        Ok((*mint_account.owner(), decimals))
+        let mint_data = get_additional_mint_data(bank, mint_account.data())?;
+        Ok((*mint_account.owner(), mint_data))
     }
 }
 
-fn get_mint_decimals(data: &[u8]) -> Result<u8> {
+fn get_additional_mint_data(bank: &Bank, data: &[u8]) -> Result<SplTokenAdditionalDataV2> {
     StateWithExtensions::<Mint>::unpack(data)
         .map_err(|_| {
             Error::invalid_params("Invalid param: Token mint could not be unpacked".to_string())
         })
-        .map(|mint| mint.base.decimals)
+        .map(|mint| {
+            let interest_bearing_config = mint
+                .get_extension::<InterestBearingConfig>()
+                .map(|x| (*x, bank.clock().unix_timestamp))
+                .ok();
+            let scaled_ui_amount_config = mint
+                .get_extension::<ScaledUiAmountConfig>()
+                .map(|x| (*x, bank.clock().unix_timestamp))
+                .ok();
+            SplTokenAdditionalDataV2 {
+                decimals: mint.base.decimals,
+                interest_bearing_config,
+                scaled_ui_amount_config,
+            }
+        })
 }

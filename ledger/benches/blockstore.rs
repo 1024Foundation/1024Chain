@@ -5,12 +5,16 @@ extern crate test;
 
 use {
     rand::Rng,
+    solana_clock::Slot,
     solana_entry::entry::{create_ticks, Entry},
+    solana_hash::Hash,
     solana_ledger::{
         blockstore::{entries_to_test_shreds, Blockstore},
         get_tmp_ledger_path_auto_delete,
     },
-    solana_sdk::{clock::Slot, hash::Hash},
+    solana_pubkey::Pubkey,
+    solana_signature::Signature,
+    solana_transaction_status::TransactionStatusMeta,
     std::path::Path,
     test::Bencher,
 };
@@ -20,7 +24,7 @@ fn bench_write_shreds(bench: &mut Bencher, entries: Vec<Entry>, ledger_path: &Pa
     let blockstore =
         Blockstore::open(ledger_path).expect("Expected to be able to open database ledger");
     bench.iter(move || {
-        let shreds = entries_to_test_shreds(&entries, 0, 0, true, 0, /*merkle_variant:*/ true);
+        let shreds = entries_to_test_shreds(&entries, 0, 0, true, 0);
         blockstore.insert_shreds(shreds, None, false).unwrap();
     });
 }
@@ -46,11 +50,10 @@ fn setup_read_bench(
         slot.saturating_sub(1), // parent_slot
         true,                   // is_full_slot
         0,                      // version
-        true,                   // merkle_variant
     );
     blockstore
         .insert_shreds(shreds, None, false)
-        .expect("Expectd successful insertion of shreds into ledger");
+        .expect("Expected successful insertion of shreds into ledger");
 }
 
 // Write small shreds to the ledger
@@ -136,7 +139,7 @@ fn bench_insert_data_shred_small(bench: &mut Bencher) {
     let num_entries = 32 * 1024;
     let entries = create_ticks(num_entries, 0, Hash::default());
     bench.iter(move || {
-        let shreds = entries_to_test_shreds(&entries, 0, 0, true, 0, /*merkle_variant:*/ true);
+        let shreds = entries_to_test_shreds(&entries, 0, 0, true, 0);
         blockstore.insert_shreds(shreds, None, false).unwrap();
     });
 }
@@ -150,7 +153,125 @@ fn bench_insert_data_shred_big(bench: &mut Bencher) {
     let num_entries = 32 * 1024;
     let entries = create_ticks(num_entries, 0, Hash::default());
     bench.iter(move || {
-        let shreds = entries_to_test_shreds(&entries, 0, 0, true, 0, /*merkle_variant:*/ true);
+        let shreds = entries_to_test_shreds(&entries, 0, 0, true, 0);
         blockstore.insert_shreds(shreds, None, false).unwrap();
+    });
+}
+
+#[bench]
+#[ignore]
+fn bench_write_transaction_memos(b: &mut Bencher) {
+    let ledger_path = get_tmp_ledger_path_auto_delete!();
+    let blockstore =
+        Blockstore::open(ledger_path.path()).expect("Expected to be able to open database ledger");
+    let signatures: Vec<Signature> = (0..64).map(|_| Signature::new_unique()).collect();
+    b.iter(|| {
+        for (slot, signature) in signatures.iter().enumerate() {
+            blockstore
+                .write_transaction_memos(
+                    signature,
+                    slot as u64,
+                    "bench_write_transaction_memos".to_string(),
+                )
+                .unwrap();
+        }
+    });
+}
+
+#[bench]
+#[ignore]
+fn bench_add_transaction_memos_to_batch(b: &mut Bencher) {
+    let ledger_path = get_tmp_ledger_path_auto_delete!();
+    let blockstore =
+        Blockstore::open(ledger_path.path()).expect("Expected to be able to open database ledger");
+    let signatures: Vec<Signature> = (0..64).map(|_| Signature::new_unique()).collect();
+    b.iter(|| {
+        let mut memos_batch = blockstore.get_write_batch().unwrap();
+
+        for (slot, signature) in signatures.iter().enumerate() {
+            blockstore
+                .add_transaction_memos_to_batch(
+                    signature,
+                    slot as u64,
+                    "bench_write_transaction_memos".to_string(),
+                    &mut memos_batch,
+                )
+                .unwrap();
+        }
+
+        blockstore.write_batch(memos_batch).unwrap();
+    });
+}
+
+#[bench]
+#[ignore]
+fn bench_write_transaction_status(b: &mut Bencher) {
+    let ledger_path = get_tmp_ledger_path_auto_delete!();
+    let blockstore =
+        Blockstore::open(ledger_path.path()).expect("Expected to be able to open database ledger");
+    let signatures: Vec<Signature> = (0..64).map(|_| Signature::new_unique()).collect();
+    let keys_with_writable: Vec<Vec<(Pubkey, bool)>> = (0..64)
+        .map(|_| {
+            vec![
+                (Pubkey::new_unique(), true),
+                (Pubkey::new_unique(), false),
+                (Pubkey::new_unique(), true),
+                (Pubkey::new_unique(), false),
+            ]
+        })
+        .collect();
+    let slot = 5;
+
+    b.iter(|| {
+        for (tx_idx, signature) in signatures.iter().enumerate() {
+            blockstore
+                .write_transaction_status(
+                    slot,
+                    *signature,
+                    keys_with_writable[tx_idx].iter().map(|(k, v)| (k, *v)),
+                    TransactionStatusMeta::default(),
+                    tx_idx,
+                )
+                .unwrap();
+        }
+    });
+}
+
+#[bench]
+#[ignore]
+fn bench_add_transaction_status_to_batch(b: &mut Bencher) {
+    let ledger_path = get_tmp_ledger_path_auto_delete!();
+    let blockstore =
+        Blockstore::open(ledger_path.path()).expect("Expected to be able to open database ledger");
+    let signatures: Vec<Signature> = (0..64).map(|_| Signature::new_unique()).collect();
+    let keys_with_writable: Vec<Vec<(Pubkey, bool)>> = (0..64)
+        .map(|_| {
+            vec![
+                (Pubkey::new_unique(), true),
+                (Pubkey::new_unique(), false),
+                (Pubkey::new_unique(), true),
+                (Pubkey::new_unique(), false),
+            ]
+        })
+        .collect();
+    let slot = 5;
+
+    b.iter(|| {
+        let mut status_batch = blockstore.get_write_batch().unwrap();
+
+        for (tx_idx, signature) in signatures.iter().enumerate() {
+            blockstore
+                .add_transaction_status_to_batch(
+                    slot,
+                    *signature,
+                    keys_with_writable[tx_idx].iter().map(|(k, v)| (k, *v)),
+                    TransactionStatusMeta::default(),
+                    tx_idx,
+                    &mut status_batch,
+                )
+                .unwrap();
+        }
+
+        blockstore.write_batch(status_batch).unwrap();
     });
 }

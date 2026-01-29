@@ -170,7 +170,6 @@ cloud_CreateInstances() {
   declare optionalBootDiskType="${10:-pd-ssd}"
   declare optionalAdditionalDiskSize="${11}"
   declare optionalPreemptible="${12}"
-  #declare sshPrivateKey="${13}"  # unused
 
   if $enableGpu; then
     # Custom Ubuntu 20.04 LTS image with CUDA 10.2 installed
@@ -179,10 +178,13 @@ cloud_CreateInstances() {
     # the stock Ubuntu 20.04 image and programmatically install CUDA after the
     # instance boots
     #
-    imageName="ubuntu-2004-focal-v20201211-with-cuda-10-2 --image-project principal-lane-200702"
+    # imageName="ubuntu-2004-focal-v20201211-with-cuda-10-2 --image-project principal-lane-200702"
+
+    # We don't have custom cuda image for ubnutu 22.04
+    echo "Error: Not supported" >&2
+    exit 1
   else
-    # Upstream Ubuntu 20.04 LTS image
-    imageName="ubuntu-2004-focal-v20220419 --image-project ubuntu-os-cloud"
+    imageName="ubuntu-2404-noble-amd64-v20250709 --image-project ubuntu-os-cloud"
   fi
 
   declare -a nodes

@@ -57,7 +57,7 @@ impl PubkeyValidityProof {
     /// invertible).
     ///
     /// * `elgamal_keypair` = The ElGamal keypair that pertains to the ElGamal public key to be
-    /// proved
+    ///   proved
     /// * `transcript` - The transcript that does the bookkeeping for the Fiat-Shamir heuristic
     pub fn new(elgamal_keypair: &ElGamalKeypair, transcript: &mut Transcript) -> Self {
         transcript.pubkey_proof_domain_separator();
@@ -65,7 +65,7 @@ impl PubkeyValidityProof {
         // extract the relevant scalar and Ristretto points from the input
         let s = elgamal_keypair.secret().get_scalar();
 
-        assert!(s != &Scalar::zero());
+        assert!(s != &Scalar::ZERO);
         let s_inv = s.invert();
 
         // generate a random masking factor that also serves as a nonce
@@ -95,7 +95,7 @@ impl PubkeyValidityProof {
     ) -> Result<(), PubkeyValidityProofVerificationError> {
         transcript.pubkey_proof_domain_separator();
 
-        // extract the relvant scalar and Ristretto points from the input
+        // extract the relevant scalar and Ristretto points from the input
         let P = elgamal_pubkey.get_point();
 
         // include Y to transcript and extract challenge
@@ -109,7 +109,7 @@ impl PubkeyValidityProof {
             .ok_or(SigmaProofVerificationError::Deserialization)?;
 
         let check = RistrettoPoint::vartime_multiscalar_mul(
-            vec![&self.z, &(-&c), &(-&Scalar::one())],
+            vec![&self.z, &(-&c), &(-&Scalar::ONE)],
             vec![&(*H), P, &Y],
         );
 
@@ -138,10 +138,7 @@ impl PubkeyValidityProof {
 
 #[cfg(test)]
 mod test {
-    use {
-        super::*,
-        solana_sdk::{pubkey::Pubkey, signature::Keypair},
-    };
+    use {super::*, solana_keypair::Keypair, solana_pubkey::Pubkey};
 
     #[test]
     fn test_pubkey_proof_correctness() {

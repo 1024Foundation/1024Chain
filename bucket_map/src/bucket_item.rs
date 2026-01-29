@@ -1,4 +1,5 @@
-use {crate::RefCount, solana_sdk::pubkey::Pubkey};
+#![cfg(feature = "dev-context-only-utils")]
+use {crate::RefCount, solana_pubkey::Pubkey};
 
 #[derive(Debug, Default, Clone)]
 pub struct BucketItem<T> {

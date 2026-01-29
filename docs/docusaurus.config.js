@@ -1,14 +1,14 @@
 const math = require("remark-math");
 const katex = require("rehype-katex");
 module.exports = {
-  title: "Solana Validator",
+  title: "Agave",
   tagline:
-    "Solana is an open source project implementing a new, high-performance, permissionless blockchain.",
-  url: "https://docs.solanalabs.com",
+    "Agave is an open source project implementing a new, high-performance, permissionless blockchain.",
+  url: "https://docs.anza.xyz",
   baseUrl: "/",
   favicon: "img/favicon.ico",
-  organizationName: "solana-labs", // Usually your GitHub org/user name.
-  projectName: "solana", // Usually your repo name.
+  organizationName: "anza-xyz", // Usually your GitHub org/user name.
+  projectName: "agave", // Usually your repo name.
   onBrokenLinks: "throw",
   stylesheets: [
     {
@@ -19,38 +19,13 @@ module.exports = {
       crossorigin: "anonymous",
     },
   ],
-  i18n: {
-    defaultLocale: "en",
-    locales: ["en", "de", "es", "ru", "ar"],
-    // localesNotBuilding: ["ko", "pt", "vi", "zh", "ja"],
-    localeConfigs: {
-      en: {
-        label: "English",
-      },
-      ru: {
-        label: "Русский",
-      },
-      es: {
-        label: "Español",
-      },
-      de: {
-        label: "Deutsch",
-      },
-      ar: {
-        label: "العربية",
-      },
-      ko: {
-        label: "한국어",
-      },
-    },
-  },
   themeConfig: {
     prism: {
       additionalLanguages: ["rust"],
     },
     navbar: {
       logo: {
-        alt: "Solana Logo",
+        alt: "Anza Logo",
         src: "img/logo-horizontal.svg",
         srcDark: "img/logo-horizontal-dark.svg",
       },
@@ -82,18 +57,14 @@ module.exports = {
           ],
         },
         {
-          type: "localeDropdown",
-          position: "right",
-        },
-        {
           href: "https://solana.com/discord",
           // label: "Discord",
           className: "header-link-icon header-discord-link",
-          "aria-label": "Solana Discord",
+          "aria-label": "Solana Tech Discord",
           position: "right",
         },
         {
-          href: "https://github.com/solana-labs/solana",
+          href: "https://github.com/anza-xyz/agave/",
           // label: "GitHub",
           className: "header-link-icon header-github-link",
           "aria-label": "GitHub repository",
@@ -141,7 +112,7 @@ module.exports = {
             },
             {
               label: "GitHub »",
-              href: "https://github.com/solana-labs/solana",
+              href: "https://github.com/anza-xyz/agave",
             },
             {
               label: "Discord »",
@@ -175,7 +146,7 @@ module.exports = {
           ],
         },
       ],
-      copyright: `Copyright © ${new Date().getFullYear()} Solana Labs`,
+      copyright: `Copyright © ${new Date().getFullYear()} Anza`,
     },
   },
   presets: [

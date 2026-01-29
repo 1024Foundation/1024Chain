@@ -7,11 +7,11 @@ use {
     clap::{crate_description, crate_name, Arg, Command},
     solana_measure::measure::Measure,
     solana_perf::perf_libs,
-    solana_sdk::hash::hash,
+    solana_sha256_hasher::hash,
 };
 
 fn main() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let matches = Command::new(crate_name!())
         .about(crate_description!())
@@ -73,6 +73,12 @@ fn main() {
     let start_hash = hash(&[1, 2, 3, 4]);
     let ticks = create_ticks(max_num_entries, hashes_per_tick, start_hash);
     let mut num_entries = start_num_entries as usize;
+    let num_threads = matches.value_of_t("num_threads").unwrap_or(num_cpus::get());
+    let thread_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .thread_name(|i| format!("solPohBench{i:02}"))
+        .build()
+        .expect("new rayon threadpool");
     if matches.is_present("cuda") {
         perf_libs::init_cuda();
     }
@@ -81,8 +87,8 @@ fn main() {
         let mut time = Measure::start("time");
         for _ in 0..iterations {
             assert!(ticks[..num_entries]
-                .verify_cpu_generic(&start_hash)
-                .finish_verify());
+                .verify_cpu_generic(&start_hash, &thread_pool)
+                .finish_verify(&thread_pool));
         }
         time.stop();
         println!(
@@ -100,8 +106,8 @@ fn main() {
                 let mut time = Measure::start("time");
                 for _ in 0..iterations {
                     assert!(ticks[..num_entries]
-                        .verify_cpu_x86_simd(&start_hash, 8)
-                        .finish_verify());
+                        .verify_cpu_x86_simd(&start_hash, 8, &thread_pool)
+                        .finish_verify(&thread_pool));
                 }
                 time.stop();
                 println!(
@@ -115,8 +121,8 @@ fn main() {
                 let mut time = Measure::start("time");
                 for _ in 0..iterations {
                     assert!(ticks[..num_entries]
-                        .verify_cpu_x86_simd(&start_hash, 16)
-                        .finish_verify());
+                        .verify_cpu_x86_simd(&start_hash, 16, &thread_pool)
+                        .finish_verify(&thread_pool));
                 }
                 time.stop();
                 println!(
@@ -132,8 +138,8 @@ fn main() {
             let recyclers = VerifyRecyclers::default();
             for _ in 0..iterations {
                 assert!(ticks[..num_entries]
-                    .start_verify(&start_hash, recyclers.clone())
-                    .finish_verify());
+                    .start_verify(&start_hash, &thread_pool, recyclers.clone())
+                    .finish_verify(&thread_pool));
             }
             time.stop();
             println!(

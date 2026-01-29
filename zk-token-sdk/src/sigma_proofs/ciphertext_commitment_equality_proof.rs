@@ -94,9 +94,8 @@ impl CiphertextCommitmentEqualityProof {
         let mut y_r = Scalar::random(&mut OsRng);
 
         let Y_0 = (&y_s * P_source).compress();
-        let Y_1 =
-            RistrettoPoint::multiscalar_mul(vec![&y_x, &y_s], vec![&(*G), D_source]).compress();
-        let Y_2 = RistrettoPoint::multiscalar_mul(vec![&y_x, &y_r], vec![&(*G), &(*H)]).compress();
+        let Y_1 = RistrettoPoint::multiscalar_mul(vec![&y_x, &y_s], vec![&G, D_source]).compress();
+        let Y_2 = RistrettoPoint::multiscalar_mul(vec![&y_x, &y_r], vec![&G, &(*H)]).compress();
 
         // record masking factors in the transcript
         transcript.append_point(b"Y_0", &Y_0);
@@ -177,7 +176,7 @@ impl CiphertextCommitmentEqualityProof {
             vec![
                 &self.z_s,           // z_s
                 &(-&c),              // -c
-                &(-&Scalar::one()),  // -identity
+                &(-&Scalar::ONE),    // -identity
                 &(&w * &self.z_x),   // w * z_x
                 &(&w * &self.z_s),   // w * z_s
                 &(&w_negated * &c),  // -w * c
@@ -191,11 +190,11 @@ impl CiphertextCommitmentEqualityProof {
                 P_source,      // P_source
                 &(*H),         // H
                 &Y_0,          // Y_0
-                &(*G),         // G
+                &G,            // G
                 D_source,      // D_source
                 C_source,      // C_source
                 &Y_1,          // Y_1
-                &(*G),         // G
+                &G,            // G
                 &(*H),         // H
                 C_destination, // C_destination
                 &Y_2,          // Y_2
@@ -309,7 +308,7 @@ mod test {
     #[test]
     fn test_ciphertext_commitment_equality_proof_edge_cases() {
         // if ElGamal public key zero (public key is invalid), then the proof should always reject
-        let public = ElGamalPubkey::from_bytes(&[0u8; 32]).unwrap();
+        let public = ElGamalPubkey::try_from([0u8; 32].as_slice()).unwrap();
         let secret = ElGamalSecretKey::new_rand();
 
         let elgamal_keypair = ElGamalKeypair::new_for_tests(public, secret);

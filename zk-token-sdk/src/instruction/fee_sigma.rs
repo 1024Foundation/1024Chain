@@ -6,7 +6,7 @@
 //! A formal documentation of how transfer fees and fee sigma proof are computed can be found in
 //! the [`ZK Token proof`] program documentation.
 //!
-//! [`ZK Token proof`]: https://docs.solanalabs.com/runtime/zk-token-proof
+//! [`ZK Token proof`]: https://docs.anza.xyz/runtime/zk-elgamal-proof
 
 #[cfg(not(target_os = "solana"))]
 use {
@@ -24,7 +24,7 @@ use {
         instruction::{ProofType, ZkProofData},
         zk_token_elgamal::pod,
     },
-    bytemuck::{Pod, Zeroable},
+    bytemuck_derive::{Pod, Zeroable},
 };
 
 /// The instruction data that is needed for the `ProofInstruction::VerifyFeeSigma` instruction.
@@ -43,7 +43,7 @@ pub struct FeeSigmaProofData {
 ///
 /// We refer to [`ZK Token proof`] for the formal details on how the fee sigma proof is computed.
 ///
-/// [`ZK Token proof`]: https://docs.solanalabs.com/runtime/zk-token-proof
+/// [`ZK Token proof`]: https://docs.anza.xyz/runtime/zk-elgamal-proof
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
 pub struct FeeSigmaProofContext {

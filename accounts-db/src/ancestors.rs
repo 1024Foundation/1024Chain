@@ -1,13 +1,14 @@
 use {
     crate::rolling_bit_field::RollingBitField,
     core::fmt::{Debug, Formatter},
-    solana_sdk::clock::Slot,
+    solana_clock::Slot,
     std::collections::HashMap,
 };
 
 pub type AncestorsForSerialization = HashMap<Slot, usize>;
 
-#[derive(Clone, PartialEq, AbiExample)]
+#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
+#[derive(Clone, PartialEq)]
 pub struct Ancestors {
     ancestors: RollingBitField,
 }
@@ -45,7 +46,7 @@ impl From<Vec<Slot>> for Ancestors {
 
 impl From<&HashMap<Slot, usize>> for Ancestors {
     fn from(source: &HashMap<Slot, usize>) -> Ancestors {
-        let vec = source.iter().map(|(slot, _)| *slot).collect::<Vec<_>>();
+        let vec = source.keys().copied().collect::<Vec<_>>();
         Ancestors::from(vec)
     }
 }
@@ -128,7 +129,7 @@ pub mod tests {
 
     #[test]
     fn test_ancestors_permutations() {
-        solana_logger::setup();
+        agave_logger::setup();
         let mut ancestors = Ancestors::default();
         let mut hash = HashMap::new();
 
@@ -193,7 +194,7 @@ pub mod tests {
 
     #[test]
     fn test_ancestors_smaller() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         for width in 0..34 {
             let mut hash = HashSet::new();

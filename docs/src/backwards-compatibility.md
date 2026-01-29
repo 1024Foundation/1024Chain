@@ -3,22 +3,25 @@ title: Backward Compatibility Policy
 ---
 
 As the Solana developer ecosystem grows, so does the need for clear expectations around
-breaking API and behavior changes affecting applications and tooling built for Solana.
+breaking API and behavior changes affecting applications and tooling built for Solana by Anza.
 In a perfect world, Solana development could continue at a very fast pace without ever
 causing issues for existing developers. However, some compromises will need to be made
-and so this document attempts to clarify and codify the process for new releases.
+and so this document attempts to clarify and codify the process for new releases. Furthermore,
+there will be a growing number of validator clients maintained separately by distinct teams.
+Coordinating across these teams to ensure the reliability of the network will require ongoing
+communication.
 
 ### Expectations
 
-- Solana software releases include APIs, SDKs, and CLI tooling (with a few [exceptions](#exceptions)).
-- Solana software releases follow semantic versioning, more details below.
+- Agave software releases include APIs, SDKs, and CLI tooling (with a few [exceptions](#exceptions)).
+- Agave software releases follow semantic versioning, more details below.
 - Software for a `MINOR` version release will be compatible across all software on the
   same `MAJOR` version.
 
 ### Deprecation Process
 
 1. In any `PATCH` or `MINOR` release, a feature, API, endpoint, etc. could be marked as deprecated.
-2. According to code upgrade difficulty, some features will be remain deprecated for a few release
+2. According to code upgrade difficulty, some features will remain deprecated for a few release
    cycles.
 3. In a future `MAJOR` release, deprecated features will be removed in an incompatible way.
 
@@ -76,7 +79,7 @@ Major releases:
 - [`solana-program`](https://docs.rs/solana-program/) - Rust SDK for writing programs
 - [`solana-client`](https://docs.rs/solana-client/) - Rust client for connecting to RPC API
 - [`solana-cli-config`](https://docs.rs/solana-cli-config/) - Rust client for managing Solana CLI config files
-- [`solana-geyser-plugin-interface`](https://docs.rs/solana-geyser-plugin-interface/) - Rust interface for developing Solana Geyser plugins.
+- [`agave-geyser-plugin-interface`](https://docs.rs/agave-geyser-plugin-interface/) - Rust interface for developing Solana Geyser plugins.
 
 Patch releases:
 
@@ -112,7 +115,7 @@ Major releases:
 
 ### Runtime Features
 
-New Solana runtime features are feature-switched and manually activated. Runtime features
+New Agave runtime features are feature-switched and manually activated. Runtime features
 include: the introduction of new native programs, sysvars, and syscalls; and changes to
 their behavior. Feature activation is cluster agnostic, allowing confidence to be built on
 Testnet before activation on Mainnet-beta.
@@ -125,13 +128,6 @@ The release process is as follows:
 3. The feature takes effect at the beginning of the next epoch
 
 ### Infrastructure Changes
-
-#### Public API Nodes
-
-Solana provides publicly available RPC API nodes for all developers to use. The Solana team
-will make their best effort to communicate any changes to the host, port, rate-limiting behavior,
-availability, etc. However, we recommend that developers rely on their own validator nodes to
-discourage dependence upon Solana operated nodes.
 
 #### Local cluster scripts and Docker images
 

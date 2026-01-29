@@ -5,24 +5,24 @@ extern crate log;
 use {
     rayon::iter::*,
     solana_gossip::{
-        cluster_info::{ClusterInfo, Node},
-        contact_info::{LegacyContactInfo as ContactInfo, Protocol},
+        cluster_info::ClusterInfo,
+        contact_info::{ContactInfo, Protocol},
         crds::Cursor,
         gossip_service::GossipService,
+        node::Node,
     },
+    solana_hash::Hash,
+    solana_keypair::Keypair,
     solana_perf::packet::Packet,
+    solana_pubkey::Pubkey,
     solana_runtime::bank_forks::BankForks,
-    solana_sdk::{
-        hash::Hash,
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-        timing::timestamp,
-        transaction::Transaction,
-    },
+    solana_signer::Signer,
     solana_streamer::{
         sendmmsg::{multi_target_send, SendPktsError},
         socket::SocketAddrSpace,
     },
+    solana_time_utils::timestamp,
+    solana_transaction::Transaction,
     solana_vote_program::{vote_instruction, vote_state::Vote},
     std::{
         net::UdpSocket,
@@ -129,13 +129,13 @@ fn retransmit_to(
     let dests: Vec<_> = if forwarded {
         peers
             .iter()
-            .filter_map(|peer| peer.tvu(Protocol::UDP).ok())
+            .filter_map(|peer| peer.tvu(Protocol::UDP))
             .filter(|addr| socket_addr_space.check(addr))
             .collect()
     } else {
         peers
             .iter()
-            .filter_map(|peer| peer.tvu(Protocol::UDP).ok())
+            .filter_map(|peer| peer.tvu(Protocol::UDP))
             .filter(|addr| socket_addr_space.check(addr))
             .collect()
     };
@@ -155,8 +155,8 @@ fn retransmit_to(
 /// ring a -> b -> c -> d -> e -> a
 #[test]
 fn gossip_ring() {
-    solana_logger::setup();
-    run_gossip_topo(50, |listen| {
+    agave_logger::setup();
+    run_gossip_topo(40, |listen| {
         let num = listen.len();
         for n in 0..num {
             let y = n % listen.len();
@@ -164,7 +164,7 @@ fn gossip_ring() {
             let yv = &listen[y].0;
             let mut d = yv.lookup_contact_info(&yv.id(), |ci| ci.clone()).unwrap();
             d.set_wallclock(timestamp());
-            listen[x].0.insert_legacy_info(d);
+            listen[x].0.insert_info(d);
         }
     });
 }
@@ -173,7 +173,7 @@ fn gossip_ring() {
 #[test]
 #[ignore]
 fn gossip_ring_large() {
-    solana_logger::setup();
+    agave_logger::setup();
     run_gossip_topo(600, |listen| {
         let num = listen.len();
         for n in 0..num {
@@ -182,14 +182,14 @@ fn gossip_ring_large() {
             let yv = &listen[y].0;
             let mut d = yv.lookup_contact_info(&yv.id(), |ci| ci.clone()).unwrap();
             d.set_wallclock(timestamp());
-            listen[x].0.insert_legacy_info(d);
+            listen[x].0.insert_info(d);
         }
     });
 }
 /// star a -> (b,c,d,e)
 #[test]
 fn gossip_star() {
-    solana_logger::setup();
+    agave_logger::setup();
     run_gossip_topo(10, |listen| {
         let num = listen.len();
         for n in 0..(num - 1) {
@@ -199,7 +199,7 @@ fn gossip_star() {
             let mut yd = yv.lookup_contact_info(&yv.id(), |ci| ci.clone()).unwrap();
             yd.set_wallclock(timestamp());
             let xv = &listen[x].0;
-            xv.insert_legacy_info(yd);
+            xv.insert_info(yd);
             trace!("star leader {}", &xv.id());
         }
     });
@@ -208,7 +208,7 @@ fn gossip_star() {
 /// rstar a <- (b,c,d,e)
 #[test]
 fn gossip_rstar() {
-    solana_logger::setup();
+    agave_logger::setup();
     run_gossip_topo(10, |listen| {
         let num = listen.len();
         let xd = {
@@ -219,7 +219,7 @@ fn gossip_rstar() {
         for n in 0..(num - 1) {
             let y = (n + 1) % listen.len();
             let yv = &listen[y].0;
-            yv.insert_legacy_info(xd.clone());
+            yv.insert_info(xd.clone());
             trace!("rstar insert {} into {}", xd.pubkey(), yv.id());
         }
     });
@@ -227,7 +227,7 @@ fn gossip_rstar() {
 
 #[test]
 pub fn cluster_info_retransmit() {
-    solana_logger::setup();
+    agave_logger::setup();
     let exit = Arc::new(AtomicBool::new(false));
     trace!("c1:");
     let (c1, dr1, tn1) = test_node(exit.clone());
@@ -257,7 +257,7 @@ pub fn cluster_info_retransmit() {
     assert!(done);
     let mut p = Packet::default();
     p.meta_mut().size = 10;
-    let peers = c1.tvu_peers();
+    let peers = c1.tvu_peers(ContactInfo::clone);
     let retransmit_peers: Vec<_> = peers.iter().collect();
     retransmit_to(
         &retransmit_peers,
@@ -295,7 +295,7 @@ pub fn cluster_info_scale() {
             genesis_utils::{create_genesis_config_with_vote_accounts, ValidatorVoteKeypairs},
         },
     };
-    solana_logger::setup();
+    agave_logger::setup();
     let exit = Arc::new(AtomicBool::new(false));
     let num_nodes: usize = std::env::var("NUM_NODES")
         .unwrap_or_else(|_| "10".to_string())
@@ -347,7 +347,7 @@ pub fn cluster_info_scale() {
         sleep(Duration::from_secs(1));
     }
     time.stop();
-    warn!("found {} nodes in {} success: {}", num_nodes, time, success);
+    warn!("found {num_nodes} nodes in {time} success: {success}");
 
     for num_votes in 1..1000 {
         let mut time = Measure::start("votes");
@@ -391,10 +391,10 @@ pub fn cluster_info_scale() {
                 }
             }
             warn!("not_done: {}/{}", not_done, nodes.len());
-            warn!("num_old: {}", num_old);
-            warn!("num_push_total: {}", num_push_total);
-            warn!("num_pushes: {}", num_pushes);
-            warn!("num_pulls: {}", num_pulls);
+            warn!("num_old: {num_old}");
+            warn!("num_push_total: {num_push_total}");
+            warn!("num_pushes: {num_pushes}");
+            warn!("num_pulls: {num_pulls}");
             success = not_done < (nodes.len() / 20);
             if success {
                 break;
@@ -402,10 +402,7 @@ pub fn cluster_info_scale() {
             sleep(Duration::from_millis(200));
         }
         time.stop();
-        warn!(
-            "propagated vote {} in {} success: {}",
-            num_votes, time, success
-        );
+        warn!("propagated vote {num_votes} in {time} success: {success}");
         sleep(Duration::from_millis(200));
         for (node, _, _) in nodes.iter() {
             node.gossip.push.num_old.store(0, Ordering::Relaxed);

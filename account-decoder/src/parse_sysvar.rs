@@ -1,5 +1,5 @@
 #[allow(deprecated)]
-use solana_sdk::sysvar::{fees::Fees, recent_blockhashes::RecentBlockhashes};
+use solana_sysvar::{fees::Fees, recent_blockhashes::RecentBlockhashes};
 use {
     crate::{
         parse_account_data::{ParsableAccount, ParseAccountError},
@@ -7,17 +7,17 @@ use {
     },
     bincode::deserialize,
     bv::BitVec,
-    solana_sdk::{
-        clock::{Clock, Epoch, Slot, UnixTimestamp},
-        epoch_schedule::EpochSchedule,
-        pubkey::Pubkey,
-        rent::Rent,
-        slot_hashes::SlotHashes,
-        slot_history::{self, SlotHistory},
-        stake_history::{StakeHistory, StakeHistoryEntry},
-        sysvar::{
-            self, epoch_rewards::EpochRewards, last_restart_slot::LastRestartSlot, rewards::Rewards,
-        },
+    serde::{Deserialize, Serialize},
+    solana_clock::{Clock, Epoch, Slot, UnixTimestamp},
+    solana_epoch_schedule::EpochSchedule,
+    solana_pubkey::Pubkey,
+    solana_rent::Rent,
+    solana_sdk_ids::sysvar,
+    solana_slot_hashes::SlotHashes,
+    solana_slot_history::{self as slot_history, SlotHistory},
+    solana_stake_interface::stake_history::{StakeHistory, StakeHistoryEntry},
+    solana_sysvar::{
+        epoch_rewards::EpochRewards, last_restart_slot::LastRestartSlot, rewards::Rewards,
     },
 };
 
@@ -94,7 +94,7 @@ pub fn parse_sysvar(data: &[u8], pubkey: &Pubkey) -> Result<SysvarAccountType, P
         } else if pubkey == &sysvar::epoch_rewards::id() {
             deserialize::<EpochRewards>(data)
                 .ok()
-                .map(SysvarAccountType::EpochRewards)
+                .map(|epoch_rewards| SysvarAccountType::EpochRewards(epoch_rewards.into()))
         } else {
             None
         }
@@ -119,7 +119,7 @@ pub enum SysvarAccountType {
     SlotHistory(UiSlotHistory),
     StakeHistory(Vec<UiStakeHistoryEntry>),
     LastRestartSlot(UiLastRestartSlot),
-    EpochRewards(EpochRewards),
+    EpochRewards(UiEpochRewards),
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -239,18 +239,44 @@ pub struct UiLastRestartSlot {
     pub last_restart_slot: Slot,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UiEpochRewards {
+    pub distribution_starting_block_height: u64,
+    pub num_partitions: u64,
+    pub parent_blockhash: String,
+    pub total_points: String,
+    pub total_rewards: String,
+    pub distributed_rewards: String,
+    pub active: bool,
+}
+
+impl From<EpochRewards> for UiEpochRewards {
+    fn from(epoch_rewards: EpochRewards) -> Self {
+        Self {
+            distribution_starting_block_height: epoch_rewards.distribution_starting_block_height,
+            num_partitions: epoch_rewards.num_partitions,
+            parent_blockhash: epoch_rewards.parent_blockhash.to_string(),
+            total_points: epoch_rewards.total_points.to_string(),
+            total_rewards: epoch_rewards.total_rewards.to_string(),
+            distributed_rewards: epoch_rewards.distributed_rewards.to_string(),
+            active: epoch_rewards.active,
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     #[allow(deprecated)]
-    use solana_sdk::sysvar::recent_blockhashes::IterItem;
+    use solana_sysvar::recent_blockhashes::IterItem;
     use {
-        super::*,
-        solana_sdk::{account::create_account_for_test, fee_calculator::FeeCalculator, hash::Hash},
+        super::*, solana_account::create_account_for_test, solana_fee_calculator::FeeCalculator,
+        solana_hash::Hash,
     };
 
     #[test]
     fn test_parse_sysvars() {
-        let hash = Hash::new(&[1; 32]);
+        let hash = Hash::new_from_array([1; 32]);
 
         let clock_sysvar = create_account_for_test(&Clock::default());
         assert_eq!(
@@ -350,7 +376,7 @@ mod test {
             }]),
         );
 
-        let bad_pubkey = solana_sdk::pubkey::new_rand();
+        let bad_pubkey = solana_pubkey::new_rand();
         assert!(parse_sysvar(&stake_history_sysvar.data, &bad_pubkey).is_err());
 
         let bad_data = vec![0; 4];
@@ -372,14 +398,16 @@ mod test {
         );
 
         let epoch_rewards = EpochRewards {
+            distribution_starting_block_height: 42,
             total_rewards: 100,
             distributed_rewards: 20,
-            distribution_complete_block_height: 42,
+            active: true,
+            ..EpochRewards::default()
         };
         let epoch_rewards_sysvar = create_account_for_test(&epoch_rewards);
         assert_eq!(
             parse_sysvar(&epoch_rewards_sysvar.data, &sysvar::epoch_rewards::id()).unwrap(),
-            SysvarAccountType::EpochRewards(epoch_rewards),
+            SysvarAccountType::EpochRewards(epoch_rewards.into()),
         );
     }
 }

@@ -4,20 +4,15 @@
 //! [implementation](https://github.com/dalek-cryptography/bulletproofs). Compared to the original
 //! implementation by dalek-cryptography:
 //! - This implementation focuses on the range proof implementation, while the dalek-cryptography
-//! crate additionally implements the general bulletproofs implementation for languages that can be
-//! represented by arithmetic circuits as well as MPC.
+//!   crate additionally implements the general bulletproofs implementation for languages that can be
+//!   represented by arithmetic circuits as well as MPC.
 //! - This implementation implements a non-interactive range proof aggregation that is specified in
-//! the original Bulletproofs [paper](https://eprint.iacr.org/2017/1066) (Section 4.3).
+//!   the original Bulletproofs [paper](https://eprint.iacr.org/2017/1066) (Section 4.3).
 //!
 
 #[cfg(not(target_os = "solana"))]
 use {
     crate::encryption::pedersen::{Pedersen, PedersenCommitment, PedersenOpening},
-    curve25519_dalek::traits::MultiscalarMul,
-    rand::rngs::OsRng,
-    subtle::{Choice, ConditionallySelectable},
-};
-use {
     crate::{
         encryption::pedersen::{G, H},
         range_proof::{
@@ -28,20 +23,27 @@ use {
         transcript::TranscriptProtocol,
     },
     core::iter,
+    curve25519_dalek::traits::MultiscalarMul,
     curve25519_dalek::{
         ristretto::{CompressedRistretto, RistrettoPoint},
         scalar::Scalar,
         traits::{IsIdentity, VartimeMultiscalarMul},
     },
     merlin::Transcript,
+    rand::rngs::OsRng,
+    subtle::{Choice, ConditionallySelectable},
 };
 
 pub mod errors;
+#[cfg(not(target_os = "solana"))]
 pub mod generators;
+#[cfg(not(target_os = "solana"))]
 pub mod inner_product;
+#[cfg(not(target_os = "solana"))]
 pub mod util;
 
 #[allow(non_snake_case)]
+#[cfg(not(target_os = "solana"))]
 #[derive(Clone)]
 pub struct RangeProof {
     pub A: CompressedRistretto,       // 32 bytes
@@ -55,6 +57,7 @@ pub struct RangeProof {
 }
 
 #[allow(non_snake_case)]
+#[cfg(not(target_os = "solana"))]
 impl RangeProof {
     /// Create an aggregated range proof.
     ///
@@ -146,16 +149,16 @@ impl RangeProof {
 
         let mut i = 0;
         let mut exp_z = z * z;
-        let mut exp_y = Scalar::one();
+        let mut exp_y = Scalar::ONE;
 
         for (amount_i, n_i) in amounts.iter().zip(bit_lengths.iter()) {
-            let mut exp_2 = Scalar::one();
+            let mut exp_2 = Scalar::ONE;
 
             for j in 0..(*n_i) {
                 // `j` is guaranteed to be at most `u64::BITS` (a 6-bit number) and therefore,
                 // casting is lossless and right shift can be safely unwrapped
                 let a_L_j = Scalar::from(amount_i.checked_shr(j as u32).unwrap() & 1);
-                let a_R_j = a_L_j - Scalar::one();
+                let a_R_j = a_L_j - Scalar::ONE;
 
                 l_poly.0[i] = a_L_j - z;
                 l_poly.1[i] = s_L[i];
@@ -190,7 +193,7 @@ impl RangeProof {
         // z^2 * V_1 + z^3 * V_2 + ... + z^{m+1} * V_m + delta(y, z)*G + x*T_1 + x^2*T_2
         let x = transcript.challenge_scalar(b"x");
 
-        let mut agg_opening = Scalar::zero();
+        let mut agg_opening = Scalar::ZERO;
         let mut exp_z = z;
         for opening in openings {
             exp_z *= z;
@@ -219,9 +222,9 @@ impl RangeProof {
         // compute the inner product argument on the commitment:
         // P = <l(x), G> + <r(x), H'> + <l(x), r(x)>*Q
         let w = transcript.challenge_scalar(b"w");
-        let Q = w * &(*G);
+        let Q = w * &G;
 
-        let G_factors: Vec<Scalar> = iter::repeat(Scalar::one()).take(nm).collect();
+        let G_factors: Vec<Scalar> = iter::repeat_n(Scalar::ONE, nm).collect();
         let H_factors: Vec<Scalar> = util::exp_iter(y.invert()).take(nm).collect();
 
         // generate challenge `c` for consistency with the verifier's transcript
@@ -322,7 +325,7 @@ impl RangeProof {
         let value_commitment_scalars = util::exp_iter(z).take(m).map(|z_exp| c * zz * z_exp);
 
         let mega_check = RistrettoPoint::optional_multiscalar_mul(
-            iter::once(Scalar::one())
+            iter::once(Scalar::ONE)
                 .chain(iter::once(x))
                 .chain(iter::once(c * x))
                 .chain(iter::once(c * x * x))
@@ -338,7 +341,7 @@ impl RangeProof {
                 .chain(iter::once(self.T_1.decompress()))
                 .chain(iter::once(self.T_2.decompress()))
                 .chain(iter::once(Some(*H)))
-                .chain(iter::once(Some(*G)))
+                .chain(iter::once(Some(G)))
                 .chain(self.ipp_proof.L_vec.iter().map(|L| L.decompress()))
                 .chain(self.ipp_proof.R_vec.iter().map(|R| R.decompress()))
                 .chain(bp_gens.G(nm).map(|&x| Some(x)))
@@ -385,10 +388,13 @@ impl RangeProof {
         let T_2 = CompressedRistretto(util::read32(&slice[3 * 32..]));
 
         let t_x = Scalar::from_canonical_bytes(util::read32(&slice[4 * 32..]))
+            .into_option()
             .ok_or(RangeProofVerificationError::Deserialization)?;
         let t_x_blinding = Scalar::from_canonical_bytes(util::read32(&slice[5 * 32..]))
+            .into_option()
             .ok_or(RangeProofVerificationError::Deserialization)?;
         let e_blinding = Scalar::from_canonical_bytes(util::read32(&slice[6 * 32..]))
+            .into_option()
             .ok_or(RangeProofVerificationError::Deserialization)?;
 
         let ipp_proof = InnerProductProof::from_bytes(&slice[7 * 32..])?;
@@ -410,6 +416,7 @@ impl RangeProof {
 /// \\[
 /// \delta(y,z) = (z - z^{2}) \langle \mathbf{1}, {\mathbf{y}}^{n \cdot m} \rangle - \sum_{j=0}^{m-1} z^{j+3} \cdot \langle \mathbf{1}, {\mathbf{2}}^{n \cdot m} \rangle
 /// \\]
+#[cfg(not(target_os = "solana"))]
 fn delta(bit_lengths: &[usize], y: &Scalar, z: &Scalar) -> Scalar {
     let nm: usize = bit_lengths.iter().sum();
     let sum_y = util::sum_of_powers(y, nm);

@@ -1,0 +1,15 @@
+[package]
+name = "gen-syscall-list"
+publish = false
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[features]
+agave-unstable-api = []
+
+[build-dependencies]
+regex = { workspace = true }

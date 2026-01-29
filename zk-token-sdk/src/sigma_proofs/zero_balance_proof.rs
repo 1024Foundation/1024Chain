@@ -136,7 +136,7 @@ impl ZeroBalanceProof {
             vec![
                 &self.z,            // z
                 &(-&c),             // -c
-                &(-&Scalar::one()), // -identity
+                &(-&Scalar::ONE),   // -identity
                 &(&w * &self.z),    // w * z
                 &(&w_negated * &c), // -w * c
                 &w_negated,         // -w
@@ -286,7 +286,7 @@ mod test {
         let mut prover_transcript = Transcript::new(b"test");
         let mut verifier_transcript = Transcript::new(b"test");
 
-        let public = ElGamalPubkey::from_bytes(&[0u8; 32]).unwrap();
+        let public = ElGamalPubkey::try_from([0u8; 32].as_slice()).unwrap();
         let ciphertext = public.encrypt(0_u64);
 
         let proof = ZeroBalanceProof::new(&source_keypair, &ciphertext, &mut prover_transcript);

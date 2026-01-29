@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 #![allow(clippy::arithmetic_side_effects)]
 
 pub mod nonblocking;
@@ -9,12 +18,16 @@ extern crate solana_metrics;
 use {
     crate::{
         nonblocking::quic_client::{
-            QuicClient, QuicClientCertificate,
-            QuicClientConnection as NonblockingQuicClientConnection, QuicLazyInitializedEndpoint,
+            QuicClient, QuicClientConnection as NonblockingQuicClientConnection,
+            QuicLazyInitializedEndpoint,
         },
-        quic_client::QuicClientConnection as BlockingQuicClientConnection,
+        quic_client::{
+            close_quic_connection, QuicClientConnection as BlockingQuicClientConnection,
+        },
     },
-    quinn::Endpoint,
+    log::debug,
+    quic_client::get_runtime,
+    quinn::{Endpoint, EndpointConfig, TokioRuntime},
     solana_connection_cache::{
         connection_cache::{
             BaseClientConnection, ClientError, ConnectionCache, ConnectionManager, ConnectionPool,
@@ -22,17 +35,13 @@ use {
         },
         connection_cache_stats::ConnectionCacheStats,
     },
-    solana_sdk::{
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-    },
-    solana_streamer::{
-        nonblocking::quic::{compute_max_allowed_uni_streams, ConnectionPeerType},
-        streamer::StakedNodes,
-        tls_certificates::new_dummy_x509_certificate,
-    },
+    solana_keypair::Keypair,
+    solana_pubkey::Pubkey,
+    solana_signer::Signer,
+    solana_streamer::streamer::StakedNodes,
+    solana_tls_utils::{new_dummy_x509_certificate, QuicClientCertificate},
     std::{
-        net::{IpAddr, SocketAddr},
+        net::{IpAddr, SocketAddr, UdpSocket},
         sync::{Arc, RwLock},
     },
 };
@@ -65,14 +74,26 @@ impl ConnectionPool for QuicPool {
 
     fn create_pool_entry(
         &self,
-        config: &Self::NewConnectionConfig,
+        _config: &Self::NewConnectionConfig,
         addr: &SocketAddr,
     ) -> Arc<Self::BaseClientConnection> {
         Arc::new(Quic(Arc::new(QuicClient::new(
             self.endpoint.clone(),
             *addr,
-            config.compute_max_parallel_streams(),
         ))))
+    }
+}
+
+impl Drop for QuicPool {
+    fn drop(&mut self) {
+        debug!(
+            "Dropping QuicPool with {} connections",
+            self.connections.len()
+        );
+        for connection in self.connections.drain(..) {
+            // Explicitly drop each connection to ensure resources are released
+            close_quic_connection(connection.0.clone());
+        }
     }
 }
 
@@ -120,24 +141,6 @@ impl QuicConfig {
         QuicLazyInitializedEndpoint::new(cert_guard.clone(), self.client_endpoint.as_ref().cloned())
     }
 
-    fn compute_max_parallel_streams(&self) -> usize {
-        let (client_type, total_stake) =
-            self.maybe_client_pubkey
-                .map_or((ConnectionPeerType::Unstaked, 0), |pubkey| {
-                    self.maybe_staked_nodes.as_ref().map_or(
-                        (ConnectionPeerType::Unstaked, 0),
-                        |stakes| {
-                            let rstakes = stakes.read().unwrap();
-                            rstakes.get_node_stake(&pubkey).map_or(
-                                (ConnectionPeerType::Unstaked, rstakes.total_stake()),
-                                |stake| (ConnectionPeerType::Staked(stake), rstakes.total_stake()),
-                            )
-                        },
-                    )
-                });
-        compute_max_allowed_uni_streams(client_type, total_stake)
-    }
-
     pub fn update_client_certificate(&mut self, keypair: &Keypair, _ipaddr: IpAddr) {
         let (cert, priv_key) = new_dummy_x509_certificate(keypair);
 
@@ -169,8 +172,14 @@ impl QuicConfig {
         self.maybe_client_pubkey = Some(*client_pubkey);
     }
 
-    pub fn update_client_endpoint(&mut self, client_endpoint: Endpoint) {
-        self.client_endpoint = Some(client_endpoint);
+    pub fn update_client_endpoint(&mut self, client_socket: UdpSocket) {
+        let runtime = get_runtime();
+        let _guard = runtime.enter();
+        let config = EndpointConfig::default();
+        self.client_endpoint = Some(
+            quinn::Endpoint::new(config, None, client_socket, Arc::new(TokioRuntime))
+                .expect("QuicNewConnection::create_endpoint quinn::Endpoint::new"),
+        );
     }
 }
 
@@ -249,60 +258,4 @@ pub fn new_quic_connection_cache(
     config.set_staked_nodes(staked_nodes, &keypair.pubkey());
     let connection_manager = QuicConnectionManager::new_with_connection_config(config);
     ConnectionCache::new(name, connection_manager, connection_pool_size)
-}
-
-#[cfg(test)]
-mod tests {
-    use {
-        super::*,
-        solana_sdk::quic::{
-            QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS, QUIC_MIN_STAKED_CONCURRENT_STREAMS,
-            QUIC_TOTAL_STAKED_CONCURRENT_STREAMS,
-        },
-        std::collections::HashMap,
-    };
-
-    #[test]
-    fn test_connection_cache_max_parallel_chunks() {
-        solana_logger::setup();
-
-        let mut connection_config = QuicConfig::new().unwrap();
-        assert_eq!(
-            connection_config.compute_max_parallel_streams(),
-            QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS
-        );
-
-        let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
-        let pubkey = Pubkey::new_unique();
-        connection_config.set_staked_nodes(&staked_nodes, &pubkey);
-        assert_eq!(
-            connection_config.compute_max_parallel_streams(),
-            QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS
-        );
-        let overrides = HashMap::<Pubkey, u64>::default();
-        let mut stakes = HashMap::from([(Pubkey::new_unique(), 10_000)]);
-        *staked_nodes.write().unwrap() =
-            StakedNodes::new(Arc::new(stakes.clone()), overrides.clone());
-        assert_eq!(
-            connection_config.compute_max_parallel_streams(),
-            QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS
-        );
-
-        stakes.insert(pubkey, 1);
-        *staked_nodes.write().unwrap() =
-            StakedNodes::new(Arc::new(stakes.clone()), overrides.clone());
-        let delta =
-            (QUIC_TOTAL_STAKED_CONCURRENT_STREAMS - QUIC_MIN_STAKED_CONCURRENT_STREAMS) as f64;
-
-        assert_eq!(
-            connection_config.compute_max_parallel_streams(),
-            (QUIC_MIN_STAKED_CONCURRENT_STREAMS as f64 + (1f64 / 10000f64) * delta) as usize
-        );
-        stakes.insert(pubkey, 1_000);
-        *staked_nodes.write().unwrap() = StakedNodes::new(Arc::new(stakes.clone()), overrides);
-        assert_ne!(
-            connection_config.compute_max_parallel_streams(),
-            QUIC_MIN_STAKED_CONCURRENT_STREAMS
-        );
-    }
 }

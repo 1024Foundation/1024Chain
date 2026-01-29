@@ -10,6 +10,7 @@ message ConfirmedBlock {
     repeated Reward rewards = 5;
     UnixTimestamp block_time = 6;
     BlockHeight block_height = 7;
+    NumPartitions num_partitions = 8;
 }
 
 message ConfirmedTransaction {
@@ -64,6 +65,8 @@ message TransactionStatusMeta {
     // Available since Solana v1.10.35 / v1.11.6.
     // Set to `None` for txs executed on earlier versions.
     optional uint64 compute_units_consumed = 16;
+    // Total transaction cost
+    optional uint64 cost_units = 17;
 }
 
 message TransactionError {
@@ -130,6 +133,7 @@ message Reward {
 
 message Rewards {
   repeated Reward rewards = 1;
+  NumPartitions num_partitions = 2;
 }
 
 message UnixTimestamp {
@@ -138,4 +142,8 @@ message UnixTimestamp {
 
 message BlockHeight {
     uint64 block_height = 1;
+}
+
+message NumPartitions {
+    uint64 num_partitions = 1;
 }

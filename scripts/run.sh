@@ -17,15 +17,17 @@ fi
 
 
 profile=debug
-if [[ -n $NDEBUG ]]; then
-  profile=release
+if [[ -n $CARGO_BUILD_PROFILE ]]; then
+  profile=$CARGO_BUILD_PROFILE
 fi
 PATH=$PWD/target/$profile:$PATH
 
 ok=true
-for program in solana-{faucet,genesis,keygen,validator}; do
+for program in solana-{faucet,genesis,keygen}; do
   $program -V || ok=false
 done
+agave-validator -V || ok=false
+
 $ok || {
   echo
   echo "Unable to locate required programs.  Try building them first with:"
@@ -35,7 +37,7 @@ $ok || {
   exit 1
 }
 
-export RUST_LOG=${RUST_LOG:-solana=info,solana_runtime::message_processor=debug} # if RUST_LOG is unset, default to info
+export RUST_LOG=${RUST_LOG:-solana=info,agave=info,solana_runtime::message_processor=debug} # if RUST_LOG is unset, default to info
 export RUST_BACKTRACE=1
 dataDir=$PWD/config/"$(basename "$0" .sh)"
 ledgerDir=$PWD/config/ledger
@@ -69,6 +71,11 @@ fi
 if [[ -e "$ledgerDir"/genesis.bin || -e "$ledgerDir"/genesis.tar.bz2 ]]; then
   echo "Use existing genesis"
 else
+  ./fetch-core-bpf.sh
+  if [[ -r core-bpf-genesis-args.sh ]]; then
+    CORE_BPF_GENESIS_ARGS=$(cat core-bpf-genesis-args.sh)
+  fi
+
   ./fetch-spl.sh
   if [[ -r spl-genesis-args.sh ]]; then
     SPL_GENESIS_ARGS=$(cat spl-genesis-args.sh)
@@ -84,6 +91,7 @@ else
       "$validator_stake_account" \
     --ledger "$ledgerDir" \
     --cluster-type "$SOLANA_RUN_SH_CLUSTER_TYPE" \
+    $CORE_BPF_GENESIS_ARGS \
     $SPL_GENESIS_ARGS \
     $SOLANA_RUN_SH_GENESIS_ARGS
 fi
@@ -115,7 +123,7 @@ args=(
   --no-os-network-limits-test
 )
 # shellcheck disable=SC2086
-solana-validator "${args[@]}" $SOLANA_RUN_SH_VALIDATOR_ARGS &
+agave-validator "${args[@]}" $SOLANA_RUN_SH_VALIDATOR_ARGS &
 validator=$!
 
 wait "$validator"

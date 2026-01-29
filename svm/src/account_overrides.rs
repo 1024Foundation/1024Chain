@@ -1,9 +1,11 @@
 use {
-    solana_sdk::{account::AccountSharedData, pubkey::Pubkey, sysvar},
+    solana_account::AccountSharedData, solana_pubkey::Pubkey, solana_sdk_ids::sysvar,
     std::collections::HashMap,
 };
 
-/// Encapsulates overridden accounts, typically used for transaction simulations
+/// Encapsulates overridden accounts, typically used for transaction
+/// simulations. Account overrides are currently not used when loading the
+/// durable nonce account or when constructing the instructions sysvar account.
 #[derive(Default)]
 pub struct AccountOverrides {
     accounts: HashMap<Pubkey, AccountSharedData>,
@@ -11,7 +13,7 @@ pub struct AccountOverrides {
 
 impl AccountOverrides {
     /// Insert or remove an account with a given pubkey to/from the list of overrides.
-    pub fn set_account(&mut self, pubkey: &Pubkey, account: Option<AccountSharedData>) {
+    fn set_account(&mut self, pubkey: &Pubkey, account: Option<AccountSharedData>) {
         match account {
             Some(account) => self.accounts.insert(*pubkey, account),
             None => self.accounts.remove(pubkey),
@@ -26,7 +28,7 @@ impl AccountOverrides {
     }
 
     /// Gets the account if it's found in the list of overrides
-    pub fn get(&self, pubkey: &Pubkey) -> Option<&AccountSharedData> {
+    pub(crate) fn get(&self, pubkey: &Pubkey) -> Option<&AccountSharedData> {
         self.accounts.get(pubkey)
     }
 }
@@ -34,8 +36,8 @@ impl AccountOverrides {
 #[cfg(test)]
 mod test {
     use {
-        crate::account_overrides::AccountOverrides,
-        solana_sdk::{account::AccountSharedData, pubkey::Pubkey, sysvar},
+        crate::account_overrides::AccountOverrides, solana_account::AccountSharedData,
+        solana_pubkey::Pubkey, solana_sdk_ids::sysvar,
     };
 
     #[test]

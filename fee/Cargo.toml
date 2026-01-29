@@ -1,0 +1,18 @@
+[package]
+name = "solana-fee"
+description = "Solana fee calculation"
+documentation = "https://docs.rs/solana-fee"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[features]
+agave-unstable-api = []
+
+[dependencies]
+agave-feature-set = { workspace = true }
+solana-fee-structure = { workspace = true }
+solana-svm-transaction = { workspace = true }

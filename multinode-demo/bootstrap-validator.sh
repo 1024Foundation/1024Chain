@@ -14,9 +14,9 @@ if [[ "$SOLANA_GPU_MISSING" -eq 1 ]]; then
 fi
 
 if [[ -n $SOLANA_CUDA ]]; then
-  program=$solana_validator_cuda
+  program=$agave_validator_cuda
 else
-  program=$solana_validator
+  program=$agave_validator
 fi
 
 no_restart=0
@@ -28,7 +28,7 @@ while [[ -n $1 ]]; do
     if [[ $1 = --init-complete-file ]]; then
       args+=("$1" "$2")
       shift 2
-    elif [[ $1 = --gossip-host ]]; then
+    elif [[ $1 = --bind-address ]]; then
       args+=("$1" "$2")
       shift 2
     elif [[ $1 = --gossip-port ]]; then
@@ -50,9 +50,6 @@ while [[ -n $1 ]]; do
       args+=("$1")
       shift
     elif [[ $1 = --rpc-pubsub-enable-block-subscription ]]; then
-      args+=("$1")
-      shift
-    elif [[ $1 = --enable-cpi-and-log-storage ]]; then
       args+=("$1")
       shift
     elif [[ $1 = --enable-extended-tx-metadata-storage ]]; then
@@ -110,6 +107,15 @@ while [[ -n $1 ]]; do
       args+=("$1" "$2")
       shift 2
     elif [[ $1 == --block-production-method ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --transaction-structure ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --wen-restart ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --wen-restart-coordinator ]]; then
       args+=("$1" "$2")
       shift 2
     else

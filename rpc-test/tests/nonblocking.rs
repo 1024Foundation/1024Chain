@@ -1,11 +1,11 @@
 use {
-    solana_client::{
-        connection_cache::Protocol,
-        nonblocking::tpu_client::{LeaderTpuService, TpuClient},
-        tpu_client::TpuClientConfig,
-    },
-    solana_sdk::{clock::DEFAULT_MS_PER_SLOT, pubkey::Pubkey, system_transaction},
+    solana_client::nonblocking::tpu_client::{LeaderTpuService, TpuClient},
+    solana_clock::DEFAULT_MS_PER_SLOT,
+    solana_connection_cache::connection_cache::Protocol,
+    solana_pubkey::Pubkey,
+    solana_system_transaction as system_transaction,
     solana_test_validator::TestValidatorGenesis,
+    solana_tpu_client::tpu_client::TpuClientConfig,
     std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -13,7 +13,7 @@ use {
     tokio::time::{sleep, Duration, Instant},
 };
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tpu_send_transaction() {
     let (test_validator, mint_keypair) = TestValidatorGenesis::default().start_async().await;
     let rpc_client = Arc::new(test_validator.get_async_rpc_client());
@@ -40,14 +40,14 @@ async fn test_tpu_send_transaction() {
             .get_signature_statuses(&signatures)
             .await
             .unwrap();
-        if statuses.value.first().is_some() {
+        if !statuses.value.is_empty() {
             break;
         }
     }
     tpu_client.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_tpu_cache_slot_updates() {
     let (test_validator, _) = TestValidatorGenesis::default().start_async().await;
     let rpc_client = Arc::new(test_validator.get_async_rpc_client());

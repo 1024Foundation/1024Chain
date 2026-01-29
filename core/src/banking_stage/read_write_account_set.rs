@@ -1,21 +1,17 @@
-use {
-    solana_sdk::{message::SanitizedMessage, pubkey::Pubkey},
-    std::collections::HashSet,
-};
+use {ahash::AHashSet, solana_pubkey::Pubkey, solana_svm_transaction::svm_message::SVMMessage};
 
 /// Wrapper struct to accumulate locks for a batch of transactions.
 #[derive(Debug, Default)]
 pub struct ReadWriteAccountSet {
     /// Set of accounts that are locked for read
-    read_set: HashSet<Pubkey>,
+    read_set: AHashSet<Pubkey>,
     /// Set of accounts that are locked for write
-    write_set: HashSet<Pubkey>,
+    write_set: AHashSet<Pubkey>,
 }
 
 impl ReadWriteAccountSet {
     /// Returns true if all account locks were available and false otherwise.
-    #[allow(dead_code)]
-    pub fn check_locks(&self, message: &SanitizedMessage) -> bool {
+    pub fn check_locks(&self, message: &impl SVMMessage) -> bool {
         message
             .account_keys()
             .iter()
@@ -31,7 +27,7 @@ impl ReadWriteAccountSet {
 
     /// Add all account locks.
     /// Returns true if all account locks were available and false otherwise.
-    pub fn take_locks(&mut self, message: &SanitizedMessage) -> bool {
+    pub fn take_locks(&mut self, message: &impl SVMMessage) -> bool {
         message
             .account_keys()
             .iter()
@@ -84,25 +80,29 @@ impl ReadWriteAccountSet {
 mod tests {
     use {
         super::ReadWriteAccountSet,
-        solana_ledger::genesis_utils::GenesisConfigInfo,
-        solana_runtime::{bank::Bank, genesis_utils::create_genesis_config},
-        solana_sdk::{
-            account::AccountSharedData,
-            address_lookup_table::{
-                self,
-                state::{AddressLookupTable, LookupTableMeta},
-            },
-            hash::Hash,
-            message::{
-                v0::{self, MessageAddressTableLookup},
-                MessageHeader, VersionedMessage,
-            },
-            pubkey::Pubkey,
-            signature::Keypair,
-            signer::Signer,
-            transaction::{MessageHash, SanitizedTransaction, VersionedTransaction},
+        solana_account::AccountSharedData,
+        solana_address_lookup_table_interface::{
+            self as address_lookup_table,
+            state::{AddressLookupTable, LookupTableMeta},
         },
-        std::{borrow::Cow, sync::Arc},
+        solana_hash::Hash,
+        solana_keypair::Keypair,
+        solana_ledger::genesis_utils::GenesisConfigInfo,
+        solana_message::{
+            v0::{self, MessageAddressTableLookup},
+            MessageHeader, VersionedMessage,
+        },
+        solana_pubkey::Pubkey,
+        solana_runtime::{bank::Bank, bank_forks::BankForks, genesis_utils::create_genesis_config},
+        solana_signer::Signer,
+        solana_transaction::{
+            sanitized::{MessageHash, SanitizedTransaction},
+            versioned::VersionedTransaction,
+        },
+        std::{
+            borrow::Cow,
+            sync::{Arc, RwLock},
+        },
     };
 
     fn create_test_versioned_message(
@@ -139,6 +139,7 @@ mod tests {
             MessageHash::Compute,
             Some(false),
             bank,
+            bank.get_reserved_account_keys(),
         )
         .unwrap()
     }
@@ -171,9 +172,9 @@ mod tests {
         )
     }
 
-    fn create_test_bank() -> Arc<Bank> {
+    fn create_test_bank() -> (Arc<Bank>, Arc<RwLock<BankForks>>) {
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
-        Bank::new_no_wallclock_throttle_for_tests(&genesis_config).0
+        Bank::new_no_wallclock_throttle_for_tests(&genesis_config)
     }
 
     // Helper function (could potentially use test_case in future).
@@ -182,7 +183,7 @@ mod tests {
     // conflict_index = 2 means write lock conflict with address table key
     // conflict_index = 3 means read lock conflict with address table key
     fn test_check_and_take_locks(conflict_index: usize, add_write: bool, expectation: bool) {
-        let bank = create_test_bank();
+        let (bank, _bank_forks) = create_test_bank();
         let (bank, table_address) = create_test_address_lookup_table(bank, 2);
         let tx = create_test_sanitized_transaction(
             &Keypair::new(),

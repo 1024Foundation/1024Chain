@@ -27,7 +27,7 @@ use {
         instruction::{ProofType, ZkProofData},
         zk_token_elgamal::pod,
     },
-    bytemuck::{Pod, Zeroable},
+    bytemuck_derive::{Pod, Zeroable},
 };
 
 /// The instruction data that is needed for the
@@ -66,8 +66,8 @@ impl CiphertextCiphertextEqualityProofData {
         destination_opening: &PedersenOpening,
         amount: u64,
     ) -> Result<Self, ProofGenerationError> {
-        let pod_source_pubkey = pod::ElGamalPubkey(source_keypair.pubkey().to_bytes());
-        let pod_destination_pubkey = pod::ElGamalPubkey(destination_pubkey.to_bytes());
+        let pod_source_pubkey = pod::ElGamalPubkey(source_keypair.pubkey().into());
+        let pod_destination_pubkey = pod::ElGamalPubkey(destination_pubkey.into());
         let pod_source_ciphertext = pod::ElGamalCiphertext(source_ciphertext.to_bytes());
         let pod_destination_ciphertext = pod::ElGamalCiphertext(destination_ciphertext.to_bytes());
 
@@ -190,7 +190,7 @@ mod test {
 
         assert!(proof_data.verify_proof().is_ok());
 
-        let amount = u64::max_value();
+        let amount = u64::MAX;
         let source_ciphertext = source_keypair.pubkey().encrypt(amount);
 
         let destination_opening = PedersenOpening::new_rand();

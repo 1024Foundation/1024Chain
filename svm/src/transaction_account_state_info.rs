@@ -1,13 +1,10 @@
 use {
-    crate::account_rent_state::RentState,
-    solana_sdk::{
-        account::ReadableAccount,
-        message::SanitizedMessage,
-        native_loader,
-        rent::Rent,
-        transaction::Result,
-        transaction_context::{IndexOfAccount, TransactionContext},
-    },
+    crate::rent_calculator::{check_rent_state, get_account_rent_state, RentState},
+    solana_account::ReadableAccount,
+    solana_rent::Rent,
+    solana_svm_transaction::svm_message::SVMMessage,
+    solana_transaction_context::{IndexOfAccount, TransactionContext},
+    solana_transaction_error::TransactionResult as Result,
 };
 
 #[derive(PartialEq, Debug)]
@@ -17,23 +14,22 @@ pub(crate) struct TransactionAccountStateInfo {
 
 impl TransactionAccountStateInfo {
     pub(crate) fn new(
-        rent: &Rent,
         transaction_context: &TransactionContext,
-        message: &SanitizedMessage,
+        message: &impl SVMMessage,
+        rent: &Rent,
     ) -> Vec<Self> {
         (0..message.account_keys().len())
             .map(|i| {
                 let rent_state = if message.is_writable(i) {
-                    let state = if let Ok(account) =
-                        transaction_context.get_account_at_index(i as IndexOfAccount)
+                    let state = if let Ok(account) = transaction_context
+                        .accounts()
+                        .try_borrow(i as IndexOfAccount)
                     {
-                        let account = account.borrow();
-
-                        // Native programs appear to be RentPaying because they carry low lamport
-                        // balances; however they will never be loaded as writable
-                        debug_assert!(!native_loader::check_id(account.owner()));
-
-                        Some(RentState::from_account(&account, rent))
+                        Some(get_account_rent_state(
+                            rent,
+                            account.lamports(),
+                            account.data().len(),
+                        ))
                     } else {
                         None
                     };
@@ -58,7 +54,7 @@ impl TransactionAccountStateInfo {
         for (i, (pre_state_info, post_state_info)) in
             pre_state_infos.iter().zip(post_state_infos).enumerate()
         {
-            RentState::check_rent_state(
+            check_rent_state(
                 pre_state_info.rent_state.as_ref(),
                 post_state_info.rent_state.as_ref(),
                 transaction_context,
@@ -72,20 +68,19 @@ impl TransactionAccountStateInfo {
 #[cfg(test)]
 mod test {
     use {
-        crate::{
-            account_rent_state::RentState,
-            transaction_account_state_info::TransactionAccountStateInfo,
+        super::*,
+        solana_account::AccountSharedData,
+        solana_hash::Hash,
+        solana_keypair::Keypair,
+        solana_message::{
+            compiled_instruction::CompiledInstruction, LegacyMessage, Message, MessageHeader,
+            SanitizedMessage,
         },
-        solana_sdk::{
-            account::AccountSharedData,
-            hash::Hash,
-            instruction::CompiledInstruction,
-            message::{LegacyMessage, Message, MessageHeader, SanitizedMessage},
-            rent::Rent,
-            signature::{Keypair, Signer},
-            transaction::TransactionError,
-            transaction_context::TransactionContext,
-        },
+        solana_rent::Rent,
+        solana_signer::Signer,
+        solana_transaction_context::TransactionContext,
+        solana_transaction_error::TransactionError,
+        std::collections::HashSet,
     };
 
     #[test]
@@ -114,8 +109,8 @@ mod test {
             recent_blockhash: Hash::default(),
         };
 
-        let legacy = LegacyMessage::new(message);
-        let sanitized_message = SanitizedMessage::Legacy(legacy);
+        let sanitized_message =
+            SanitizedMessage::Legacy(LegacyMessage::new(message, &HashSet::new()));
 
         let transaction_accounts = vec![
             (key1.pubkey(), AccountSharedData::default()),
@@ -124,7 +119,7 @@ mod test {
         ];
 
         let context = TransactionContext::new(transaction_accounts, rent.clone(), 20, 20);
-        let result = TransactionAccountStateInfo::new(&rent, &context, &sanitized_message);
+        let result = TransactionAccountStateInfo::new(&context, &sanitized_message, &rent);
         assert_eq!(
             result,
             vec![
@@ -166,8 +161,8 @@ mod test {
             recent_blockhash: Hash::default(),
         };
 
-        let legacy = LegacyMessage::new(message);
-        let sanitized_message = SanitizedMessage::Legacy(legacy);
+        let sanitized_message =
+            SanitizedMessage::Legacy(LegacyMessage::new(message, &HashSet::new()));
 
         let transaction_accounts = vec![
             (key1.pubkey(), AccountSharedData::default()),
@@ -176,7 +171,7 @@ mod test {
         ];
 
         let context = TransactionContext::new(transaction_accounts, rent.clone(), 20, 20);
-        let _result = TransactionAccountStateInfo::new(&rent, &context, &sanitized_message);
+        let _result = TransactionAccountStateInfo::new(&context, &sanitized_message, &rent);
     }
 
     #[test]

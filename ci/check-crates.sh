@@ -21,11 +21,11 @@ declare skip_patterns=(
 )
 
 declare -A verified_crate_owners=(
-  ["solana-grimes"]=1
+  ["anza-team"]=1
 )
 
 # get Cargo.toml from git diff
-readarray -t files <<<"$(git diff "$COMMIT_RANGE" --diff-filter=AM --name-only | grep Cargo.toml)"
+readarray -t files <<<"$(git diff "$COMMIT_RANGE" --diff-filter=ACMR --name-only | grep Cargo.toml)"
 printf "%s\n" "${files[@]}"
 
 error_count=0
@@ -50,11 +50,48 @@ for file in "${files[@]}"; do
     fi
   done
 
+  # crates.io will reject publication if certain fields are not populated
+  # https://doc.rust-lang.org/cargo/reference/publishing.html#before-publishing-a-new-crate
+  IFS=$'\t' read -r lic licf desc home repo < <(toml get "$file" . | jq -r "
+    (.package.license | tojson)\
+    +\"\t\"+(.package.license_file | tojson)\
+    +\"\t\"+(.package.description | tojson)\
+    +\"\t\"+(.package.homepage | tojson)\
+    +\"\t\"+(.package.repository | tojson)\
+  ")
+
+  declare missing_metadata=()
+  if [ "$lic" = "null" ] && [ "$licf" = "null" ]; then
+    missing_metadata+=( "license" )
+  else
+    echo "✅ license"
+  fi
+  if [ "$desc" = "null" ]; then
+    missing_metadata+=( "description" )
+  else
+    echo "✅ description"
+  fi
+  if [ "$home" = "null" ]; then
+    missing_metadata+=( "homepage" )
+  else
+    echo "✅ homepage"
+  fi
+  if [ "$repo" = "null" ]; then
+    missing_metadata+=( "repository" )
+  else
+    echo "✅ repository"
+  fi
+
+  if [ ${#missing_metadata[@]} -ne 0 ]; then
+    echo "❌ $crate_name is missing the following metadata fields: ${missing_metadata[*]}"
+    exit 1
+  fi
+
   response=$(curl -s https://crates.io/api/v1/crates/"$crate_name"/owners)
   errors=$(echo "$response" | jq .errors)
   if [[ $errors != "null" ]]; then
     details=$(echo "$response" | jq .errors | jq -r ".[0].detail")
-    if [[ $details = *"Not Found"* ]]; then
+    if [[ $details = *"does not exist"* ]]; then
       ((error_count++))
       echo "❌ new crate $crate_name not found on crates.io. you can either
 

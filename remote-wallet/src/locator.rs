@@ -1,5 +1,5 @@
 use {
-    solana_sdk::pubkey::{ParsePubkeyError, Pubkey},
+    solana_pubkey::{ParsePubkeyError, Pubkey},
     std::{
         convert::{Infallible, TryFrom, TryInto},
         str::FromStr,
@@ -8,16 +8,11 @@ use {
     uriparse::{URIReference, URIReferenceBuilder, URIReferenceError},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Manufacturer {
+    #[default]
     Unknown,
     Ledger,
-}
-
-impl Default for Manufacturer {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 const MANUFACTURER_UNKNOWN: &str = "unknown";

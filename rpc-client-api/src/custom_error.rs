@@ -2,8 +2,9 @@
 use {
     crate::response::RpcSimulateTransactionResult,
     jsonrpc_core::{Error, ErrorCode},
-    solana_sdk::clock::Slot,
-    solana_transaction_status::EncodeError,
+    serde::{Deserialize, Serialize},
+    solana_clock::Slot,
+    solana_transaction_status_client_types::EncodeError,
     thiserror::Error,
 };
 
@@ -24,8 +25,12 @@ pub const JSON_RPC_SERVER_ERROR_TRANSACTION_SIGNATURE_LEN_MISMATCH: i64 = -32013
 pub const JSON_RPC_SERVER_ERROR_BLOCK_STATUS_NOT_AVAILABLE_YET: i64 = -32014;
 pub const JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION: i64 = -32015;
 pub const JSON_RPC_SERVER_ERROR_MIN_CONTEXT_SLOT_NOT_REACHED: i64 = -32016;
+pub const JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE: i64 = -32017;
+pub const JSON_RPC_SERVER_ERROR_SLOT_NOT_EPOCH_BOUNDARY: i64 = -32018;
+pub const JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_UNREACHABLE: i64 = -32019;
 
 #[derive(Error, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum RpcCustomError {
     #[error("BlockCleanedUp")]
     BlockCleanedUp {
@@ -44,7 +49,7 @@ pub enum RpcCustomError {
     #[error("NodeUnhealthy")]
     NodeUnhealthy { num_slots_behind: Option<Slot> },
     #[error("TransactionPrecompileVerificationFailure")]
-    TransactionPrecompileVerificationFailure(solana_sdk::transaction::TransactionError),
+    TransactionPrecompileVerificationFailure(solana_transaction_error::TransactionError),
     #[error("SlotSkipped")]
     SlotSkipped { slot: Slot },
     #[error("NoSnapshot")]
@@ -65,6 +70,16 @@ pub enum RpcCustomError {
     UnsupportedTransactionVersion(u8),
     #[error("MinContextSlotNotReached")]
     MinContextSlotNotReached { context_slot: Slot },
+    #[error("EpochRewardsPeriodActive")]
+    EpochRewardsPeriodActive {
+        slot: Slot,
+        current_block_height: u64,
+        rewards_complete_block_height: u64,
+    },
+    #[error("SlotNotEpochBoundary")]
+    SlotNotEpochBoundary { slot: Slot },
+    #[error("LongTermStorageUnreachable")]
+    LongTermStorageUnreachable,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,6 +92,15 @@ pub struct NodeUnhealthyErrorData {
 #[serde(rename_all = "camelCase")]
 pub struct MinContextSlotNotReachedErrorData {
     pub context_slot: Slot,
+}
+
+#[cfg_attr(test, derive(PartialEq))]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpochRewardsPeriodActiveErrorData {
+    pub current_block_height: u64,
+    pub rewards_complete_block_height: u64,
+    pub slot: Option<u64>,
 }
 
 impl From<EncodeError> for RpcCustomError {
@@ -98,7 +122,8 @@ impl From<RpcCustomError> for Error {
             } => Self {
                 code: ErrorCode::ServerError(JSON_RPC_SERVER_ERROR_BLOCK_CLEANED_UP),
                 message: format!(
-                    "Block {slot} cleaned up, does not exist on node. First available block: {first_available_block}",
+                    "Block {slot} cleaned up, does not exist on node. First available block: \
+                     {first_available_block}",
                 ),
                 data: None,
             },
@@ -161,8 +186,8 @@ impl From<RpcCustomError> for Error {
                     JSON_RPC_SERVER_ERROR_KEY_EXCLUDED_FROM_SECONDARY_INDEX,
                 ),
                 message: format!(
-                    "{index_key} excluded from account secondary indexes; \
-                    this RPC method unavailable for key"
+                    "{index_key} excluded from account secondary indexes; this RPC method \
+                     unavailable for key"
                 ),
                 data: None,
             },
@@ -194,8 +219,8 @@ impl From<RpcCustomError> for Error {
                 code: ErrorCode::ServerError(JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION),
                 message: format!(
                     "Transaction version ({version}) is not supported by the requesting client. \
-                    Please try the request again with the following configuration parameter: \
-                    \"maxSupportedTransactionVersion\": {version}"
+                     Please try the request again with the following configuration parameter: \
+                     \"maxSupportedTransactionVersion\": {version}"
                 ),
                 data: None,
             },
@@ -206,6 +231,73 @@ impl From<RpcCustomError> for Error {
                     context_slot,
                 })),
             },
+            RpcCustomError::EpochRewardsPeriodActive {
+                slot,
+                current_block_height,
+                rewards_complete_block_height,
+            } => Self {
+                code: ErrorCode::ServerError(JSON_RPC_SERVER_ERROR_EPOCH_REWARDS_PERIOD_ACTIVE),
+                message: format!("Epoch rewards period still active at slot {slot}"),
+                data: Some(serde_json::json!(EpochRewardsPeriodActiveErrorData {
+                    current_block_height,
+                    rewards_complete_block_height,
+                    slot: Some(slot),
+                })),
+            },
+            RpcCustomError::SlotNotEpochBoundary { slot } => Self {
+                code: ErrorCode::ServerError(JSON_RPC_SERVER_ERROR_SLOT_NOT_EPOCH_BOUNDARY),
+                message: format!(
+                    "Rewards cannot be found because slot {slot} is not the epoch boundary. This \
+                     may be due to gap in the queried node's local ledger or long-term storage"
+                ),
+                data: Some(serde_json::json!({
+                    "slot": slot,
+                })),
+            },
+            RpcCustomError::LongTermStorageUnreachable => Self {
+                code: ErrorCode::ServerError(JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_UNREACHABLE),
+                message: "Failed to query long-term storage; please try again".to_string(),
+                data: None,
+            },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        crate::custom_error::EpochRewardsPeriodActiveErrorData, serde_json::Value,
+        test_case::test_case,
+    };
+
+    #[test_case(serde_json::json!({
+            "currentBlockHeight": 123,
+            "rewardsCompleteBlockHeight": 456
+        }); "Pre-3.0 schema")]
+    #[test_case(serde_json::json!({
+            "currentBlockHeight": 123,
+            "rewardsCompleteBlockHeight": 456,
+            "slot": 789
+        }); "3.0+ schema")]
+    fn test_deseriailze_epoch_rewards_period_active_error_data(serialized_data: Value) {
+        let expected_current_block_height = serialized_data
+            .get("currentBlockHeight")
+            .map(|v| v.as_u64().unwrap())
+            .unwrap();
+        let expected_rewards_complete_block_height = serialized_data
+            .get("rewardsCompleteBlockHeight")
+            .map(|v| v.as_u64().unwrap())
+            .unwrap();
+        let expected_slot: Option<u64> = serialized_data.get("slot").map(|v| v.as_u64().unwrap());
+        let actual: EpochRewardsPeriodActiveErrorData =
+            serde_json::from_value(serialized_data).expect("Failed to deserialize test fixture");
+        assert_eq!(
+            actual,
+            EpochRewardsPeriodActiveErrorData {
+                current_block_height: expected_current_block_height,
+                rewards_complete_block_height: expected_rewards_complete_block_height,
+                slot: expected_slot,
+            }
+        );
     }
 }

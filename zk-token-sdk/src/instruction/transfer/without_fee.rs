@@ -29,7 +29,7 @@ use {
         instruction::{ProofType, ZkProofData},
         zk_token_elgamal::pod,
     },
-    bytemuck::{Pod, Zeroable},
+    bytemuck_derive::{Pod, Zeroable},
 };
 
 #[cfg(not(target_os = "solana"))]
@@ -42,10 +42,8 @@ const TRANSFER_AMOUNT_LO_NEGATED_BITS: usize = 16;
 const TRANSFER_AMOUNT_HI_BITS: usize = 32;
 
 #[cfg(not(target_os = "solana"))]
-lazy_static::lazy_static! {
-    pub static ref COMMITMENT_MAX: PedersenCommitment = Pedersen::encode((1_u64 <<
-                                                                         TRANSFER_AMOUNT_LO_NEGATED_BITS) - 1);
-}
+pub static COMMITMENT_MAX: std::sync::LazyLock<PedersenCommitment> =
+    std::sync::LazyLock::new(|| Pedersen::encode((1_u64 << TRANSFER_AMOUNT_LO_NEGATED_BITS) - 1));
 
 /// The instruction data that is needed for the `ProofInstruction::VerifyTransfer` instruction.
 ///
@@ -470,7 +468,7 @@ impl TransferProof {
 
 #[cfg(test)]
 mod test {
-    use {super::*, crate::encryption::elgamal::ElGamalKeypair};
+    use {super::*, crate::encryption::elgamal::ElGamalKeypair, bytemuck::Zeroable};
 
     #[test]
     fn test_transfer_correctness() {
@@ -506,7 +504,7 @@ mod test {
         // Case 2: transfer max amount
 
         // create source account spendable ciphertext
-        let spendable_balance: u64 = u64::max_value();
+        let spendable_balance: u64 = u64::MAX;
         let spendable_ciphertext = source_keypair.pubkey().encrypt(spendable_balance);
 
         // transfer amount

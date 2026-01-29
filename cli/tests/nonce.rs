@@ -7,65 +7,38 @@ use {
         test_utils::check_ready,
     },
     solana_cli_output::{parse_sign_only_reply_string, OutputFormat},
-    solana_faucet::faucet::run_local_faucet,
+    solana_commitment_config::CommitmentConfig,
+    solana_faucet::faucet::run_local_faucet_with_unique_port_for_tests,
+    solana_hash::Hash,
+    solana_keypair::{keypair_from_seed, Keypair},
+    solana_native_token::LAMPORTS_PER_SOL,
+    solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_nonce_utils::blockhash_query::{self, BlockhashQuery},
-    solana_sdk::{
-        commitment_config::CommitmentConfig,
-        hash::Hash,
-        native_token::sol_to_lamports,
-        pubkey::Pubkey,
-        signature::{keypair_from_seed, Keypair, Signer},
-        system_program,
-    },
+    solana_signer::Signer,
     solana_streamer::socket::SocketAddrSpace,
+    solana_system_interface::program as system_program,
     solana_test_validator::TestValidator,
+    test_case::test_case,
 };
 
-#[test]
-fn test_nonce() {
+#[test_case(None, false, None; "base")]
+#[test_case(Some(String::from("seed")), false, None; "with_seed")]
+#[test_case(None, true, None; "with_authority")]
+#[test_case(None, false, Some(1_000_000); "with_compute_unit_price")]
+fn test_nonce(seed: Option<String>, use_nonce_authority: bool, compute_unit_price: Option<u64>) {
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator =
         TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 
-    full_battery_tests(test_validator, None, false);
-}
-
-#[test]
-fn test_nonce_with_seed() {
-    let mint_keypair = Keypair::new();
-    let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
-
-    full_battery_tests(test_validator, Some(String::from("seed")), false);
-}
-
-#[test]
-fn test_nonce_with_authority() {
-    let mint_keypair = Keypair::new();
-    let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
-
-    full_battery_tests(test_validator, None, true);
-}
-
-fn full_battery_tests(
-    test_validator: TestValidator,
-    seed: Option<String>,
-    use_nonce_authority: bool,
-) {
     let rpc_client =
         RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
     let json_rpc_url = test_validator.rpc_url();
 
     let mut config_payer = CliConfig::recent_for_tests();
-    config_payer.json_rpc_url = json_rpc_url.clone();
+    config_payer.json_rpc_url.clone_from(&json_rpc_url);
     let payer = Keypair::new();
     config_payer.signers = vec![&payer];
 
@@ -73,11 +46,11 @@ fn full_battery_tests(
         &rpc_client,
         &config_payer,
         &config_payer.signers[0].pubkey(),
-        sol_to_lamports(2000.0),
+        2000 * LAMPORTS_PER_SOL,
     )
     .unwrap();
     check_balance!(
-        sol_to_lamports(2000.0),
+        2000 * LAMPORTS_PER_SOL,
         &rpc_client,
         &config_payer.signers[0].pubkey(),
     );
@@ -112,17 +85,17 @@ fn full_battery_tests(
         seed,
         nonce_authority: optional_authority,
         memo: None,
-        amount: SpendAmount::Some(sol_to_lamports(1000.0)),
-        compute_unit_price: None,
+        amount: SpendAmount::Some(1000 * LAMPORTS_PER_SOL),
+        compute_unit_price,
     };
 
     process_command(&config_payer).unwrap();
     check_balance!(
-        sol_to_lamports(1000.0),
+        1000 * LAMPORTS_PER_SOL,
         &rpc_client,
         &config_payer.signers[0].pubkey(),
     );
-    check_balance!(sol_to_lamports(1000.0), &rpc_client, &nonce_account);
+    check_balance!(1000 * LAMPORTS_PER_SOL, &rpc_client, &nonce_account);
 
     // Get nonce
     config_payer.signers.pop();
@@ -146,12 +119,12 @@ fn full_battery_tests(
     };
 
     // New nonce
-    config_payer.signers = authorized_signers.clone();
+    config_payer.signers.clone_from(&authorized_signers);
     config_payer.command = CliCommand::NewNonce {
         nonce_account,
         nonce_authority: index,
         memo: None,
-        compute_unit_price: None,
+        compute_unit_price,
     };
     process_command(&config_payer).unwrap();
 
@@ -164,24 +137,24 @@ fn full_battery_tests(
     assert_ne!(first_nonce, third_nonce);
 
     // Withdraw from nonce account
-    let payee_pubkey = solana_sdk::pubkey::new_rand();
+    let payee_pubkey = solana_pubkey::new_rand();
     config_payer.signers = authorized_signers;
     config_payer.command = CliCommand::WithdrawFromNonceAccount {
         nonce_account,
         nonce_authority: index,
         memo: None,
         destination_account_pubkey: payee_pubkey,
-        lamports: sol_to_lamports(100.0),
-        compute_unit_price: None,
+        lamports: 100 * LAMPORTS_PER_SOL,
+        compute_unit_price,
     };
     process_command(&config_payer).unwrap();
     check_balance!(
-        sol_to_lamports(1000.0),
+        1000 * LAMPORTS_PER_SOL,
         &rpc_client,
         &config_payer.signers[0].pubkey(),
     );
-    check_balance!(sol_to_lamports(900.0), &rpc_client, &nonce_account);
-    check_balance!(sol_to_lamports(100.0), &rpc_client, &payee_pubkey);
+    check_balance!(900 * LAMPORTS_PER_SOL, &rpc_client, &nonce_account);
+    check_balance!(100 * LAMPORTS_PER_SOL, &rpc_client, &payee_pubkey);
 
     // Show nonce account
     config_payer.command = CliCommand::ShowNonceAccount {
@@ -197,7 +170,7 @@ fn full_battery_tests(
         nonce_authority: index,
         memo: None,
         new_authority: new_authority.pubkey(),
-        compute_unit_price: None,
+        compute_unit_price,
     };
     process_command(&config_payer).unwrap();
 
@@ -206,7 +179,7 @@ fn full_battery_tests(
         nonce_account,
         nonce_authority: index,
         memo: None,
-        compute_unit_price: None,
+        compute_unit_price,
     };
     process_command(&config_payer).unwrap_err();
 
@@ -216,7 +189,7 @@ fn full_battery_tests(
         nonce_account,
         nonce_authority: 1,
         memo: None,
-        compute_unit_price: None,
+        compute_unit_price,
     };
     process_command(&config_payer).unwrap();
 
@@ -226,30 +199,29 @@ fn full_battery_tests(
         nonce_authority: 1,
         memo: None,
         destination_account_pubkey: payee_pubkey,
-        lamports: sol_to_lamports(100.0),
-        compute_unit_price: None,
+        lamports: 100 * LAMPORTS_PER_SOL,
+        compute_unit_price,
     };
     process_command(&config_payer).unwrap();
     check_balance!(
-        sol_to_lamports(1000.0),
+        1000 * LAMPORTS_PER_SOL,
         &rpc_client,
         &config_payer.signers[0].pubkey(),
     );
-    check_balance!(sol_to_lamports(800.0), &rpc_client, &nonce_account);
-    check_balance!(sol_to_lamports(200.0), &rpc_client, &payee_pubkey);
+    check_balance!(800 * LAMPORTS_PER_SOL, &rpc_client, &nonce_account);
+    check_balance!(200 * LAMPORTS_PER_SOL, &rpc_client, &payee_pubkey);
 }
 
 #[test]
-#[allow(clippy::redundant_closure)]
 fn test_create_account_with_seed() {
-    const ONE_SIG_FEE: f64 = 0.000005;
-    solana_logger::setup();
+    const ONE_SIG_FEE: u64 = 5000;
+    agave_logger::setup();
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator = TestValidator::with_custom_fees(
         mint_pubkey,
-        sol_to_lamports(ONE_SIG_FEE),
+        ONE_SIG_FEE,
         Some(faucet_addr),
         SocketAddrSpace::Unspecified,
     );
@@ -265,23 +237,23 @@ fn test_create_account_with_seed() {
         &rpc_client,
         &CliConfig::recent_for_tests(),
         &offline_nonce_authority_signer.pubkey(),
-        sol_to_lamports(42.0),
+        42 * LAMPORTS_PER_SOL,
     )
     .unwrap();
     request_and_confirm_airdrop(
         &rpc_client,
         &CliConfig::recent_for_tests(),
         &online_nonce_creator_signer.pubkey(),
-        sol_to_lamports(4242.0),
+        4242 * LAMPORTS_PER_SOL,
     )
     .unwrap();
     check_balance!(
-        sol_to_lamports(42.0),
+        42 * LAMPORTS_PER_SOL,
         &rpc_client,
         &offline_nonce_authority_signer.pubkey(),
     );
     check_balance!(
-        sol_to_lamports(4242.0),
+        4242 * LAMPORTS_PER_SOL,
         &rpc_client,
         &online_nonce_creator_signer.pubkey(),
     );
@@ -305,18 +277,18 @@ fn test_create_account_with_seed() {
         seed: Some(seed),
         nonce_authority: Some(authority_pubkey),
         memo: None,
-        amount: SpendAmount::Some(sol_to_lamports(241.0)),
+        amount: SpendAmount::Some(241 * LAMPORTS_PER_SOL),
         compute_unit_price: None,
     };
     process_command(&creator_config).unwrap();
-    check_balance!(sol_to_lamports(241.0), &rpc_client, &nonce_address);
+    check_balance!(241 * LAMPORTS_PER_SOL, &rpc_client, &nonce_address);
     check_balance!(
-        sol_to_lamports(42.0),
+        42 * LAMPORTS_PER_SOL,
         &rpc_client,
         &offline_nonce_authority_signer.pubkey(),
     );
     check_balance!(
-        sol_to_lamports(4001.0 - ONE_SIG_FEE),
+        4001 * LAMPORTS_PER_SOL - ONE_SIG_FEE,
         &rpc_client,
         &online_nonce_creator_signer.pubkey(),
     );
@@ -340,7 +312,7 @@ fn test_create_account_with_seed() {
     authority_config.command = CliCommand::ClusterVersion;
     process_command(&authority_config).unwrap_err();
     authority_config.command = CliCommand::Transfer {
-        amount: SpendAmount::Some(sol_to_lamports(10.0)),
+        amount: SpendAmount::Some(10 * LAMPORTS_PER_SOL),
         to: to_address,
         from: 0,
         sign_only: true,
@@ -367,7 +339,7 @@ fn test_create_account_with_seed() {
     submit_config.json_rpc_url = test_validator.rpc_url();
     submit_config.signers = vec![&authority_presigner];
     submit_config.command = CliCommand::Transfer {
-        amount: SpendAmount::Some(sol_to_lamports(10.0)),
+        amount: SpendAmount::Some(10 * LAMPORTS_PER_SOL),
         to: to_address,
         from: 0,
         sign_only: false,
@@ -387,16 +359,16 @@ fn test_create_account_with_seed() {
         compute_unit_price: None,
     };
     process_command(&submit_config).unwrap();
-    check_balance!(sol_to_lamports(241.0), &rpc_client, &nonce_address);
+    check_balance!(241 * LAMPORTS_PER_SOL, &rpc_client, &nonce_address);
     check_balance!(
-        sol_to_lamports(32.0 - ONE_SIG_FEE),
+        32 * LAMPORTS_PER_SOL - ONE_SIG_FEE,
         &rpc_client,
         &offline_nonce_authority_signer.pubkey(),
     );
     check_balance!(
-        sol_to_lamports(4001.0 - ONE_SIG_FEE),
+        4001 * LAMPORTS_PER_SOL - ONE_SIG_FEE,
         &rpc_client,
         &online_nonce_creator_signer.pubkey(),
     );
-    check_balance!(sol_to_lamports(10.0), &rpc_client, &to_address);
+    check_balance!(10 * LAMPORTS_PER_SOL, &rpc_client, &to_address);
 }

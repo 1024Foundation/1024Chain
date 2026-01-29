@@ -1,13 +1,23 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 #![forbid(unsafe_code)]
+// Allow deprecated warnings since this crate will be removed along with
+// `solana-zk-token-sdk` will be removed
+#![allow(deprecated)]
 
 use {
     bytemuck::Pod,
-    solana_program_runtime::{declare_process_instruction, ic_msg, invoke_context::InvokeContext},
-    solana_sdk::{
-        feature_set,
-        instruction::{InstructionError, TRANSACTION_LEVEL_STACK_HEIGHT},
-        system_program,
-    },
+    solana_instruction::{error::InstructionError, TRANSACTION_LEVEL_STACK_HEIGHT},
+    solana_program_runtime::{declare_process_instruction, invoke_context::InvokeContext},
+    solana_sdk_ids::system_program,
+    solana_svm_log_collector::ic_msg,
     solana_zk_token_sdk::{
         zk_token_proof_instruction::*,
         zk_token_proof_program::id,
@@ -31,6 +41,8 @@ pub const VERIFY_CIPHERTEXT_COMMITMENT_EQUALITY_COMPUTE_UNITS: u64 = 6_400;
 pub const VERIFY_GROUPED_CIPHERTEXT_2_HANDLES_VALIDITY_COMPUTE_UNITS: u64 = 6_400;
 pub const VERIFY_BATCHED_GROUPED_CIPHERTEXT_2_HANDLES_VALIDITY_COMPUTE_UNITS: u64 = 13_000;
 pub const VERIFY_FEE_SIGMA_COMPUTE_UNITS: u64 = 6_500;
+pub const VERIFY_GROUPED_CIPHERTEXT_3_HANDLES_VALIDITY_COMPUTE_UNITS: u64 = 8_100;
+pub const VERIFY_BATCHED_GROUPED_CIPHERTEXT_3_HANDLES_VALIDITY_COMPUTE_UNITS: u64 = 16_400;
 
 const INSTRUCTION_DATA_LENGTH_WITH_PROOF_ACCOUNT: usize = 5;
 
@@ -48,15 +60,15 @@ where
 
     // if instruction data is exactly 5 bytes, then read proof from an account
     let context_data = if instruction_data.len() == INSTRUCTION_DATA_LENGTH_WITH_PROOF_ACCOUNT {
-        if !invoke_context
-            .feature_set
-            .is_active(&feature_set::enable_zk_proof_from_account::id())
-        {
+        let enable_zk_proof_from_account = false;
+        // This code is disabled on purpose. If the feature is required to be enabled in future,
+        // a better way to lookup feature_set should be implemented/used.
+        if !enable_zk_proof_from_account {
             return Err(InstructionError::InvalidInstructionData);
         }
 
-        let proof_data_account = instruction_context
-            .try_borrow_instruction_account(transaction_context, accessed_accounts)?;
+        let proof_data_account =
+            instruction_context.try_borrow_instruction_account(accessed_accounts)?;
         accessed_accounts = accessed_accounts.checked_add(1).unwrap();
 
         let proof_data_offset = u32::from_le_bytes(
@@ -103,14 +115,9 @@ where
     // create context state if additional accounts are provided with the instruction
     if instruction_context.get_number_of_instruction_accounts() > accessed_accounts {
         let context_state_authority = *instruction_context
-            .try_borrow_instruction_account(
-                transaction_context,
-                accessed_accounts.checked_add(1).unwrap(),
-            )?
-            .get_key();
-
-        let mut proof_context_account = instruction_context
-            .try_borrow_instruction_account(transaction_context, accessed_accounts)?;
+            .get_key_of_instruction_account(accessed_accounts.checked_add(1).unwrap())?;
+        let mut proof_context_account =
+            instruction_context.try_borrow_instruction_account(accessed_accounts)?;
 
         if *proof_context_account.get_owner() != id() {
             return Err(InstructionError::InvalidAccountOwner);
@@ -141,27 +148,20 @@ fn process_close_proof_context(invoke_context: &mut InvokeContext) -> Result<(),
     let instruction_context = transaction_context.get_current_instruction_context()?;
 
     let owner_pubkey = {
-        let owner_account =
-            instruction_context.try_borrow_instruction_account(transaction_context, 2)?;
-
-        if !owner_account.is_signer() {
+        if !instruction_context.is_instruction_account_signer(2)? {
             return Err(InstructionError::MissingRequiredSignature);
         }
-        *owner_account.get_key()
-    }; // done with `owner_account`, so drop it to prevent a potential double borrow
 
-    let proof_context_account_pubkey = *instruction_context
-        .try_borrow_instruction_account(transaction_context, 0)?
-        .get_key();
-    let destination_account_pubkey = *instruction_context
-        .try_borrow_instruction_account(transaction_context, 1)?
-        .get_key();
+        *instruction_context.get_key_of_instruction_account(2)?
+    };
+
+    let proof_context_account_pubkey = *instruction_context.get_key_of_instruction_account(0)?;
+    let destination_account_pubkey = *instruction_context.get_key_of_instruction_account(1)?;
     if proof_context_account_pubkey == destination_account_pubkey {
         return Err(InstructionError::InvalidInstructionData);
     }
 
-    let mut proof_context_account =
-        instruction_context.try_borrow_instruction_account(transaction_context, 0)?;
+    let mut proof_context_account = instruction_context.try_borrow_instruction_account(0)?;
     let proof_context_state_meta =
         ProofContextStateMeta::try_from_bytes(proof_context_account.get_data())?;
     let expected_owner_pubkey = proof_context_state_meta.context_state_authority;
@@ -170,8 +170,7 @@ fn process_close_proof_context(invoke_context: &mut InvokeContext) -> Result<(),
         return Err(InstructionError::InvalidAccountOwner);
     }
 
-    let mut destination_account =
-        instruction_context.try_borrow_instruction_account(transaction_context, 1)?;
+    let mut destination_account = instruction_context.try_borrow_instruction_account(1)?;
     destination_account.checked_add_lamports(proof_context_account.get_lamports())?;
     proof_context_account.set_lamports(0)?;
     proof_context_account.set_data_length(0)?;
@@ -181,9 +180,7 @@ fn process_close_proof_context(invoke_context: &mut InvokeContext) -> Result<(),
 }
 
 declare_process_instruction!(Entrypoint, 0, |invoke_context| {
-    let enable_zk_transfer_with_fee = invoke_context
-        .feature_set
-        .is_active(&feature_set::enable_zk_transfer_with_fee::id());
+    let enable_zk_transfer_with_fee = false;
 
     let transaction_context = &invoke_context.transaction_context;
     let instruction_context = transaction_context.get_current_instruction_context()?;
@@ -339,6 +336,29 @@ declare_process_instruction!(Entrypoint, 0, |invoke_context| {
                 .map_err(|_| InstructionError::ComputationalBudgetExceeded)?;
             ic_msg!(invoke_context, "VerifyFeeSigma");
             process_verify_proof::<FeeSigmaProofData, FeeSigmaProofContext>(invoke_context)
+        }
+        ProofInstruction::VerifyGroupedCiphertext3HandlesValidity => {
+            invoke_context
+                .consume_checked(VERIFY_GROUPED_CIPHERTEXT_3_HANDLES_VALIDITY_COMPUTE_UNITS)
+                .map_err(|_| InstructionError::ComputationalBudgetExceeded)?;
+            ic_msg!(invoke_context, "VerifyGroupedCiphertext3HandlesValidity");
+            process_verify_proof::<
+                GroupedCiphertext3HandlesValidityProofData,
+                GroupedCiphertext3HandlesValidityProofContext,
+            >(invoke_context)
+        }
+        ProofInstruction::VerifyBatchedGroupedCiphertext3HandlesValidity => {
+            invoke_context
+                .consume_checked(VERIFY_BATCHED_GROUPED_CIPHERTEXT_3_HANDLES_VALIDITY_COMPUTE_UNITS)
+                .map_err(|_| InstructionError::ComputationalBudgetExceeded)?;
+            ic_msg!(
+                invoke_context,
+                "VerifyBatchedGroupedCiphertext3HandlesValidity"
+            );
+            process_verify_proof::<
+                BatchedGroupedCiphertext3HandlesValidityProofData,
+                BatchedGroupedCiphertext3HandlesValidityProofContext,
+            >(invoke_context)
         }
     }
 });

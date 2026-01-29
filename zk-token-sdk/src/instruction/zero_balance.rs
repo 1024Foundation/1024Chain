@@ -1,7 +1,7 @@
 //! The zero-balance proof instruction.
 //!
 //! A zero-balance proof is defined with respect to a twisted ElGamal ciphertext. The proof
-//! certifies that a given ciphertext encrypts the message 0 in the field (`Scalar::zero()`). To
+//! certifies that a given ciphertext encrypts the message 0 in the field (`Scalar::ZERO`). To
 //! generate the proof, a prover must provide the decryption key for the ciphertext.
 
 #[cfg(not(target_os = "solana"))]
@@ -20,7 +20,7 @@ use {
         instruction::{ProofType, ZkProofData},
         zk_token_elgamal::pod,
     },
-    bytemuck::{Pod, Zeroable},
+    bytemuck_derive::{Pod, Zeroable},
 };
 
 /// The instruction data that is needed for the `ProofInstruction::ZeroBalance` instruction.
@@ -54,7 +54,7 @@ impl ZeroBalanceProofData {
         keypair: &ElGamalKeypair,
         ciphertext: &ElGamalCiphertext,
     ) -> Result<Self, ProofGenerationError> {
-        let pod_pubkey = pod::ElGamalPubkey(keypair.pubkey().to_bytes());
+        let pod_pubkey = pod::ElGamalPubkey(keypair.pubkey().into());
         let pod_ciphertext = pod::ElGamalCiphertext(ciphertext.to_bytes());
 
         let context = ZeroBalanceProofContext {

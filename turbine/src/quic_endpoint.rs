@@ -4,15 +4,22 @@ use {
     futures::future::TryJoin,
     log::error,
     quinn::{
+        crypto::rustls::{QuicClientConfig, QuicServerConfig},
         ClientConfig, ConnectError, Connecting, Connection, ConnectionError, Endpoint,
         EndpointConfig, IdleTimeout, SendDatagramError, ServerConfig, TokioRuntime,
         TransportConfig, VarInt,
     },
-    rustls::{Certificate, PrivateKey},
-    solana_quic_client::nonblocking::quic_client::SkipServerVerification,
+    rustls::{
+        pki_types::{CertificateDer, PrivateKeyDer},
+        CertificateError, KeyLogFile,
+    },
+    solana_keypair::Keypair,
+    solana_pubkey::Pubkey,
     solana_runtime::bank_forks::BankForks,
-    solana_sdk::{pubkey::Pubkey, signature::Keypair},
-    solana_streamer::{quic::SkipClientVerification, tls_certificates::new_dummy_x509_certificate},
+    solana_tls_utils::{
+        new_dummy_x509_certificate, socket_addr_to_quic_server_name, tls_client_config_builder,
+        tls_server_config_builder,
+    },
     std::{
         cmp::Reverse,
         collections::{hash_map::Entry, HashMap},
@@ -38,7 +45,6 @@ const CLIENT_CHANNEL_BUFFER: usize = 1 << 14;
 const ROUTER_CHANNEL_BUFFER: usize = 64;
 const CONNECTION_CACHE_CAPACITY: usize = 3072;
 const ALPN_TURBINE_PROTOCOL_ID: &[u8] = b"solana-turbine";
-const CONNECT_SERVER_NAME: &str = "solana-turbine";
 
 // Transport config.
 const DATAGRAM_RECEIVE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
@@ -102,7 +108,7 @@ pub fn new_quic_endpoint(
     Error,
 > {
     let (cert, key) = new_dummy_x509_certificate(keypair);
-    let server_config = new_server_config(cert.clone(), key.clone())?;
+    let server_config = new_server_config(cert.clone(), key.clone_key())?;
     let client_config = new_client_config(cert, key)?;
     let mut endpoint = {
         // Endpoint::new requires entering the runtime context,
@@ -148,28 +154,31 @@ pub fn close_quic_endpoint(endpoint: &Endpoint) {
     );
 }
 
-fn new_server_config(cert: Certificate, key: PrivateKey) -> Result<ServerConfig, rustls::Error> {
-    let mut config = rustls::ServerConfig::builder()
-        .with_safe_defaults()
-        .with_client_cert_verifier(Arc::new(SkipClientVerification {}))
-        .with_single_cert(vec![cert], key)?;
+fn new_server_config(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> Result<ServerConfig, rustls::Error> {
+    let mut config = tls_server_config_builder().with_single_cert(vec![cert], key)?;
     config.alpn_protocols = vec![ALPN_TURBINE_PROTOCOL_ID.to_vec()];
-    let mut config = ServerConfig::with_crypto(Arc::new(config));
+    config.key_log = Arc::new(KeyLogFile::new());
+    let quic_server_config = QuicServerConfig::try_from(config)
+        .map_err(|_err| rustls::Error::InvalidCertificate(CertificateError::BadSignature))?;
+
+    let mut config = ServerConfig::with_crypto(Arc::new(quic_server_config));
     config
         .transport_config(Arc::new(new_transport_config()))
-        .use_retry(true)
         .migration(false);
     Ok(config)
 }
 
-fn new_client_config(cert: Certificate, key: PrivateKey) -> Result<ClientConfig, rustls::Error> {
-    let mut config = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification {}))
-        .with_client_auth_cert(vec![cert], key)?;
+fn new_client_config(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> Result<ClientConfig, rustls::Error> {
+    let mut config = tls_client_config_builder().with_client_auth_cert(vec![cert], key)?;
     config.enable_early_data = true;
     config.alpn_protocols = vec![ALPN_TURBINE_PROTOCOL_ID.to_vec()];
-    let mut config = ClientConfig::new(Arc::new(config));
+    let mut config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
     config.transport_config(Arc::new(new_transport_config()));
     Ok(config)
 }
@@ -200,18 +209,27 @@ async fn run_server(
 ) {
     let stats = Arc::<TurbineQuicStats>::default();
     let report_metrics_task =
-        tokio::task::spawn(report_metrics_task("repair_quic_server", stats.clone()));
-    while let Some(connecting) = endpoint.accept().await {
-        tokio::task::spawn(handle_connecting_task(
-            endpoint.clone(),
-            connecting,
-            sender.clone(),
-            bank_forks.clone(),
-            prune_cache_pending.clone(),
-            router.clone(),
-            cache.clone(),
-            stats.clone(),
-        ));
+        tokio::task::spawn(report_metrics_task("turbine_quic_server", stats.clone()));
+    while let Some(incoming) = endpoint.accept().await {
+        let remote_addr: SocketAddr = incoming.remote_address();
+        let connecting = incoming.accept();
+        match connecting {
+            Ok(connecting) => {
+                tokio::task::spawn(handle_connecting_task(
+                    endpoint.clone(),
+                    connecting,
+                    sender.clone(),
+                    bank_forks.clone(),
+                    prune_cache_pending.clone(),
+                    router.clone(),
+                    cache.clone(),
+                    stats.clone(),
+                ));
+            }
+            Err(error) => {
+                debug!("Error while accepting incoming connection: {error:?} from {remote_addr}");
+            }
+        }
     }
     report_metrics_task.abort();
 }
@@ -227,7 +245,7 @@ async fn run_client(
 ) {
     let stats = Arc::<TurbineQuicStats>::default();
     let report_metrics_task =
-        tokio::task::spawn(report_metrics_task("repair_quic_client", stats.clone()));
+        tokio::task::spawn(report_metrics_task("turbine_quic_client", stats.clone()));
     while let Some((remote_address, bytes)) = receiver.recv().await {
         let Some(bytes) = try_route_bytes(&remote_address, bytes, &*router.read().await, &stats)
         else {
@@ -486,9 +504,8 @@ async fn make_connection(
     cache: Arc<Mutex<HashMap<Pubkey, Connection>>>,
     stats: Arc<TurbineQuicStats>,
 ) -> Result<(), Error> {
-    let connection = endpoint
-        .connect(remote_address, CONNECT_SERVER_NAME)?
-        .await?;
+    let server_name = socket_addr_to_quic_server_name(remote_address);
+    let connection = endpoint.connect(remote_address, &server_name)?.await?;
     handle_connection(
         endpoint,
         connection.remote_address(),
@@ -575,7 +592,7 @@ async fn prune_connection_cache(
     debug_assert!(prune_cache_pending.load(Ordering::Relaxed));
     let staked_nodes = {
         let root_bank = bank_forks.read().unwrap().root_bank();
-        root_bank.staked_nodes()
+        root_bank.current_epoch_staked_nodes()
     };
     {
         let mut cache = cache.lock().await;
@@ -628,11 +645,15 @@ struct TurbineQuicStats {
     connection_error_timed_out: AtomicU64,
     connection_error_transport_error: AtomicU64,
     connection_error_version_mismatch: AtomicU64,
+    connection_error_connection_limit_exceeded: AtomicU64,
     invalid_identity: AtomicU64,
     router_try_send_error_full: AtomicU64,
     send_datagram_error_connection_lost: AtomicU64,
     send_datagram_error_too_large: AtomicU64,
     send_datagram_error_unsupported_by_peer: AtomicU64,
+    connect_error_cids_exhausted: AtomicU64,
+    connect_error_invalid_server_name: AtomicU64,
+    connection_error_cids_exhausted: AtomicU64,
 }
 
 async fn report_metrics_task(name: &'static str, stats: Arc<TurbineQuicStats>) {
@@ -646,12 +667,6 @@ fn record_error(err: &Error, stats: &TurbineQuicStats) {
     match err {
         Error::ChannelSendError => (),
         Error::ConnectError(ConnectError::EndpointStopping) => {
-            add_metric!(stats.connect_error_other)
-        }
-        Error::ConnectError(ConnectError::TooManyConnections) => {
-            add_metric!(stats.connect_error_too_many_connections)
-        }
-        Error::ConnectError(ConnectError::InvalidDnsName(_)) => {
             add_metric!(stats.connect_error_other)
         }
         Error::ConnectError(ConnectError::InvalidRemoteAddress(_)) => {
@@ -695,6 +710,15 @@ fn record_error(err: &Error, stats: &TurbineQuicStats) {
             add_metric!(stats.send_datagram_error_connection_lost)
         }
         Error::TlsError(_) => (),
+        Error::ConnectError(ConnectError::CidsExhausted) => {
+            add_metric!(stats.connect_error_cids_exhausted)
+        }
+        Error::ConnectError(ConnectError::InvalidServerName(_)) => {
+            add_metric!(stats.connect_error_invalid_server_name)
+        }
+        Error::ConnectionError(ConnectionError::CidsExhausted) => {
+            add_metric!(stats.connection_error_cids_exhausted)
+        }
     }
 }
 
@@ -757,6 +781,11 @@ fn report_metrics(name: &'static str, stats: &TurbineQuicStats) {
             i64
         ),
         (
+            "connection_error_connection_limit_exceeded",
+            reset_metric!(stats.connection_error_connection_limit_exceeded),
+            i64
+        ),
+        (
             "invalid_identity",
             reset_metric!(stats.invalid_identity),
             i64
@@ -790,9 +819,14 @@ mod tests {
         super::*,
         itertools::{izip, multiunzip},
         solana_ledger::genesis_utils::{create_genesis_config, GenesisConfigInfo},
+        solana_net_utils::sockets::{bind_to, localhost_port_range_for_tests},
         solana_runtime::bank::Bank,
-        solana_sdk::signature::Signer,
-        std::{iter::repeat_with, net::Ipv4Addr, time::Duration},
+        solana_signer::Signer,
+        std::{
+            iter::repeat_with,
+            net::{IpAddr, Ipv4Addr},
+            time::Duration,
+        },
     };
 
     #[test]
@@ -805,10 +839,12 @@ mod tests {
             .build()
             .unwrap();
         let keypairs: Vec<Keypair> = repeat_with(Keypair::new).take(NUM_ENDPOINTS).collect();
-        let sockets: Vec<UdpSocket> = repeat_with(|| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))
+        let port_range = localhost_port_range_for_tests();
+        let ip_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let sockets: Vec<UdpSocket> = (port_range.0..port_range.1)
+            .map(|port| bind_to(ip_addr, port).unwrap())
             .take(NUM_ENDPOINTS)
-            .collect::<Result<_, _>>()
-            .unwrap();
+            .collect();
         let addresses: Vec<SocketAddr> = sockets
             .iter()
             .map(UdpSocket::local_addr)

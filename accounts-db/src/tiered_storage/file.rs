@@ -1,18 +1,19 @@
 use {
     super::{error::TieredStorageError, TieredStorageResult},
-    bytemuck::{AnyBitPattern, NoUninit, Pod, Zeroable},
+    bytemuck::{AnyBitPattern, NoUninit, Zeroable},
     std::{
         fs::{File, OpenOptions},
-        io::{BufWriter, Read, Result as IoResult, Seek, SeekFrom, Write},
+        io::{self, BufWriter, Read, Seek, SeekFrom, Write},
         mem,
         path::Path,
+        ptr,
     },
 };
 
 /// The ending 8 bytes of a valid tiered account storage file.
 pub const FILE_MAGIC_NUMBER: u64 = u64::from_le_bytes(*b"AnzaTech");
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, bytemuck_derive::Pod, bytemuck_derive::Zeroable)]
 #[repr(C)]
 pub struct TieredStorageMagicNumber(pub u64);
 
@@ -42,7 +43,7 @@ impl TieredReadableFile {
         Ok(file)
     }
 
-    pub fn new_writable(file_path: impl AsRef<Path>) -> IoResult<Self> {
+    pub fn new_writable(file_path: impl AsRef<Path>) -> io::Result<Self> {
         Ok(Self(
             OpenOptions::new()
                 .create_new(true)
@@ -67,7 +68,7 @@ impl TieredReadableFile {
     /// Reads a value of type `T` from the file.
     ///
     /// Type T must be plain ol' data.
-    pub fn read_pod<T: NoUninit + AnyBitPattern>(&self, value: &mut T) -> IoResult<()> {
+    pub fn read_pod<T: NoUninit + AnyBitPattern>(&self, value: &mut T) -> io::Result<()> {
         // SAFETY: Since T is AnyBitPattern, it is safe to cast bytes to T.
         unsafe { self.read_type(value) }
     }
@@ -82,8 +83,8 @@ impl TieredReadableFile {
     /// Caller must ensure casting bytes to T is safe.
     /// Refer to the Safety sections in std::slice::from_raw_parts()
     /// and bytemuck's Pod and AnyBitPattern for more information.
-    pub unsafe fn read_type<T>(&self, value: &mut T) -> IoResult<()> {
-        let ptr = value as *mut _ as *mut u8;
+    pub unsafe fn read_type<T>(&self, value: &mut T) -> io::Result<()> {
+        let ptr = ptr::from_mut(value).cast();
         // SAFETY: The caller ensures it is safe to cast bytes to T,
         // we ensure the size is safe by querying T directly,
         // and Rust ensures ptr is aligned.
@@ -91,15 +92,15 @@ impl TieredReadableFile {
         self.read_bytes(bytes)
     }
 
-    pub fn seek(&self, offset: u64) -> IoResult<u64> {
+    pub fn seek(&self, offset: u64) -> io::Result<u64> {
         (&self.0).seek(SeekFrom::Start(offset))
     }
 
-    pub fn seek_from_end(&self, offset: i64) -> IoResult<u64> {
+    pub fn seek_from_end(&self, offset: i64) -> io::Result<u64> {
         (&self.0).seek(SeekFrom::End(offset))
     }
 
-    pub fn read_bytes(&self, buffer: &mut [u8]) -> IoResult<()> {
+    pub fn read_bytes(&self, buffer: &mut [u8]) -> io::Result<()> {
         (&self.0).read_exact(buffer)
     }
 }
@@ -108,7 +109,7 @@ impl TieredReadableFile {
 pub struct TieredWritableFile(pub BufWriter<File>);
 
 impl TieredWritableFile {
-    pub fn new(file_path: impl AsRef<Path>) -> IoResult<Self> {
+    pub fn new(file_path: impl AsRef<Path>) -> io::Result<Self> {
         Ok(Self(BufWriter::new(
             OpenOptions::new()
                 .create_new(true)
@@ -120,7 +121,7 @@ impl TieredWritableFile {
     /// Writes `value` to the file.
     ///
     /// `value` must be plain ol' data.
-    pub fn write_pod<T: NoUninit>(&mut self, value: &T) -> IoResult<usize> {
+    pub fn write_pod<T: NoUninit>(&mut self, value: &T) -> io::Result<usize> {
         // SAFETY: Since T is NoUninit, it does not contain any uninitialized bytes.
         unsafe { self.write_type(value) }
     }
@@ -135,24 +136,37 @@ impl TieredWritableFile {
     /// Caller must ensure casting T to bytes is safe.
     /// Refer to the Safety sections in std::slice::from_raw_parts()
     /// and bytemuck's Pod and NoUninit for more information.
-    pub unsafe fn write_type<T>(&mut self, value: &T) -> IoResult<usize> {
-        let ptr = value as *const _ as *const u8;
+    pub unsafe fn write_type<T>(&mut self, value: &T) -> io::Result<usize> {
+        let ptr = ptr::from_ref(value).cast();
         let bytes = unsafe { std::slice::from_raw_parts(ptr, mem::size_of::<T>()) };
         self.write_bytes(bytes)
     }
 
-    pub fn seek(&mut self, offset: u64) -> IoResult<u64> {
+    pub fn seek(&mut self, offset: u64) -> io::Result<u64> {
         self.0.seek(SeekFrom::Start(offset))
     }
 
-    pub fn seek_from_end(&mut self, offset: i64) -> IoResult<u64> {
+    pub fn seek_from_end(&mut self, offset: i64) -> io::Result<u64> {
         self.0.seek(SeekFrom::End(offset))
     }
 
-    pub fn write_bytes(&mut self, bytes: &[u8]) -> IoResult<usize> {
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.0.write_all(bytes)?;
 
         Ok(bytes.len())
+    }
+}
+
+impl Drop for TieredWritableFile {
+    fn drop(&mut self) {
+        // BufWriter flushes on Drop, but swallows any errors.
+        // Users should always flush explicitly, so errors can be handled.
+        // However, if flush wasn't called, do it here and panic on error.
+        // This is a programmer bug; it means we have forgotten to call flush somewhere.
+        let result = self.0.flush();
+        if let Err(err) = result {
+            panic!("failed to flush TieredWritableFile on drop: {err}");
+        }
     }
 }
 

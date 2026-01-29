@@ -1,10 +1,17 @@
 use {
+    solana_account_info::AccountInfo,
+    solana_clock::Clock,
+    solana_epoch_rewards::EpochRewards,
+    solana_epoch_schedule::EpochSchedule,
+    solana_instruction::Instruction,
+    solana_msg::msg,
+    solana_program_error::ProgramResult,
     solana_program_test::{processor, ProgramTest},
-    solana_sdk::{
-        account_info::AccountInfo, clock::Clock, entrypoint::ProgramResult,
-        epoch_rewards::EpochRewards, epoch_schedule::EpochSchedule, instruction::Instruction, msg,
-        pubkey::Pubkey, rent::Rent, signature::Signer, sysvar::Sysvar, transaction::Transaction,
-    },
+    solana_pubkey::Pubkey,
+    solana_rent::Rent,
+    solana_signer::Signer,
+    solana_sysvar::Sysvar,
+    solana_transaction::Transaction,
 };
 
 // Process instruction to invoke into another program
@@ -22,7 +29,7 @@ fn sysvar_getter_process_instruction(
     assert_eq!(epoch_schedule, EpochSchedule::default());
 
     let rent = Rent::get()?;
-    assert_eq!(rent, Rent::default());
+    assert_eq!(rent.exemption_threshold, 1.0);
 
     Ok(())
 }
@@ -65,10 +72,11 @@ fn epoch_reward_sysvar_getter_process_instruction(
     // input[0] == 1 indicates the bank is in reward period.
     if input[0] == 0 {
         // epoch rewards sysvar should not exist for banks that are not in reward period
-        let epoch_rewards = EpochRewards::get();
-        assert!(epoch_rewards.is_err());
+        let epoch_rewards = EpochRewards::get()?;
+        assert!(!epoch_rewards.active);
     } else {
-        let _epoch_rewards = EpochRewards::get()?;
+        let epoch_rewards = EpochRewards::get()?;
+        assert!(epoch_rewards.active);
     }
 
     Ok(())

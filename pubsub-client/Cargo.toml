@@ -9,18 +9,25 @@ homepage = { workspace = true }
 license = { workspace = true }
 edition = { workspace = true }
 
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[features]
+agave-unstable-api = []
+
 [dependencies]
 crossbeam-channel = { workspace = true }
 futures-util = { workspace = true }
+http = { workspace = true }
 log = { workspace = true }
-reqwest = { workspace = true, features = ["blocking", "brotli", "deflate", "gzip", "rustls-tls", "json"] }
 semver = { workspace = true }
 serde = { workspace = true }
-serde_derive = { workspace = true }
 serde_json = { workspace = true }
-solana-account-decoder = { workspace = true }
-solana-rpc-client-api = { workspace = true }
-solana-sdk = { workspace = true }
+solana-account-decoder-client-types = { workspace = true }
+solana-clock = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-rpc-client-types = { workspace = true }
+solana-signature = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
@@ -30,6 +37,5 @@ url = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
-
-[package.metadata.docs.rs]
-targets = ["x86_64-unknown-linux-gnu"]
+solana-commitment-config = { workspace = true }
+solana-pubkey = { workspace = true, features = ["rand"] }

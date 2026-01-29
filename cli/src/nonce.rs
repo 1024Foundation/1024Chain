@@ -5,13 +5,16 @@ use {
             log_instruction_custom_error, CliCommand, CliCommandInfo, CliConfig, CliError,
             ProcessResult,
         },
-        compute_unit_price::WithComputeUnitPrice,
+        compute_budget::{
+            simulate_and_update_compute_unit_limit, ComputeUnitConfig, WithComputeUnitConfig,
+        },
         memo::WithMemo,
         spend_utils::{resolve_spend_tx_and_check_account_balance, SpendAmount},
     },
     clap::{App, Arg, ArgMatches, SubCommand},
+    solana_account::Account,
     solana_clap_utils::{
-        compute_unit_price::{compute_unit_price_arg, COMPUTE_UNIT_PRICE_ARG},
+        compute_budget::{compute_unit_price_arg, ComputeUnitLimit, COMPUTE_UNIT_PRICE_ARG},
         input_parsers::*,
         input_validators::*,
         keypair::{CliSigners, DefaultSigner, SignerIndex},
@@ -19,23 +22,22 @@ use {
         nonce::*,
     },
     solana_cli_output::CliNonceAccount,
+    solana_hash::Hash,
+    solana_message::Message,
+    solana_nonce::{self as nonce, state::State},
+    solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_nonce_utils::*,
-    solana_sdk::{
-        account::Account,
-        hash::Hash,
-        message::Message,
-        nonce::{self, State},
-        pubkey::Pubkey,
-        system_instruction::{
+    solana_sdk_ids::system_program,
+    solana_system_interface::{
+        error::SystemError,
+        instruction::{
             advance_nonce_account, authorize_nonce_account, create_nonce_account,
             create_nonce_account_with_seed, upgrade_nonce_account, withdraw_nonce_account,
-            SystemError,
         },
-        system_program,
-        transaction::Transaction,
     },
+    solana_transaction::Transaction,
     std::rc::Rc,
 };
 
@@ -273,10 +275,9 @@ pub fn parse_get_nonce(
     let nonce_account_pubkey =
         pubkey_of_signer(matches, "nonce_account_pubkey", wallet_manager)?.unwrap();
 
-    Ok(CliCommandInfo {
-        command: CliCommand::GetNonce(nonce_account_pubkey),
-        signers: vec![],
-    })
+    Ok(CliCommandInfo::without_signers(CliCommand::GetNonce(
+        nonce_account_pubkey,
+    )))
 }
 
 pub fn parse_new_nonce(
@@ -316,13 +317,12 @@ pub fn parse_show_nonce_account(
         pubkey_of_signer(matches, "nonce_account_pubkey", wallet_manager)?.unwrap();
     let use_lamports_unit = matches.is_present("lamports");
 
-    Ok(CliCommandInfo {
-        command: CliCommand::ShowNonceAccount {
+    Ok(CliCommandInfo::without_signers(
+        CliCommand::ShowNonceAccount {
             nonce_account_pubkey,
             use_lamports_unit,
         },
-        signers: vec![],
-    })
+    ))
 }
 
 pub fn parse_withdraw_from_nonce_account(
@@ -410,19 +410,24 @@ pub fn process_authorize_nonce_account(
     nonce_authority: SignerIndex,
     memo: Option<&String>,
     new_authority: &Pubkey,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let latest_blockhash = rpc_client.get_latest_blockhash()?;
 
     let nonce_authority = config.signers[nonce_authority];
+    let compute_unit_limit = ComputeUnitLimit::Simulated;
     let ixs = vec![authorize_nonce_account(
         nonce_account,
         &nonce_authority.pubkey(),
         new_authority,
     )]
     .with_memo(memo)
-    .with_compute_unit_price(compute_unit_price);
-    let message = Message::new(&ixs, Some(&config.signers[0].pubkey()));
+    .with_compute_unit_config(&ComputeUnitConfig {
+        compute_unit_price,
+        compute_unit_limit,
+    });
+    let mut message = Message::new(&ixs, Some(&config.signers[0].pubkey()));
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
     tx.try_sign(&config.signers, latest_blockhash)?;
 
@@ -432,7 +437,11 @@ pub fn process_authorize_nonce_account(
         &tx.message,
         config.commitment,
     )?;
-    let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+        &tx,
+        config.commitment,
+        config.send_transaction_config,
+    );
 
     log_instruction_custom_error::<SystemError>(result, config)
 }
@@ -444,8 +453,8 @@ pub fn process_create_nonce_account(
     seed: Option<String>,
     nonce_authority: Option<Pubkey>,
     memo: Option<&String>,
-    amount: SpendAmount,
-    compute_unit_price: Option<&u64>,
+    mut amount: SpendAmount,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let nonce_account_pubkey = config.signers[nonce_account].pubkey();
     let nonce_account_address = if let Some(ref seed) = seed {
@@ -459,8 +468,16 @@ pub fn process_create_nonce_account(
         (&nonce_account_address, "nonce_account".to_string()),
     )?;
 
+    let minimum_balance = rpc_client.get_minimum_balance_for_rent_exemption(State::size())?;
+    if amount == SpendAmount::All {
+        amount = SpendAmount::AllForAccountCreation {
+            create_account_min_balance: minimum_balance,
+        };
+    }
+
     let nonce_authority = nonce_authority.unwrap_or_else(|| config.signers[0].pubkey());
 
+    let compute_unit_limit = ComputeUnitLimit::Simulated;
     let build_message = |lamports| {
         let ixs = if let Some(seed) = seed.clone() {
             create_nonce_account_with_seed(
@@ -472,7 +489,10 @@ pub fn process_create_nonce_account(
                 lamports,
             )
             .with_memo(memo)
-            .with_compute_unit_price(compute_unit_price)
+            .with_compute_unit_config(&ComputeUnitConfig {
+                compute_unit_price,
+                compute_unit_limit,
+            })
         } else {
             create_nonce_account(
                 &config.signers[0].pubkey(),
@@ -481,7 +501,10 @@ pub fn process_create_nonce_account(
                 lamports,
             )
             .with_memo(memo)
-            .with_compute_unit_price(compute_unit_price)
+            .with_compute_unit_config(&ComputeUnitConfig {
+                compute_unit_price,
+                compute_unit_limit,
+            })
         };
         Message::new(&ixs, Some(&config.signers[0].pubkey()))
     };
@@ -494,6 +517,7 @@ pub fn process_create_nonce_account(
         amount,
         &latest_blockhash,
         &config.signers[0].pubkey(),
+        compute_unit_limit,
         build_message,
         config.commitment,
     )?;
@@ -507,7 +531,6 @@ pub fn process_create_nonce_account(
         return Err(CliError::BadParameter(err_msg).into());
     }
 
-    let minimum_balance = rpc_client.get_minimum_balance_for_rent_exemption(State::size())?;
     if lamports < minimum_balance {
         return Err(CliError::BadParameter(format!(
             "need at least {minimum_balance} lamports for nonce account to be rent exempt, \
@@ -518,7 +541,11 @@ pub fn process_create_nonce_account(
 
     let mut tx = Transaction::new_unsigned(message);
     tx.try_sign(&config.signers, latest_blockhash)?;
-    let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+        &tx,
+        config.commitment,
+        config.send_transaction_config,
+    );
 
     log_instruction_custom_error::<SystemError>(result, config)
 }
@@ -528,7 +555,6 @@ pub fn process_get_nonce(
     config: &CliConfig,
     nonce_account_pubkey: &Pubkey,
 ) -> ProcessResult {
-    #[allow(clippy::redundant_closure)]
     match get_account_with_commitment(rpc_client, nonce_account_pubkey, config.commitment)
         .and_then(|ref a| state_from_account(a))?
     {
@@ -543,7 +569,7 @@ pub fn process_new_nonce(
     nonce_account: &Pubkey,
     nonce_authority: SignerIndex,
     memo: Option<&String>,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     check_unique_pubkeys(
         (&config.signers[0].pubkey(), "cli keypair".to_string()),
@@ -558,14 +584,19 @@ pub fn process_new_nonce(
     }
 
     let nonce_authority = config.signers[nonce_authority];
+    let compute_unit_limit = ComputeUnitLimit::Simulated;
     let ixs = vec![advance_nonce_account(
         nonce_account,
         &nonce_authority.pubkey(),
     )]
     .with_memo(memo)
-    .with_compute_unit_price(compute_unit_price);
+    .with_compute_unit_config(&ComputeUnitConfig {
+        compute_unit_price,
+        compute_unit_limit,
+    });
     let latest_blockhash = rpc_client.get_latest_blockhash()?;
-    let message = Message::new(&ixs, Some(&config.signers[0].pubkey()));
+    let mut message = Message::new(&ixs, Some(&config.signers[0].pubkey()));
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
     tx.try_sign(&config.signers, latest_blockhash)?;
     check_account_for_fee_with_commitment(
@@ -574,7 +605,11 @@ pub fn process_new_nonce(
         &tx.message,
         config.commitment,
     )?;
-    let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+        &tx,
+        config.commitment,
+        config.send_transaction_config,
+    );
 
     log_instruction_custom_error::<SystemError>(result, config)
 }
@@ -617,11 +652,12 @@ pub fn process_withdraw_from_nonce_account(
     memo: Option<&String>,
     destination_account_pubkey: &Pubkey,
     lamports: u64,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let latest_blockhash = rpc_client.get_latest_blockhash()?;
 
     let nonce_authority = config.signers[nonce_authority];
+    let compute_unit_limit = ComputeUnitLimit::Simulated;
     let ixs = vec![withdraw_nonce_account(
         nonce_account,
         &nonce_authority.pubkey(),
@@ -629,8 +665,12 @@ pub fn process_withdraw_from_nonce_account(
         lamports,
     )]
     .with_memo(memo)
-    .with_compute_unit_price(compute_unit_price);
-    let message = Message::new(&ixs, Some(&config.signers[0].pubkey()));
+    .with_compute_unit_config(&ComputeUnitConfig {
+        compute_unit_price,
+        compute_unit_limit,
+    });
+    let mut message = Message::new(&ixs, Some(&config.signers[0].pubkey()));
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
     tx.try_sign(&config.signers, latest_blockhash)?;
     check_account_for_fee_with_commitment(
@@ -639,7 +679,11 @@ pub fn process_withdraw_from_nonce_account(
         &tx.message,
         config.commitment,
     )?;
-    let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+        &tx,
+        config.commitment,
+        config.send_transaction_config,
+    );
 
     log_instruction_custom_error::<SystemError>(result, config)
 }
@@ -649,13 +693,18 @@ pub(crate) fn process_upgrade_nonce_account(
     config: &CliConfig,
     nonce_account: Pubkey,
     memo: Option<&String>,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let latest_blockhash = rpc_client.get_latest_blockhash()?;
+    let compute_unit_limit = ComputeUnitLimit::Simulated;
     let ixs = vec![upgrade_nonce_account(nonce_account)]
         .with_memo(memo)
-        .with_compute_unit_price(compute_unit_price);
-    let message = Message::new(&ixs, Some(&config.signers[0].pubkey()));
+        .with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit,
+        });
+    let mut message = Message::new(&ixs, Some(&config.signers[0].pubkey()));
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
     tx.try_sign(&config.signers, latest_blockhash)?;
     check_account_for_fee_with_commitment(
@@ -664,7 +713,11 @@ pub(crate) fn process_upgrade_nonce_account(
         &tx.message,
         config.commitment,
     )?;
-    let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+        &tx,
+        config.commitment,
+        config.send_transaction_config,
+    );
     log_instruction_custom_error::<SystemError>(result, config)
 }
 
@@ -673,19 +726,17 @@ mod tests {
     use {
         super::*,
         crate::{clap_app::get_clap_app, cli::parse_command},
-        solana_sdk::{
-            account::Account,
-            account_utils::StateMut,
-            hash::hash,
-            nonce::{
-                self,
-                state::{DurableNonce, Versions},
-                State,
-            },
-            nonce_account,
-            signature::{read_keypair_file, write_keypair, Keypair, Signer},
-            system_program,
+        solana_account::{state_traits::StateMut, Account},
+        solana_keypair::{read_keypair_file, write_keypair, Keypair},
+        solana_nonce::{
+            self as nonce,
+            state::{DurableNonce, State},
+            versions::Versions,
         },
+        solana_nonce_account as nonce_account,
+        solana_sdk_ids::system_program,
+        solana_sha256_hasher::hash,
+        solana_signer::Signer,
         tempfile::NamedTempFile,
     };
 
@@ -818,10 +869,7 @@ mod tests {
         ]);
         assert_eq!(
             parse_command(&test_get_nonce, &default_signer, &mut None).unwrap(),
-            CliCommandInfo {
-                command: CliCommand::GetNonce(nonce_account_keypair.pubkey()),
-                signers: vec![],
-            }
+            CliCommandInfo::without_signers(CliCommand::GetNonce(nonce_account_keypair.pubkey()))
         );
 
         // Test NewNonce SubCommand
@@ -876,13 +924,10 @@ mod tests {
         ]);
         assert_eq!(
             parse_command(&test_show_nonce_account, &default_signer, &mut None).unwrap(),
-            CliCommandInfo {
-                command: CliCommand::ShowNonceAccount {
-                    nonce_account_pubkey: nonce_account_keypair.pubkey(),
-                    use_lamports_unit: false,
-                },
-                signers: vec![],
-            }
+            CliCommandInfo::without_signers(CliCommand::ShowNonceAccount {
+                nonce_account_pubkey: nonce_account_keypair.pubkey(),
+                use_lamports_unit: false,
+            })
         );
 
         // Test WithdrawFromNonceAccount Subcommand
@@ -997,7 +1042,7 @@ mod tests {
     fn test_check_nonce_account() {
         let durable_nonce = DurableNonce::from_blockhash(&Hash::default());
         let blockhash = *durable_nonce.as_hash();
-        let nonce_pubkey = solana_sdk::pubkey::new_rand();
+        let nonce_pubkey = solana_pubkey::new_rand();
         let data = Versions::new(State::Initialized(nonce::state::Data::new(
             nonce_pubkey,
             durable_nonce,
@@ -1039,7 +1084,7 @@ mod tests {
             );
         }
 
-        let new_nonce_authority = solana_sdk::pubkey::new_rand();
+        let new_nonce_authority = solana_pubkey::new_rand();
         let data = Versions::new(State::Initialized(nonce::state::Data::new(
             new_nonce_authority,
             durable_nonce,
@@ -1091,7 +1136,7 @@ mod tests {
         let mut nonce_account = nonce_account::create_account(1).into_inner();
         assert_eq!(state_from_account(&nonce_account), Ok(State::Uninitialized));
 
-        let durable_nonce = DurableNonce::from_blockhash(&Hash::new(&[42u8; 32]));
+        let durable_nonce = DurableNonce::from_blockhash(&Hash::new_from_array([42u8; 32]));
         let data = nonce::state::Data::new(Pubkey::from([1u8; 32]), durable_nonce, 42);
         nonce_account
             .set_state(&Versions::new(State::Initialized(data.clone())))
@@ -1121,7 +1166,7 @@ mod tests {
             Err(Error::InvalidStateForOperation)
         );
 
-        let durable_nonce = DurableNonce::from_blockhash(&Hash::new(&[42u8; 32]));
+        let durable_nonce = DurableNonce::from_blockhash(&Hash::new_from_array([42u8; 32]));
         let data = nonce::state::Data::new(Pubkey::from([1u8; 32]), durable_nonce, 42);
         nonce_account
             .set_state(&Versions::new(State::Initialized(data.clone())))

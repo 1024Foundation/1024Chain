@@ -1,6 +1,5 @@
 [package]
-name = "solana-bpf-rust-big-mod-exp"
-documentation = "https://docs.rs/solana-bpf-rust-big-mod-exp"
+name = "solana-sbf-rust-big-mod-exp"
 version = { workspace = true }
 description = { workspace = true }
 authors = { workspace = true }
@@ -9,14 +8,16 @@ homepage = { workspace = true }
 license = { workspace = true }
 edition = { workspace = true }
 
-[dependencies]
-array-bytes = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-solana-program = { workspace = true }
-
 [lib]
 crate-type = ["cdylib"]
 
-[package.metadata.docs.rs]
-targets = ["x86_64-unknown-linux-gnu"]
+[dependencies]
+array-bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+solana-big-mod-exp = { workspace = true }
+solana-msg = { workspace = true }
+solana-program-entrypoint = { workspace = true }
+
+[lints]
+workspace = true

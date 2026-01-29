@@ -1,6 +1,8 @@
 use {
     crate::consensus::heaviest_subtree_fork_choice::SlotHashKey,
-    solana_sdk::{clock::Slot, hash::Hash, pubkey::Pubkey},
+    solana_clock::Slot,
+    solana_hash::Hash,
+    solana_pubkey::Pubkey,
     std::collections::{hash_map::Entry, HashMap},
 };
 
@@ -184,10 +186,9 @@ mod tests {
                     (vote_slot, vec![frozen_hash])
                 );
             } else {
-                assert!(latest_validator_votes_for_frozen_banks
+                assert!(!latest_validator_votes_for_frozen_banks
                     .fork_choice_dirty_set
-                    .get(&vote_pubkey)
-                    .is_none());
+                    .contains_key(&vote_pubkey));
             }
         }
 
@@ -218,10 +219,9 @@ mod tests {
                 (vote_slot, all_frozen_hashes.clone())
             );
         } else {
-            assert!(latest_validator_votes_for_frozen_banks
+            assert!(!latest_validator_votes_for_frozen_banks
                 .fork_choice_dirty_set
-                .get(&vote_pubkey)
-                .is_none());
+                .contains_key(&vote_pubkey));
         }
 
         // Case 4: Adding duplicate vote that is not frozen should not update the state
@@ -250,10 +250,9 @@ mod tests {
                 (vote_slot, all_frozen_hashes.clone())
             );
         } else {
-            assert!(latest_validator_votes_for_frozen_banks
+            assert!(!latest_validator_votes_for_frozen_banks
                 .fork_choice_dirty_set
-                .get(&vote_pubkey)
-                .is_none());
+                .contains_key(&vote_pubkey));
         }
 
         // Case 5: Adding a vote for a new higher slot that is not yet frozen
@@ -285,10 +284,9 @@ mod tests {
                 (old_vote_slot, all_frozen_hashes)
             );
         } else {
-            assert!(latest_validator_votes_for_frozen_banks
+            assert!(!latest_validator_votes_for_frozen_banks
                 .fork_choice_dirty_set
-                .get(&vote_pubkey)
-                .is_none());
+                .contains_key(&vote_pubkey));
         }
 
         // Case 6: Adding a vote for a new higher slot that *is* frozen
@@ -318,10 +316,9 @@ mod tests {
                 (vote_slot, vec![frozen_hash])
             );
         } else {
-            assert!(latest_validator_votes_for_frozen_banks
+            assert!(!latest_validator_votes_for_frozen_banks
                 .fork_choice_dirty_set
-                .get(&vote_pubkey)
-                .is_none());
+                .contains_key(&vote_pubkey));
         }
 
         // Case 7: Adding a vote for a new pubkey should also update the state
@@ -352,10 +349,9 @@ mod tests {
                 (vote_slot, vec![frozen_hash])
             );
         } else {
-            assert!(latest_validator_votes_for_frozen_banks
+            assert!(!latest_validator_votes_for_frozen_banks
                 .fork_choice_dirty_set
-                .get(&vote_pubkey)
-                .is_none());
+                .contains_key(&vote_pubkey));
         }
     }
 

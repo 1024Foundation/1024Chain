@@ -4,7 +4,7 @@ use {
             log_instruction_custom_error, request_and_confirm_airdrop, CliCommand, CliCommandInfo,
             CliConfig, CliError, ProcessResult,
         },
-        compute_unit_price::WithComputeUnitPrice,
+        compute_budget::{ComputeUnitConfig, WithComputeUnitConfig},
         memo::WithMemo,
         nonce::check_nonce_account,
         spend_utils::{resolve_spend_tx_and_check_account_balances, SpendAmount},
@@ -12,7 +12,7 @@ use {
     clap::{value_t_or_exit, App, Arg, ArgMatches, SubCommand},
     hex::FromHex,
     solana_clap_utils::{
-        compute_unit_price::{compute_unit_price_arg, COMPUTE_UNIT_PRICE_ARG},
+        compute_budget::{compute_unit_price_arg, ComputeUnitLimit, COMPUTE_UNIT_PRICE_ARG},
         fee_payer::*,
         hidden_unless_forced,
         input_parsers::*,
@@ -28,27 +28,48 @@ use {
         CliSignatureVerificationStatus, CliTransaction, CliTransactionConfirmation, OutputFormat,
         ReturnSignersConfig,
     },
+    solana_commitment_config::CommitmentConfig,
+    solana_message::Message,
+    solana_offchain_message::OffchainMessage,
+    solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::config::RpcTransactionConfig,
     solana_rpc_client_nonce_utils::blockhash_query::BlockhashQuery,
-    solana_sdk::{
-        commitment_config::CommitmentConfig,
-        message::Message,
-        offchain_message::OffchainMessage,
-        pubkey::Pubkey,
-        signature::Signature,
-        stake,
-        system_instruction::{self, SystemError},
-        system_program,
-        transaction::{Transaction, VersionedTransaction},
-    },
+    solana_sdk_ids::{stake, system_program},
+    solana_signature::Signature,
+    solana_system_interface::{error::SystemError, instruction as system_instruction},
+    solana_transaction::{versioned::VersionedTransaction, Transaction},
     solana_transaction_status::{
         EncodableWithMeta, EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction,
         TransactionBinaryEncoding, UiTransactionEncoding,
     },
     std::{fmt::Write as FmtWrite, fs::File, io::Write, rc::Rc, str::FromStr},
 };
+
+// Formatted specifically for the manually-indented heredoc string
+#[rustfmt::skip]
+const CONFIRM_AFTER_HELP_MESSAGE: &str =
+    "Note: This will show more detailed information for finalized \
+     transactions with verbose mode (-v/--verbose).\
+     \n\
+     \nAccount modes:\
+     \n  |srwx|\
+     \n    s: signed\
+     \n    r: readable (always true)\
+     \n    w: writable\
+     \n    x: program account (inner instructions excluded)";
+
+#[rustfmt::skip]
+const SEEDS_ARG_HELP_MESSAGE: &str =
+    "The seeds. \n\
+     Each one must match the pattern PREFIX:VALUE. \n\
+     PREFIX can be one of [string, pubkey, hex, u8] \n\
+     or matches the pattern [u,i][16,32,64,128][le,be] \
+     (for example u64le) for number values \n\
+     [u,i] - represents whether the number is unsigned or signed, \n\
+     [16,32,64,128] - represents the bit length, and \n\
+     [le,be] - represents the byte order - little endian or big endian";
 
 pub trait WalletSubCommands {
     fn wallet_subcommands(self) -> Self;
@@ -138,19 +159,7 @@ impl WalletSubCommands for App<'_, '_> {
                         .required(true)
                         .help("The transaction signature to confirm"),
                 )
-                .after_help(
-                    // Formatted specifically for the manually-indented heredoc string
-                    "Note: This will show more detailed information for finalized \
-                    transactions with verbose mode (-v/--verbose).\
-                    \n\
-                    \nAccount modes:\
-                    \n  |srwx|\
-                    \n    s: signed\
-                    \n    r: readable (always true)\
-                    \n    w: writable\
-                    \n    x: program account (inner instructions excluded)\
-                    ",
-                ),
+                .after_help(CONFIRM_AFTER_HELP_MESSAGE),
         )
         .subcommand(
             SubCommand::with_name("create-address-with-seed")
@@ -174,8 +183,8 @@ impl WalletSubCommands for App<'_, '_> {
                         .takes_value(true)
                         .required(true)
                         .help(
-                            "The program_id that the address will ultimately be used for, \n\
-                             or one of NONCE, STAKE, and VOTE keywords",
+                            "The program_id that the address will ultimately be used for, or one \
+                             of NONCE, STAKE, and VOTE keywords",
                         ),
                 )
                 .arg(pubkey!(
@@ -196,8 +205,8 @@ impl WalletSubCommands for App<'_, '_> {
                         .takes_value(true)
                         .required(true)
                         .help(
-                            "The program_id that the address will ultimately be used for, \n\
-                             or one of NONCE, STAKE, and VOTE keywords",
+                            "The program_id that the address will ultimately be used for, or one \
+                             of NONCE, STAKE, and VOTE keywords",
                         ),
                 )
                 .arg(
@@ -206,16 +215,7 @@ impl WalletSubCommands for App<'_, '_> {
                         .value_name("SEED")
                         .takes_value(true)
                         .validator(is_structured_seed)
-                        .help(
-                            "The seeds. \n\
-                            Each one must match the pattern PREFIX:VALUE. \n\
-                            PREFIX can be one of [string, pubkey, hex, u8] \n\
-                            or matches the pattern [u,i][16,32,64,128][le,be] \
-                            (for example u64le) for number values \n\
-                            [u,i] - represents whether the number is unsigned or signed, \n\
-                            [16,32,64,128] - represents the bit length, and \n\
-                            [le,be] - represents the byte order - little endian or big endian",
-                        ),
+                        .help(SEEDS_ARG_HELP_MESSAGE),
                 ),
         )
         .subcommand(
@@ -393,7 +393,7 @@ fn resolve_derived_address_program_id(matches: &ArgMatches<'_>, arg_name: &str) 
         let upper = v.to_ascii_uppercase();
         match upper.as_str() {
             "NONCE" | "SYSTEM" => Some(system_program::id()),
-            "STAKE" => Some(stake::program::id()),
+            "STAKE" => Some(stake::id()),
             "VOTE" => Some(solana_vote_program::id()),
             _ => pubkey_of(matches, arg_name),
         }
@@ -407,14 +407,11 @@ pub fn parse_account(
     let account_pubkey = pubkey_of_signer(matches, "account_pubkey", wallet_manager)?.unwrap();
     let output_file = matches.value_of("output_file");
     let use_lamports_unit = matches.is_present("lamports");
-    Ok(CliCommandInfo {
-        command: CliCommand::ShowAccount {
-            pubkey: account_pubkey,
-            output_file: output_file.map(ToString::to_string),
-            use_lamports_unit,
-        },
-        signers: vec![],
-    })
+    Ok(CliCommandInfo::without_signers(CliCommand::ShowAccount {
+        pubkey: account_pubkey,
+        output_file: output_file.map(ToString::to_string),
+        use_lamports_unit,
+    }))
 }
 
 pub fn parse_airdrop(
@@ -465,10 +462,9 @@ pub fn parse_decode_transaction(matches: &ArgMatches<'_>) -> Result<CliCommandIn
 
     let encoded_transaction = EncodedTransaction::Binary(blob, binary_encoding);
     if let Some(transaction) = encoded_transaction.decode() {
-        Ok(CliCommandInfo {
-            command: CliCommand::DecodeTransaction(transaction),
-            signers: vec![],
-        })
+        Ok(CliCommandInfo::without_signers(
+            CliCommand::DecodeTransaction(transaction),
+        ))
     } else {
         Err(CliError::BadParameter(
             "Unable to decode transaction".to_string(),
@@ -542,10 +538,9 @@ pub fn parse_find_program_derived_address(
         })
         .unwrap_or_default();
 
-    Ok(CliCommandInfo {
-        command: CliCommand::FindProgramDerivedAddress { seeds, program_id },
-        signers: vec![],
-    })
+    Ok(CliCommandInfo::without_signers(
+        CliCommand::FindProgramDerivedAddress { seeds, program_id },
+    ))
 }
 
 pub fn parse_transfer(
@@ -801,7 +796,7 @@ pub fn process_confirm(
                     confirmation_status: Some(transaction_status.confirmation_status()),
                     transaction,
                     get_transaction_error,
-                    err: transaction_status.err.clone(),
+                    err: transaction_status.err.clone().map(Into::into),
                 }
             } else {
                 CliTransactionConfirmation {
@@ -817,7 +812,6 @@ pub fn process_confirm(
     }
 }
 
-#[allow(clippy::unnecessary_wraps)]
 pub fn process_decode_transaction(
     config: &CliConfig,
     transaction: &VersionedTransaction,
@@ -885,7 +879,7 @@ pub fn process_transfer(
     fee_payer: SignerIndex,
     derived_address_seed: Option<String>,
     derived_address_program_id: Option<&Pubkey>,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let from = config.signers[from];
     let mut from_pubkey = from.pubkey();
@@ -917,6 +911,11 @@ pub fn process_transfer(
         None
     };
 
+    let compute_unit_limit = if nonce_account.is_some() {
+        ComputeUnitLimit::Default
+    } else {
+        ComputeUnitLimit::Simulated
+    };
     let build_message = |lamports| {
         let ixs = if let Some((base_pubkey, seed, program_id, from_pubkey)) = with_seed.as_ref() {
             vec![system_instruction::transfer_with_seed(
@@ -928,11 +927,17 @@ pub fn process_transfer(
                 lamports,
             )]
             .with_memo(memo)
-            .with_compute_unit_price(compute_unit_price)
+            .with_compute_unit_config(&ComputeUnitConfig {
+                compute_unit_price,
+                compute_unit_limit,
+            })
         } else {
             vec![system_instruction::transfer(&from_pubkey, to, lamports)]
                 .with_memo(memo)
-                .with_compute_unit_price(compute_unit_price)
+                .with_compute_unit_config(&ComputeUnitConfig {
+                    compute_unit_price,
+                    compute_unit_limit,
+                })
         };
 
         if let Some(nonce_account) = &nonce_account {
@@ -954,6 +959,7 @@ pub fn process_transfer(
         &recent_blockhash,
         &from_pubkey,
         &fee_payer.pubkey(),
+        compute_unit_limit,
         build_message,
         config.commitment,
     )?;
@@ -980,9 +986,13 @@ pub fn process_transfer(
 
         tx.try_sign(&config.signers, recent_blockhash)?;
         let result = if no_wait {
-            rpc_client.send_transaction(&tx)
+            rpc_client.send_transaction_with_config(&tx, config.send_transaction_config)
         } else {
-            rpc_client.send_and_confirm_transaction_with_spinner(&tx)
+            rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+                &tx,
+                config.commitment,
+                config.send_transaction_config,
+            )
         };
         log_instruction_custom_error::<SystemError>(result, config)
     }

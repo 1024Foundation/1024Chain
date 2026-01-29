@@ -1,10 +1,11 @@
 //! Plain Old Data types for the AES128-GCM-SIV authenticated encryption scheme.
 
 #[cfg(not(target_os = "solana"))]
-use crate::encryption::auth_encryption::{self as decoded, AuthenticatedEncryptionError};
+use crate::{encryption::auth_encryption as decoded, errors::AuthenticatedEncryptionError};
 use {
-    crate::zk_token_elgamal::pod::{impl_from_str, Pod, Zeroable},
+    crate::zk_token_elgamal::pod::impl_from_str,
     base64::{prelude::BASE64_STANDARD, Engine},
+    bytemuck::{Pod, Zeroable},
     std::fmt,
 };
 
@@ -74,7 +75,7 @@ mod tests {
         let ae_key = AeKey::new_rand();
         let expected_ae_ciphertext: AeCiphertext = ae_key.encrypt(0_u64).into();
 
-        let ae_ciphertext_base64_str = format!("{}", expected_ae_ciphertext);
+        let ae_ciphertext_base64_str = format!("{expected_ae_ciphertext}");
         let computed_ae_ciphertext = AeCiphertext::from_str(&ae_ciphertext_base64_str).unwrap();
 
         assert_eq!(expected_ae_ciphertext, computed_ae_ciphertext);

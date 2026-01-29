@@ -1,15 +1,14 @@
 use {
+    solana_account_info::{next_account_info, AccountInfo},
+    solana_instruction::{AccountMeta, Instruction},
+    solana_keypair::Keypair,
+    solana_msg::msg,
+    solana_program_error::ProgramResult,
     solana_program_test::{processor, ProgramTest},
-    solana_sdk::{
-        account_info::{next_account_info, AccountInfo},
-        entrypoint::ProgramResult,
-        instruction::{AccountMeta, Instruction},
-        msg,
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-        system_instruction,
-        transaction::Transaction,
-    },
+    solana_pubkey::Pubkey,
+    solana_signer::Signer,
+    solana_system_interface::instruction as system_instruction,
+    solana_transaction::Transaction,
 };
 
 fn move_lamports_process_instruction(
@@ -42,7 +41,7 @@ async fn move_lamports() {
 
     let lamports = 1_000_000_000;
     let source = Keypair::new();
-    let mut context = program_test.start_with_context().await;
+    let context = program_test.start_with_context().await;
     let instructions = vec![
         system_instruction::create_account(
             &context.payer.pubkey(),

@@ -1,28 +1,25 @@
+use std::sync::LazyLock;
 // Wallet settings that can be configured for long-term use
 use {
-    serde_derive::{Deserialize, Serialize},
+    serde::{Deserialize, Serialize},
     std::{collections::HashMap, io, path::Path},
     url::Url,
 };
 
-lazy_static! {
-    /// The default path to the CLI configuration file.
-    ///
-    /// This is a [lazy_static] of `Option<String>`, the value of which is
-    ///
-    /// > `~/.config/solana/cli/config.yml`
-    ///
-    /// It will only be `None` if it is unable to identify the user's home
-    /// directory, which should not happen under typical OS environments.
-    ///
-    /// [lazy_static]: https://docs.rs/lazy_static
-    pub static ref CONFIG_FILE: Option<String> = {
-        dirs_next::home_dir().map(|mut path| {
-            path.extend([".config", "solana", "cli", "config.yml"]);
-            path.to_str().unwrap().to_string()
-        })
-    };
-}
+/// The default path to the CLI configuration file.
+///
+/// This is a [LazyLock] of `Option<String>`, the value of which is
+///
+/// > `~/.config/solana/cli/config.yml`
+///
+/// It will only be `None` if it is unable to identify the user's home
+/// directory, which should not happen under typical OS environments.
+pub static CONFIG_FILE: LazyLock<Option<String>> = LazyLock::new(|| {
+    dirs_next::home_dir().map(|mut path| {
+        path.extend([".config", "solana", "cli", "config.yml"]);
+        path.to_str().unwrap().to_string()
+    })
+});
 
 /// The Solana CLI configuration.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -61,7 +58,7 @@ pub struct Config {
     /// The default commitment level.
     ///
     /// By default the value is "confirmed", as defined by
-    /// `solana_sdk::commitment_config::CommitmentLevel::Confirmed`.
+    /// `solana_commitment_config::CommitmentLevel::Confirmed`.
     #[serde(default)]
     pub commitment: String,
 }
@@ -135,7 +132,7 @@ impl Config {
             return "".to_string();
         }
         let json_rpc_url = json_rpc_url.unwrap();
-        let is_secure = json_rpc_url.scheme().to_ascii_lowercase() == "https";
+        let is_secure = json_rpc_url.scheme().eq_ignore_ascii_case("https");
         let mut ws_url = json_rpc_url.clone();
         ws_url
             .set_scheme(if is_secure { "wss" } else { "ws" })

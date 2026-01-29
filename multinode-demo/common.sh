@@ -7,8 +7,9 @@
 # shellcheck disable=2034
 #
 
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. || exit 1; pwd)"
 # shellcheck source=net/common.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. || exit 1; pwd)"/net/common.sh
+source "$here"/net/common.sh
 
 prebuild=
 if [[ $1 = "--prebuild" ]]; then
@@ -30,22 +31,32 @@ if [[ -n $USE_INSTALL || ! -f "$SOLANA_ROOT"/Cargo.toml ]]; then
     if [[ -z $program ]]; then
       printf "solana"
     else
-      printf "solana-%s" "$program"
+      if [[ $program == "validator" || $program == "ledger-tool" || $program == "watchtower" || $program == "install" ]]; then
+        printf "agave-%s" "$program"
+      else
+        printf "solana-%s" "$program"
+      fi
     fi
   }
 else
   solana_program() {
     declare program="$1"
     declare crate="$program"
+    declare manifest_path
+    if [[ $program == "bench-tps" || $program == "ledger-tool" ]]; then
+      manifest_path="--manifest-path $here/dev-bins/Cargo.toml"
+    fi
     if [[ -z $program ]]; then
       crate="cli"
       program="solana"
+    elif [[ $program == "validator" || $program == "ledger-tool" || $program == "watchtower" || $program == "install" ]]; then
+      program="agave-$program"
     else
       program="solana-$program"
     fi
 
-    if [[ -n $NDEBUG ]]; then
-      maybe_release=--release
+    if [[ -n $CARGO_BUILD_PROFILE ]]; then
+      profile_arg="--profile $CARGO_BUILD_PROFILE"
     fi
 
     # Prebuild binaries so that CI sanity check timeout doesn't include build time
@@ -53,18 +64,18 @@ else
       (
         set -x
         # shellcheck disable=SC2086 # Don't want to double quote
-        cargo $CARGO_TOOLCHAIN build $maybe_release --bin $program
+        cargo $CARGO_TOOLCHAIN build $manifest_path $profile_arg --bin $program
       )
     fi
 
-    printf "cargo $CARGO_TOOLCHAIN run $maybe_release  --bin %s %s -- " "$program"
+    printf "cargo $CARGO_TOOLCHAIN run $manifest_path $profile_arg --bin %s %s -- " "$program"
   }
 fi
 
 solana_bench_tps=$(solana_program bench-tps)
 solana_faucet=$(solana_program faucet)
-solana_validator=$(solana_program validator)
-solana_validator_cuda="$solana_validator --cuda"
+agave_validator=$(solana_program validator)
+agave_validator_cuda="$agave_validator --cuda"
 solana_genesis=$(solana_program genesis)
 solana_gossip=$(solana_program gossip)
 solana_keygen=$(solana_program keygen)

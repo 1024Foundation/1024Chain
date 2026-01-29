@@ -4,11 +4,12 @@
 
 mod iterators;
 use {
-    bv::BitVec, iterators::RollingBitFieldOnesIter, solana_nohash_hasher::IntSet,
-    solana_sdk::clock::Slot,
+    bv::BitVec, iterators::RollingBitFieldOnesIter, solana_clock::Slot,
+    solana_nohash_hasher::IntSet,
 };
 
-#[derive(Debug, AbiExample, Clone)]
+#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
+#[derive(Clone)]
 pub struct RollingBitField {
     max_width: u64,
     min: u64,
@@ -34,6 +35,60 @@ impl PartialEq<RollingBitField> for RollingBitField {
             }
             true
         }
+    }
+}
+
+impl std::fmt::Debug for RollingBitField {
+    /// Custom debug formatter that outputs the possibly long and
+    /// sparse vector of bits in a compact representation, where each
+    /// sequence of equal values is compacted into value;length pair
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut bits = String::from("[");
+        let mut prev = self.bits[0];
+        bits.push_str(&format!("{prev}"));
+        let mut index = 1;
+        while index < self.bits.len() {
+            if self.bits[index] != prev {
+                prev = self.bits[index];
+                break;
+            }
+            index += 1;
+        }
+        if index > 1 {
+            bits.push_str(&format!(";{index}"));
+        }
+        if index < self.bits.len() {
+            bits.push_str(&format!(", {prev}"));
+        }
+        let mut count = 0;
+        while index < self.bits.len() {
+            if self.bits[index] != prev {
+                if count > 1 {
+                    bits.push_str(&format!(";{count}"));
+                }
+                count = 0;
+                prev = self.bits[index];
+                bits.push_str(&format!(", {prev}"));
+            }
+            count += 1;
+            index += 1;
+        }
+        if count > 1 {
+            bits.push_str(&format!(";{count}"));
+        }
+        bits.push(']');
+        // The order of the `count` and `bits` fields is changed on
+        // purpose so that possibly very long output of `bits` doesn't
+        // make it more difficult to read the value of the `count`
+        // field.
+        f.debug_struct("RollingBitField")
+            .field("max_width", &self.max_width)
+            .field("min", &self.min)
+            .field("max_exclusive", &self.max_exclusive)
+            .field("count", &self.count)
+            .field("bits", &bits)
+            .field("excess", &self.excess)
+            .finish()
     }
 }
 
@@ -309,7 +364,7 @@ pub mod tests {
 
     #[test]
     fn test_get_all_less_than() {
-        solana_logger::setup();
+        agave_logger::setup();
         let len = 16;
         let mut bitfield = RollingBitField::new(len);
         assert!(bitfield.get_all_less_than(0).is_empty());
@@ -362,7 +417,7 @@ pub mod tests {
 
     #[test]
     fn test_bitfield_delete_non_excess() {
-        solana_logger::setup();
+        agave_logger::setup();
         let len = 16;
         let mut bitfield = RollingBitField::new(len);
         assert_eq!(bitfield.min(), None);
@@ -406,7 +461,7 @@ pub mod tests {
 
     #[test]
     fn test_bitfield_insert_excess() {
-        solana_logger::setup();
+        agave_logger::setup();
         let len = 16;
         let mut bitfield = RollingBitField::new(len);
 
@@ -438,7 +493,7 @@ pub mod tests {
 
     #[test]
     fn test_bitfield_permutations() {
-        solana_logger::setup();
+        agave_logger::setup();
         let mut bitfield = RollingBitField::new(2097152);
         let mut hash = HashSet::new();
 
@@ -538,7 +593,7 @@ pub mod tests {
 
     #[test]
     fn test_bitfield_insert_wide() {
-        solana_logger::setup();
+        agave_logger::setup();
         let width = 16;
         let start = 0;
         let mut tester = setup_wide(width, start);
@@ -557,7 +612,7 @@ pub mod tests {
 
     #[test]
     fn test_bitfield_insert_wide_before() {
-        solana_logger::setup();
+        agave_logger::setup();
         let width = 16;
         let start = 100;
         let mut bitfield = setup_wide(width, start).bitfield;
@@ -572,7 +627,7 @@ pub mod tests {
 
     #[test]
     fn test_bitfield_insert_wide_before_ok() {
-        solana_logger::setup();
+        agave_logger::setup();
         let width = 16;
         let start = 100;
         let mut bitfield = setup_wide(width, start).bitfield;
@@ -623,7 +678,7 @@ pub mod tests {
 
     #[test]
     fn test_bitfield_excess2() {
-        solana_logger::setup();
+        agave_logger::setup();
         let width = 16;
         let mut tester = setup_empty(width);
         let slot = 100;
@@ -657,7 +712,7 @@ pub mod tests {
 
     #[test]
     fn test_bitfield_excess() {
-        solana_logger::setup();
+        agave_logger::setup();
         // start at slot 0 or a separate, higher slot
         for width in [16, 4194304].iter() {
             let width = *width;
@@ -791,7 +846,7 @@ pub mod tests {
 
     #[test]
     fn test_bitfield_functionality() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         // bitfield sizes are powers of 2, cycle through values of 1, 2, 4, .. 2^9
         for power in 0..10 {
@@ -954,7 +1009,7 @@ pub mod tests {
     #[test]
     fn test_bitfield_smaller() {
         // smaller bitfield, fewer entries, including 0
-        solana_logger::setup();
+        agave_logger::setup();
 
         for width in 0..34 {
             let mut bitfield = RollingBitField::new(4096);
@@ -1000,5 +1055,59 @@ pub mod tests {
             );
             assert_eq!(count, count2);
         }
+    }
+
+    #[test]
+    fn test_debug_formatter() {
+        let mut bitfield = RollingBitField::new(1);
+        assert_eq!(
+            "RollingBitField { max_width: 1, min: 0, max_exclusive: 0, count: 0, bits: \
+             \"[false]\", excess: {} }",
+            format!("{bitfield:?}")
+        );
+        bitfield.insert(0);
+        assert_eq!(
+            "RollingBitField { max_width: 1, min: 0, max_exclusive: 1, count: 1, bits: \
+             \"[true]\", excess: {} }",
+            format!("{bitfield:?}")
+        );
+        let mut bitfield = RollingBitField::new(2);
+        assert_eq!(
+            "RollingBitField { max_width: 2, min: 0, max_exclusive: 0, count: 0, bits: \
+             \"[false;2]\", excess: {} }",
+            format!("{bitfield:?}")
+        );
+        bitfield.insert(0);
+        assert_eq!(
+            "RollingBitField { max_width: 2, min: 0, max_exclusive: 1, count: 1, bits: \"[true, \
+             false]\", excess: {} }",
+            format!("{bitfield:?}")
+        );
+        bitfield.insert(1);
+        assert_eq!(
+            "RollingBitField { max_width: 2, min: 0, max_exclusive: 2, count: 2, bits: \
+             \"[true;2]\", excess: {} }",
+            format!("{bitfield:?}")
+        );
+        let mut bitfield = RollingBitField::new(4096);
+        assert_eq!(
+            "RollingBitField { max_width: 4096, min: 0, max_exclusive: 0, count: 0, bits: \
+             \"[false;4096]\", excess: {} }",
+            format!("{bitfield:?}")
+        );
+        bitfield.insert(4095);
+        assert_eq!(
+            "RollingBitField { max_width: 4096, min: 4095, max_exclusive: 4096, count: 1, bits: \
+             \"[false;4095, true]\", excess: {} }",
+            format!("{bitfield:?}")
+        );
+        bitfield.clear();
+        bitfield.insert(2);
+        bitfield.insert(3);
+        assert_eq!(
+            "RollingBitField { max_width: 4096, min: 2, max_exclusive: 4, count: 2, bits: \
+             \"[false;2, true;2, false;4092]\", excess: {} }",
+            format!("{bitfield:?}")
+        );
     }
 }

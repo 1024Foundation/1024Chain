@@ -1,6 +1,6 @@
 use {
     crate::{
-        client::{Client, RPCCommandConfig},
+        client::Client,
         sparse_index::{IndexEntry, RegistryIndex},
     },
     flate2::{
@@ -12,12 +12,10 @@ use {
     serde::{Deserialize, Serialize},
     serde_json::from_slice,
     sha2::{Digest, Sha256},
-    solana_cli::program_v4::{process_deploy_program, process_dump, read_and_verify_elf},
-    solana_sdk::{
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-        signer::EncodableKey,
-    },
+    solana_cli::program_v4::{process_deploy_program, process_dump, AdditionalCliConfig},
+    solana_keypair::Keypair,
+    solana_pubkey::Pubkey,
+    solana_signer::{EncodableKey, Signer},
     std::{
         collections::BTreeMap,
         fs,
@@ -43,7 +41,6 @@ pub(crate) enum DependencyType {
     Normal,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Dependency {
     pub name: String,
@@ -110,9 +107,14 @@ impl Program {
         if self.id != signer.pubkey() {
             return Err("Signer doesn't match program ID".into());
         }
+        let mut cli_config = client.get_cli_config();
+        cli_config.signers.push(signer);
 
-        let mut program_data = read_and_verify_elf(self.path.as_ref())
-            .map_err(|e| format!("failed to read the program: {}", e))?;
+        let mut file = fs::File::open(&self.path)
+            .map_err(|err| format!("Unable to open program file: {err}"))?;
+        let mut program_data = Vec::new();
+        file.read_to_end(&mut program_data)
+            .map_err(|err| format!("Unable to read program file: {err}"))?;
 
         if APPEND_CRATE_TO_ELF {
             let program_id_str = Program::program_id_to_crate_name(self.id);
@@ -122,19 +124,21 @@ impl Program {
             program_data.extend_from_slice(&crate_tar_gz.0);
             program_data.extend_from_slice(&crate_len);
         }
-        let command_config = RPCCommandConfig::new(client.as_ref());
 
         process_deploy_program(
             client.rpc_client.clone(),
-            &command_config.0,
-            &program_data,
-            program_data.len() as u32,
+            &cli_config,
+            &AdditionalCliConfig::default(),
             &signer.pubkey(),
-            Some(signer),
+            None,
+            Some(&2),
+            &client.authority_signer_index,
+            &program_data,
+            None..None,
         )
         .map_err(|e| {
-            error!("Failed to deploy the program: {}", e);
-            format!("Failed to deploy the program: {}", e)
+            error!("Failed to deploy the program: {e}");
+            format!("Failed to deploy the program: {e}")
         })?;
 
         Ok(())
@@ -142,17 +146,16 @@ impl Program {
 
     fn dump(&mut self, client: Arc<Client>) -> Result<(), Error> {
         info!("Fetching program {:?}", self.id);
-        let command_config = RPCCommandConfig::new(client.as_ref());
 
         process_dump(
             client.rpc_client.clone(),
-            command_config.0.commitment,
+            &client.get_cli_config(),
             Some(self.id),
             &self.path,
         )
         .map_err(|e| {
-            error!("Failed to fetch the program: {}", e);
-            format!("Failed to fetch the program: {}", e)
+            error!("Failed to fetch the program: {e}");
+            format!("Failed to fetch the program: {e}")
         })?;
 
         if APPEND_CRATE_TO_ELF {
@@ -294,18 +297,17 @@ impl UnpackedCrate {
 
         let lib_name = UnpackedCrate::program_library_name(&tempdir, &meta)?;
 
-        let program_path =
-            UnpackedCrate::make_path(&tempdir, &meta, format!("out/{}.so", lib_name))
-                .into_os_string()
-                .into_string()
-                .map_err(|_| "Failed to get program file path")?;
+        let program_path = UnpackedCrate::make_path(&tempdir, &meta, format!("out/{lib_name}.so"))
+            .into_os_string()
+            .into_string()
+            .map_err(|_| "Failed to get program file path")?;
 
         let keypair = Keypair::read_from_file(UnpackedCrate::make_path(
             &tempdir,
             &meta,
-            format!("out/{}-keypair.json", lib_name),
+            format!("out/{lib_name}-keypair.json"),
         ))
-        .map_err(|e| format!("Failed to get keypair from the file: {}", e))?;
+        .map_err(|e| format!("Failed to get keypair from the file: {e}"))?;
 
         Ok(UnpackedCrate {
             meta,
@@ -339,7 +341,7 @@ impl UnpackedCrate {
         Program::from(self).deploy(client, signer)?;
 
         let mut entry: IndexEntry = self.meta.clone().into();
-        entry.cksum = self.cksum.clone();
+        entry.cksum.clone_from(&self.cksum);
         index.insert_entry(entry)?;
 
         info!("Successfully deployed the program");
@@ -403,7 +405,7 @@ impl UnpackedCrate {
         fs::create_dir_all(base_path)
             .map_err(|_| "Failed to create the base directory for output")?;
 
-        let program_path = Self::make_path(&tempdir, &meta, format!("out/{}.so", id))
+        let program_path = Self::make_path(&tempdir, &meta, format!("out/{id}.so"))
             .into_os_string()
             .into_string()
             .map_err(|_| "Failed to get program file path")?;

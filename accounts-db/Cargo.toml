@@ -1,7 +1,7 @@
 [package]
 name = "solana-accounts-db"
 description = "Solana accounts db"
-documentation = "https://docs.rs/solana-acounts-db"
+documentation = "https://docs.rs/solana-accounts-db"
 version = { workspace = true }
 authors = { workspace = true }
 repository = { workspace = true }
@@ -9,88 +9,144 @@ homepage = { workspace = true }
 license = { workspace = true }
 edition = { workspace = true }
 
-[dependencies]
-arrayref = { workspace = true }
-bincode = { workspace = true }
-blake3 = { workspace = true }
-bv = { workspace = true, features = ["serde"] }
-bytemuck = { workspace = true }
-byteorder = { workspace = true }
-bzip2 = { workspace = true }
-crossbeam-channel = { workspace = true }
-dashmap = { workspace = true, features = ["rayon", "raw-api"] }
-flate2 = { workspace = true }
-fnv = { workspace = true }
-im = { workspace = true, features = ["rayon", "serde"] }
-index_list = { workspace = true }
-indexmap = { workspace = true }
-itertools = { workspace = true }
-lazy_static = { workspace = true }
-log = { workspace = true }
-lz4 = { workspace = true }
-memmap2 = { workspace = true }
-modular-bitfield = { workspace = true }
-num-derive = { workspace = true }
-num-traits = { workspace = true }
-num_cpus = { workspace = true }
-num_enum = { workspace = true }
-percentage = { workspace = true }
-qualifier_attr = { workspace = true }
-rand = { workspace = true }
-rayon = { workspace = true }
-regex = { workspace = true }
-seqlock = { workspace = true }
-serde = { workspace = true, features = ["rc"] }
-serde_derive = { workspace = true }
-smallvec = { workspace = true, features = ["const_generics"] }
-solana-bucket-map = { workspace = true }
-solana-config-program = { workspace = true }
-solana-frozen-abi = { workspace = true }
-solana-frozen-abi-macro = { workspace = true }
-solana-measure = { workspace = true }
-solana-metrics = { workspace = true }
-solana-nohash-hasher = { workspace = true }
-solana-program-runtime = { workspace = true }
-solana-rayon-threadlimit = { workspace = true }
-solana-sdk = { workspace = true }
-solana-stake-program = { workspace = true }
-solana-svm = { workspace = true }
-solana-system-program = { workspace = true }
-solana-vote-program = { workspace = true }
-static_assertions = { workspace = true }
-strum = { workspace = true, features = ["derive"] }
-strum_macros = { workspace = true }
-tar = { workspace = true }
-tempfile = { workspace = true }
-thiserror = { workspace = true }
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lib]
 crate-type = ["lib"]
 name = "solana_accounts_db"
 
+[features]
+agave-unstable-api = []
+dev-context-only-utils = [
+    "dep:qualifier_attr",
+    "dep:solana-keypair",
+    "dep:solana-rent",
+    "dep:solana-signer",
+    "dep:solana-stake-interface",
+    "dep:solana-vote-program",
+    "solana-account/dev-context-only-utils",
+    "solana-transaction/dev-context-only-utils",
+]
+frozen-abi = [
+    "dep:solana-frozen-abi",
+    "dep:solana-frozen-abi-macro",
+    "solana-fee-calculator/frozen-abi",
+    "solana-vote-program/frozen-abi",
+]
+
+[dependencies]
+agave-fs = { workspace = true }
+ahash = { workspace = true }
+bincode = { workspace = true }
+blake3 = { workspace = true }
+bv = { workspace = true, features = ["serde"] }
+bytemuck = { workspace = true }
+bytemuck_derive = { workspace = true }
+crossbeam-channel = { workspace = true }
+dashmap = { workspace = true, features = ["rayon", "raw-api"] }
+indexmap = { workspace = true }
+itertools = { workspace = true }
+log = { workspace = true }
+lz4 = { workspace = true }
+memmap2 = { workspace = true }
+modular-bitfield = { workspace = true }
+num_cpus = { workspace = true }
+num_enum = { workspace = true }
+qualifier_attr = { workspace = true, optional = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+seqlock = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
+smallvec = { workspace = true, features = ["const_generics"] }
+solana-account = { workspace = true, features = ["serde"] }
+solana-address-lookup-table-interface = { workspace = true, features = [
+    "bincode",
+    "bytemuck",
+] }
+solana-bucket-map = { workspace = true }
+solana-clock = { workspace = true }
+solana-epoch-schedule = { workspace = true }
+solana-fee-calculator = { workspace = true }
+solana-frozen-abi = { workspace = true, optional = true, features = [
+    "frozen-abi",
+] }
+solana-frozen-abi-macro = { workspace = true, optional = true, features = [
+    "frozen-abi",
+] }
+solana-genesis-config = { workspace = true, features = ["serde"] }
+solana-hash = { workspace = true, features = ["serde"] }
+solana-keypair = { workspace = true, optional = true }
+solana-lattice-hash = { workspace = true }
+solana-measure = { workspace = true }
+solana-message = { workspace = true }
+solana-metrics = { workspace = true }
+solana-nohash-hasher = { workspace = true }
+solana-pubkey = { workspace = true, features = ["rand"] }
+solana-rayon-threadlimit = { workspace = true }
+solana-rent = { workspace = true, optional = true }
+solana-reward-info = { workspace = true, features = ["serde"] }
+solana-sha256-hasher = { workspace = true }
+solana-signer = { workspace = true, optional = true }
+solana-slot-hashes = { workspace = true }
+solana-stake-interface = { workspace = true, optional = true }
+solana-svm-transaction = { workspace = true }
+solana-system-interface = { workspace = true }
+solana-sysvar = { workspace = true }
+solana-time-utils = { workspace = true }
+solana-transaction = { workspace = true }
+solana-transaction-context = { workspace = true }
+solana-transaction-error = { workspace = true }
+solana-vote-program = { workspace = true, optional = true }
+spl-generic-token = { workspace = true }
+static_assertions = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+
 [dev-dependencies]
+agave-logger = { workspace = true }
+agave-reserved-account-keys = { workspace = true }
 assert_matches = { workspace = true }
 criterion = { workspace = true }
-ed25519-dalek = { workspace = true }
 libsecp256k1 = { workspace = true }
 memoffset = { workspace = true }
 rand_chacha = { workspace = true }
+serde_bytes = { workspace = true }
 # See order-crates-for-publishing.py for using this unusual `path = "."`
-solana-accounts-db = { path = ".", features = ["dev-context-only-utils"] }
-solana-logger = { workspace = true }
-solana-sdk = { workspace = true, features = ["dev-context-only-utils"] }
+solana-accounts-db = { path = ".", features = ["agave-unstable-api", "dev-context-only-utils"] }
+solana-compute-budget = { workspace = true }
+solana-instruction = { workspace = true }
+solana-sdk-ids = { workspace = true }
+solana-signature = { workspace = true, features = ["rand"] }
+solana-slot-history = { workspace = true }
+solana-svm = { workspace = true }
 static_assertions = { workspace = true }
+strum = { workspace = true, features = ["derive"] }
+strum_macros = { workspace = true }
 test-case = { workspace = true }
 
-[package.metadata.docs.rs]
-targets = ["x86_64-unknown-linux-gnu"]
+[target.'cfg(not(any(target_env = "msvc", target_os = "freebsd")))'.dev-dependencies]
+jemallocator = { workspace = true }
 
-[build-dependencies]
-rustc_version = { workspace = true }
-
-[features]
-dev-context-only-utils = []
+[[bench]]
+name = "bench_accounts_file"
+harness = false
 
 [[bench]]
 name = "bench_hashing"
 harness = false
+
+[[bench]]
+name = "read_only_accounts_cache"
+harness = false
+
+[[bench]]
+name = "bench_serde"
+harness = false
+
+[[bench]]
+name = "bench_lock_accounts"
+harness = false
+
+[lints]
+workspace = true

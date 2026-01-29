@@ -18,7 +18,7 @@ use {
         instruction::{ProofType, ZkProofData},
         zk_token_elgamal::pod,
     },
-    bytemuck::{Pod, Zeroable},
+    bytemuck_derive::{Pod, Zeroable},
 };
 
 #[cfg(not(target_os = "solana"))]
@@ -69,7 +69,7 @@ impl WithdrawData {
         // current source balance
         let final_ciphertext = current_ciphertext - &ElGamal::encode(amount);
 
-        let pod_pubkey = pod::ElGamalPubkey(keypair.pubkey().to_bytes());
+        let pod_pubkey = pod::ElGamalPubkey(keypair.pubkey().into());
         let pod_final_ciphertext: pod::ElGamalCiphertext = final_ciphertext.into();
 
         let context = WithdrawProofContext {

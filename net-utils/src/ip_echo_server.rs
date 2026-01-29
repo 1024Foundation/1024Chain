@@ -1,11 +1,12 @@
 use {
-    crate::{HEADER_LENGTH, IP_ECHO_SERVER_RESPONSE_LENGTH},
+    crate::{bind_to_unspecified, HEADER_LENGTH, IP_ECHO_SERVER_RESPONSE_LENGTH},
     log::*,
-    serde_derive::{Deserialize, Serialize},
-    solana_sdk::deserialize_utils::default_on_eof,
+    serde::{Deserialize, Serialize},
+    solana_serde::default_on_eof,
     std::{
         io,
         net::{IpAddr, SocketAddr},
+        num::NonZeroUsize,
         time::Duration,
     },
     tokio::{
@@ -18,6 +19,13 @@ use {
 
 pub type IpEchoServer = Runtime;
 
+// Enforce a minimum of two threads:
+// - One thread to monitor the TcpListener and spawn async tasks
+// - One thread to service the spawned tasks
+pub const MINIMUM_IP_ECHO_SERVER_THREADS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+// IP echo requests require little computation and come in fairly infrequently,
+// so keep the number of server workers small to avoid overhead
+pub const DEFAULT_IP_ECHO_SERVER_THREADS: NonZeroUsize = MINIMUM_IP_ECHO_SERVER_THREADS;
 pub const MAX_PORT_COUNT_PER_MESSAGE: usize = 4;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -51,9 +59,8 @@ impl IpEchoServerMessage {
 
 pub(crate) fn ip_echo_server_request_length() -> usize {
     const REQUEST_TERMINUS_LENGTH: usize = 1;
-    HEADER_LENGTH
-        + bincode::serialized_size(&IpEchoServerMessage::default()).unwrap() as usize
-        + REQUEST_TERMINUS_LENGTH
+    (HEADER_LENGTH + REQUEST_TERMINUS_LENGTH)
+        .wrapping_add(bincode::serialized_size(&IpEchoServerMessage::default()).unwrap() as usize)
 }
 
 async fn process_connection(
@@ -61,7 +68,7 @@ async fn process_connection(
     peer_addr: SocketAddr,
     shred_version: Option<u16>,
 ) -> io::Result<()> {
-    info!("connection from {:?}", peer_addr);
+    info!("connection from {peer_addr:?}");
 
     let mut data = vec![0u8; ip_echo_server_request_length()];
 
@@ -85,43 +92,43 @@ async fn process_connection(
             .await??;
             return Ok(());
         }
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("Bad request header: {request_header}"),
-        ));
+        return Err(io::Error::other(format!(
+            "Bad request header: {request_header}"
+        )));
     }
 
     let msg =
         bincode::deserialize::<IpEchoServerMessage>(&data[HEADER_LENGTH..]).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to deserialize IpEchoServerMessage: {err:?}"),
-            )
+            io::Error::other(format!(
+                "Failed to deserialize IpEchoServerMessage: {err:?}"
+            ))
         })?;
 
-    trace!("request: {:?}", msg);
+    trace!("request: {msg:?}");
 
     // Fire a datagram at each non-zero UDP port
-    match std::net::UdpSocket::bind("0.0.0.0:0") {
+    match bind_to_unspecified() {
         Ok(udp_socket) => {
             for udp_port in &msg.udp_ports {
                 if *udp_port != 0 {
-                    match udp_socket.send_to(&[0], SocketAddr::from((peer_addr.ip(), *udp_port))) {
-                        Ok(_) => debug!("Successful send_to udp/{}", udp_port),
-                        Err(err) => info!("Failed to send_to udp/{}: {}", udp_port, err),
+                    let result =
+                        udp_socket.send_to(&[0], SocketAddr::from((peer_addr.ip(), *udp_port)));
+                    match result {
+                        Ok(_) => debug!("Successful send_to udp/{udp_port}"),
+                        Err(err) => info!("Failed to send_to udp/{udp_port}: {err}"),
                     }
                 }
             }
         }
         Err(err) => {
-            warn!("Failed to bind local udp socket: {}", err);
+            warn!("Failed to bind local udp socket: {err}");
         }
     }
 
     // Try to connect to each non-zero TCP port
     for tcp_port in &msg.tcp_ports {
         if *tcp_port != 0 {
-            debug!("Connecting to tcp/{}", tcp_port);
+            debug!("Connecting to tcp/{tcp_port}");
 
             let mut tcp_stream = timeout(
                 IO_TIMEOUT,
@@ -141,7 +148,7 @@ async fn process_connection(
     // conflict with the first four bytes of a valid HTTP response.
     let mut bytes = vec![0u8; IP_ECHO_SERVER_RESPONSE_LENGTH];
     bincode::serialize_into(&mut bytes[HEADER_LENGTH..], &response).unwrap();
-    trace!("response: {:?}", bytes);
+    trace!("response: {bytes:?}");
     writer.write_all(&bytes).await
 }
 
@@ -151,23 +158,25 @@ async fn run_echo_server(tcp_listener: std::net::TcpListener, shred_version: Opt
         TcpListener::from_std(tcp_listener).expect("Failed to convert std::TcpListener");
 
     loop {
-        match tcp_listener.accept().await {
+        let connection = tcp_listener.accept().await;
+        match connection {
             Ok((socket, peer_addr)) => {
                 runtime::Handle::current().spawn(async move {
                     if let Err(err) = process_connection(socket, peer_addr, shred_version).await {
-                        info!("session failed: {:?}", err);
+                        info!("session failed: {err:?}");
                     }
                 });
             }
-            Err(err) => warn!("listener accept failed: {:?}", err),
+            Err(err) => warn!("listener accept failed: {err:?}"),
         }
     }
 }
 
-/// Starts a simple TCP server on the given port that echos the IP address of any peer that
-/// connects.  Used by |get_public_ip_addr|
+/// Starts a simple TCP server that echos the IP address of any peer that connects
+/// Used by functions like |get_public_ip_addr| and |get_cluster_shred_version|
 pub fn ip_echo_server(
     tcp_listener: std::net::TcpListener,
+    num_server_threads: NonZeroUsize,
     // Cluster shred-version of the node running the server.
     shred_version: Option<u16>,
 ) -> IpEchoServer {
@@ -175,6 +184,7 @@ pub fn ip_echo_server(
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_name("solIpEchoSrvrRt")
+        .worker_threads(num_server_threads.get())
         .enable_all()
         .build()
         .expect("new tokio runtime");

@@ -1,6 +1,6 @@
 //! lockups generator
 use {
-    solana_sdk::{clock::Epoch, epoch_schedule::EpochSchedule, timing::years_as_slots},
+    solana_clock::Epoch, solana_epoch_schedule::EpochSchedule, solana_time_utils::years_as_slots,
     std::time::Duration,
 };
 
@@ -130,7 +130,6 @@ pub struct Unlock {
 
 impl Unlock {
     /// the number of lamports unlocked at this event
-    #[allow(clippy::float_cmp)]
     pub fn amount(&self, total: u64) -> u64 {
         if self.fraction == 1.0 {
             total - (self.prev_fraction * total as f64) as u64
@@ -145,7 +144,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(clippy::float_cmp)]
     fn test_make_lockups() {
         // this number just a random val
         let total_lamports: u64 = 1_725_987_234_408_923;

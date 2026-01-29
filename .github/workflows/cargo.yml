@@ -13,6 +13,9 @@ on:
       - "**.rs"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      - ".github/scripts/install-all-deps.sh"
+      - ".github/scripts/install-openssl.sh"
+      - ".github/scripts/install-proto.sh"
       - ".github/scripts/cargo-clippy-before-script.sh"
       - ".github/workflows/cargo.yml"
 
@@ -26,48 +29,48 @@ env:
   RUSTC_WRAPPER: "sccache"
 
 jobs:
-  clippy-stable:
-    strategy:
-      matrix:
-        os:
-          - macos-latest-large
-          - windows-latest
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: mozilla-actions/sccache-action@v0.0.3
-        with:
-          version: "v0.5.4"
-
-      - shell: bash
-        run: .github/scripts/cargo-clippy-before-script.sh ${{ runner.os }}
-
-      - shell: bash
-        run: |
-          source ci/rust-version.sh stable
-          rustup component add clippy --toolchain "$rust_stable"
-          scripts/cargo-clippy-stable.sh
-
   clippy-nightly:
+    if: github.repository == 'anza-xyz/agave'
     strategy:
       matrix:
         os:
-          - macos-latest-large
-          - windows-latest
-    runs-on: ${{ matrix.os }}
+          - os: macos-15
+          # musl with dynamic linking
+          - os: ubuntu-24.04
+            container: docker.io/rust:1-alpine3.22
+            rustflags: -C target-feature=-crt-static
+          - os: windows-2025
+    runs-on: ${{ matrix.os.os }}
+    container:
+      image: ${{ matrix.os.container }}
+    env:
+      RUSTFLAGS: ${{ matrix.os.rustflags }}
     steps:
-      - uses: actions/checkout@v4
+      # Alpine container needs:
+      # * `bash`, to run the scripts.
+      # * `git`, to run the `checkout` action.
+      - if: ${{ contains(matrix.os.container, 'alpine') }}
+        run: |
+          apk update
+          apk add bash git
 
-      - uses: mozilla-actions/sccache-action@v0.0.3
+      - uses: actions/checkout@v5
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
         with:
-          version: "v0.5.4"
+          version: "v0.10.0"
 
-      - shell: bash
-        run: .github/scripts/cargo-clippy-before-script.sh ${{ runner.os }}
+      # took the workaround from https://github.com/sfackler/rust-openssl/issues/2149
+      - name: Set Perl environment variables
+        if: runner.os == 'Windows'
+        run: |
+          echo "PERL=$((where.exe perl)[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          echo "OPENSSL_SRC_PERL=$((where.exe perl)[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - shell: bash
         run: |
+          git config --global --add safe.directory "$(pwd)"
+          source .github/scripts/install-all-deps.sh ${{ runner.os }}
           source ci/rust-version.sh nightly
           rustup component add clippy --toolchain "$rust_nightly"
           scripts/cargo-clippy-nightly.sh

@@ -62,7 +62,7 @@ prefix=testnet-dev-${USER//[^A-Za-z0-9]/}
 additionalValidatorCount=2
 clientNodeCount=0
 blockstreamer=false
-validatorBootDiskSizeInGb=500
+validatorBootDiskSizeInGb=100
 clientBootDiskSizeInGb=75
 validatorAdditionalDiskSizeInGb=
 externalNodes=false
@@ -799,13 +799,13 @@ $(
   cat \
     disable-background-upgrades.sh \
     create-solana-user.sh \
-    solana-user-authorized_keys.sh \
-    add-testnet-solana-user-authorized_keys.sh \
     install-ag.sh \
+    install-at.sh \
     install-certbot.sh \
     install-earlyoom.sh \
     install-iftop.sh \
-    install-libssl-compatability.sh \
+    install-jq.sh \
+    install-libssl.sh \
     install-rsync.sh \
     install-perf.sh \
     localtime.sh \

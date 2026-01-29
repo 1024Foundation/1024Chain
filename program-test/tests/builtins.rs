@@ -1,19 +1,19 @@
 use {
+    solana_keypair::Keypair,
+    solana_loader_v3_interface::state::UpgradeableLoaderState,
+    solana_message::{v0::Message, VersionedMessage},
     solana_program_test::ProgramTest,
-    solana_sdk::{
-        bpf_loader_upgradeable::{self, UpgradeableLoaderState},
-        message::{v0::Message, VersionedMessage},
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-        system_instruction,
-        transaction::{Transaction, VersionedTransaction},
-    },
+    solana_pubkey::Pubkey,
+    solana_sdk_ids::bpf_loader_upgradeable,
+    solana_signer::Signer,
+    solana_system_interface::instruction as system_instruction,
+    solana_transaction::{versioned::VersionedTransaction, Transaction},
 };
 
 #[tokio::test]
 async fn test_bpf_loader_upgradeable_present() {
     // Arrange
-    let (mut banks_client, payer, recent_blockhash) = ProgramTest::default().start().await;
+    let (banks_client, payer, recent_blockhash) = ProgramTest::default().start().await;
 
     let buffer_keypair = Keypair::new();
     let upgrade_authority_keypair = Keypair::new();
@@ -21,7 +21,7 @@ async fn test_bpf_loader_upgradeable_present() {
     let rent = banks_client.get_rent().await.unwrap();
     let buffer_rent = rent.minimum_balance(UpgradeableLoaderState::size_of_programdata(1));
 
-    let create_buffer_instructions = bpf_loader_upgradeable::create_buffer(
+    let create_buffer_instructions = solana_loader_v3_interface::instruction::create_buffer(
         &payer.pubkey(),
         &buffer_keypair.pubkey(),
         &upgrade_authority_keypair.pubkey(),
@@ -50,7 +50,7 @@ async fn test_bpf_loader_upgradeable_present() {
 #[tokio::test]
 async fn versioned_transaction() {
     let program_test = ProgramTest::default();
-    let mut context = program_test.start_with_context().await;
+    let context = program_test.start_with_context().await;
 
     let program_id = Pubkey::new_unique();
     let account = Keypair::new();

@@ -34,6 +34,9 @@ echo --- build environment
   cargo clippy --version --verbose
   $cargoNightly clippy --version --verbose
 
+  # miri is only available with nightly
+  $cargoNightly miri --version --verbose
+
   $cargoNightly hack --version --verbose
 
   # audit is done only with "$cargo stable"
@@ -44,6 +47,9 @@ echo --- build environment
   sccache --version
 
   wasm-pack --version
+
+  cargo nextest --version --verbose
+  $cargoNightly nextest --version --verbose
 )
 
 export RUST_BACKTRACE=1
@@ -54,7 +60,8 @@ export RUSTFLAGS="-D warnings -A incomplete_features"
 
 # Only force up-to-date lock files on edge
 if [[ $CI_BASE_BRANCH = "$EDGE_CHANNEL" ]]; then
-  if _ scripts/cargo-for-all-lock-files.sh "+${rust_nightly}" check --locked --workspace --all-targets --features dummy-for-ci-check; then
+  if _ scripts/cargo-for-all-lock-files.sh "+${rust_nightly}" check \
+    --locked --workspace --all-targets --features dummy-for-ci-check,frozen-abi; then
     true
   else
     check_status=$?

@@ -1,6 +1,6 @@
 use {
+    solana_pubkey::Pubkey,
     solana_runtime::bank_forks::BankForks,
-    solana_sdk::pubkey::Pubkey,
     solana_streamer::streamer::StakedNodes,
     std::{
         collections::HashMap,
@@ -32,7 +32,7 @@ impl StakedNodesUpdaterService {
                 while !exit.load(Ordering::Relaxed) {
                     let stakes = {
                         let root_bank = bank_forks.read().unwrap().root_bank();
-                        root_bank.staked_nodes()
+                        root_bank.current_epoch_staked_nodes()
                     };
                     let overrides = staked_nodes_overrides.read().unwrap().clone();
                     *staked_nodes.write().unwrap() = StakedNodes::new(stakes, overrides);

@@ -55,12 +55,12 @@ impl CargoRegistryService {
                 };
 
                 if result.is_ok() {
-                    info!("Published the crate successfully. {:?}", result);
+                    info!("Published the crate successfully. {result:?}");
                     response_builder::success_response()
                 } else {
                     response_builder::error_response(
                         hyper::StatusCode::BAD_REQUEST,
-                        format!("Failed to publish the crate. {:?}", result).as_str(),
+                        format!("Failed to publish the crate. {result:?}").as_str(),
                     )
                 }
             }
@@ -263,7 +263,7 @@ impl CargoRegistryService {
 
 #[tokio::main]
 async fn main() {
-    solana_logger::setup_with_default("solana=info");
+    agave_logger::setup_with_default_filter();
     let client = Arc::new(Client::new().expect("Failed to get RPC Client instance"));
 
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), client.port);
@@ -283,7 +283,7 @@ async fn main() {
     });
 
     let server = Server::bind(&bind_addr).serve(registry_service);
-    info!("Server running on http://{}", bind_addr);
+    info!("Server running on http://{bind_addr}");
 
     let _ = server.await;
 }

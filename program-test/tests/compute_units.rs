@@ -1,13 +1,11 @@
 use {
+    solana_instruction::{AccountMeta, Instruction},
+    solana_keypair::Keypair,
     solana_program_test::ProgramTest,
-    solana_sdk::{
-        instruction::{AccountMeta, Instruction},
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-        system_instruction,
-        sysvar::rent,
-        transaction::Transaction,
-    },
+    solana_signer::Signer,
+    solana_system_interface::instruction as system_instruction,
+    solana_sysvar::rent,
+    solana_transaction::Transaction,
 };
 
 #[should_panic]
@@ -21,12 +19,12 @@ fn overflow_compute_units() {
 async fn max_compute_units() {
     let mut program_test = ProgramTest::default();
     program_test.set_compute_max_units(i64::MAX as u64);
-    let mut context = program_test.start_with_context().await;
+    let context = program_test.start_with_context().await;
 
     // Invalid compute unit maximums are only triggered by BPF programs, so send
     // a valid instruction into a BPF program to make sure the issue doesn't
     // manifest.
-    let token_2022_id = Pubkey::try_from("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+    let token_2022_id = spl_generic_token::token_2022::id();
     let mint = Keypair::new();
     let rent = context.banks_client.get_rent().await.unwrap();
     let space = 82;

@@ -9,25 +9,33 @@ homepage = { workspace = true }
 license = { workspace = true }
 edition = { workspace = true }
 
-[dependencies]
-crossbeam-channel = { workspace = true }
-gethostname = { workspace = true }
-lazy_static = { workspace = true }
-log = { workspace = true }
-reqwest = { workspace = true, features = ["blocking", "brotli", "deflate", "gzip", "rustls-tls", "json"] }
-solana-sdk = { workspace = true }
-thiserror = { workspace = true }
-
-[dev-dependencies]
-env_logger = { workspace = true }
-rand = { workspace = true }
-serial_test = { workspace = true }
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lib]
 name = "solana_metrics"
 
+[features]
+agave-unstable-api = []
+
+[dependencies]
+crossbeam-channel = { workspace = true }
+gethostname = { workspace = true }
+log = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "brotli", "deflate", "gzip", "rustls-tls", "json"] }
+solana-cluster-type = { workspace = true }
+solana-sha256-hasher = { workspace = true }
+solana-time-utils = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+bencher = { workspace = true }
+env_logger = { workspace = true }
+rand = { workspace = true }
+serial_test = { workspace = true }
+solana-metrics = { path = ".", features = ["agave-unstable-api"] }
+solana-sha256-hasher = { workspace = true, features = ["sha2"] }
+
 [[bench]]
 name = "metrics"
-
-[package.metadata.docs.rs]
-targets = ["x86_64-unknown-linux-gnu"]
+harness = false

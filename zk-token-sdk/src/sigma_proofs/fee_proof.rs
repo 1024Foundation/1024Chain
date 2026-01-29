@@ -8,7 +8,7 @@
 //! The protocol guarantees computational soundness (by the hardness of discrete log) and perfect
 //! zero-knowledge in the random oracle model.
 //!
-//! [`ZK Token proof program`]: https://docs.solanalabs.com/runtime/zk-token-proof
+//! [`ZK Token proof program`]: https://docs.anza.xyz/runtime/zk-elgamal-proof
 
 #[cfg(not(target_os = "solana"))]
 use {
@@ -68,7 +68,7 @@ impl FeeSigmaProof {
     /// `fee_amount` must satisfy the relation `transfer_amount * (fee_rate_basis_point /
     /// 10_000) = fee_amount` or equivalently, `(transfer_amount * fee_rate_basis_point) - (10_000
     /// * fee_amount) = 0`. More generally, let `delta_fee = (transfer_amount *
-    /// fee_rate_basis_point) - (10_000 * fee_amount)`. Then assuming that a division rounding
+    ///   fee_rate_basis_point) - (10_000 * fee_amount)`. Then assuming that a division rounding
     /// could occur, the `delta_fee` must satisfy the bound `0 <= delta_fee < 10_000`.
     ///
     /// If `fee_amount >= max_fee`, then `fee_amount = max_fee` and therefore, the prover can
@@ -89,11 +89,11 @@ impl FeeSigmaProof {
     /// and `create_proof_fee_below_max` to enforce that the function executes in constant time.
     ///
     /// * `(fee_amount, fee_commitment, fee_opening)` - The amount, Pedersen commitment, and
-    /// opening of the transfer fee
+    ///   opening of the transfer fee
     /// * `(delta_fee, delta_commitment, delta_opening)` - The amount, Pedersen commitment, and
-    /// opening of the "real" delta amount
+    ///   opening of the "real" delta amount
     /// * `(claimed_commitment, claimed_opening)` - The Pedersen commitment and opening of the
-    /// "claimed" delta amount
+    ///   "claimed" delta amount
     /// * `max_fee` - The maximum fee bound
     /// * `transcript` - The transcript that does the bookkeeping for the Fiat-Shamir heuristic
     pub fn new(
@@ -174,13 +174,13 @@ impl FeeSigmaProof {
 
         let Y_delta = RistrettoPoint::multiscalar_mul(
             vec![z_x, z_delta, -c_equality],
-            vec![&(*G), &(*H), C_delta],
+            vec![&G, &(*H), C_delta],
         )
         .compress();
 
         let Y_claimed = RistrettoPoint::multiscalar_mul(
             vec![z_x, z_claimed, -c_equality],
-            vec![&(*G), &(*H), C_claimed],
+            vec![&G, &(*H), C_claimed],
         )
         .compress();
 
@@ -226,7 +226,7 @@ impl FeeSigmaProof {
     ///
     /// * `fee_commitment` - The Pedersen commitment of the transfer fee
     /// * `(delta_fee, delta_opening)` - The Pedersen commitment and opening of the "real" delta
-    /// value
+    ///   value
     /// * `claimed_opening` - The opening of the Pedersen commitment of the "claimed" delta value
     /// * `max_fee` - The maximum fee bound
     /// * `transcript` - The transcript that does the bookkeeping for the Fiat-Shamir heuristic
@@ -247,7 +247,7 @@ impl FeeSigmaProof {
         // solve for Y_max in the verification algebraic relation
         let Y_max_proof = RistrettoPoint::multiscalar_mul(
             vec![z_max_proof, -c_max_proof, c_max_proof * m],
-            vec![&(*H), C_fee, &(*G)],
+            vec![&(*H), C_fee, &G],
         )
         .compress();
 
@@ -268,9 +268,9 @@ impl FeeSigmaProof {
         let y_claimed = Scalar::random(&mut OsRng);
 
         let Y_delta =
-            RistrettoPoint::multiscalar_mul(vec![y_x, y_delta], vec![&(*G), &(*H)]).compress();
+            RistrettoPoint::multiscalar_mul(vec![y_x, y_delta], vec![&G, &(*H)]).compress();
         let Y_claimed =
-            RistrettoPoint::multiscalar_mul(vec![y_x, y_claimed], vec![&(*G), &(*H)]).compress();
+            RistrettoPoint::multiscalar_mul(vec![y_x, y_claimed], vec![&G, &(*H)]).compress();
 
         transcript.append_point(b"Y_max_proof", &Y_max_proof);
         transcript.append_point(b"Y_delta", &Y_delta);
@@ -358,7 +358,7 @@ impl FeeSigmaProof {
                 c_max_proof,
                 -c_max_proof * m,
                 -z_max,
-                Scalar::one(),
+                Scalar::ONE,
                 w * z_x,
                 w * z_delta_real,
                 -w * c_equality,
@@ -370,14 +370,14 @@ impl FeeSigmaProof {
             ],
             vec![
                 C_max,
-                &(*G),
+                &G,
                 &(*H),
                 &Y_max,
-                &(*G),
+                &G,
                 &(*H),
                 C_delta,
                 &Y_delta_real,
-                &(*G),
+                &G,
                 &(*H),
                 C_claimed,
                 &Y_claimed,

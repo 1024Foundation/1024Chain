@@ -1,50 +1,83 @@
 use {
     super::{Error, Result},
-    bincode::serialized_size,
     crossbeam_channel::Receiver,
+    solana_clock::Slot,
     solana_entry::entry::Entry,
+    solana_hash::Hash,
     solana_ledger::{
         blockstore::Blockstore,
-        shred::{self, ShredData},
+        shred::{self, get_data_shred_bytes_per_batch_typical, ProcessShredsStats},
     },
     solana_poh::poh_recorder::WorkingBankEntry,
     solana_runtime::bank::Bank,
-    solana_sdk::{clock::Slot, hash::Hash},
     std::{
         sync::Arc,
         time::{Duration, Instant},
     },
+    wincode::serialized_size,
 };
 
 const ENTRY_COALESCE_DURATION: Duration = Duration::from_millis(50);
 
 pub(super) struct ReceiveResults {
     pub entries: Vec<Entry>,
-    pub time_elapsed: Duration,
-    pub time_coalesced: Duration,
     pub bank: Arc<Bank>,
     pub last_tick_height: u64,
 }
 
-#[derive(Clone)]
-pub struct UnfinishedSlotInfo {
-    pub(super) chained_merkle_root: Hash,
-    pub next_shred_index: u32,
-    pub(crate) next_code_index: u32,
-    pub slot: Slot,
-    pub parent: Slot,
+const fn get_target_batch_bytes_default() -> u64 {
+    // Empirically discovered to be a good balance between avoiding padding and
+    // not delaying broadcast.
+    2 * get_data_shred_bytes_per_batch_typical()
 }
 
-pub(super) fn recv_slot_entries(receiver: &Receiver<WorkingBankEntry>) -> Result<ReceiveResults> {
-    let target_serialized_batch_byte_count: u64 =
-        32 * ShredData::capacity(/*merkle_proof_size*/ None).unwrap() as u64;
-    let timer = Duration::new(1, 0);
-    let recv_start = Instant::now();
-    let (mut bank, (entry, mut last_tick_height)) = receiver.recv_timeout(timer)?;
-    let mut entries = vec![entry];
-    assert!(last_tick_height <= bank.max_tick_height());
+const fn get_target_batch_pad_bytes() -> u64 {
+    // Less than 5% padding is acceptable overhead. Let's not push our luck.
+    get_data_shred_bytes_per_batch_typical() / 20
+}
 
-    // Drain channel
+fn keep_coalescing_entries(
+    last_tick_height: u64,
+    max_tick_height: u64,
+    serialized_batch_byte_count: u64,
+    max_batch_byte_count: u64,
+    process_stats: &mut ProcessShredsStats,
+) -> bool {
+    if last_tick_height >= max_tick_height {
+        // The slot has ended.
+        process_stats.coalesce_exited_slot_ended += 1;
+        return false;
+    } else if serialized_batch_byte_count >= max_batch_byte_count {
+        // Exceeded the max batch byte count.
+        process_stats.coalesce_exited_hit_max += 1;
+        return false;
+    }
+    let bytes_to_fill_erasure_batch = get_data_shred_bytes_per_batch_typical()
+        - (serialized_batch_byte_count % get_data_shred_bytes_per_batch_typical());
+    if bytes_to_fill_erasure_batch < get_target_batch_pad_bytes() {
+        // We're close enough to tightly packing erasure batches. Just send it.
+        process_stats.coalesce_exited_tightly_packed += 1;
+        return false;
+    }
+    true
+}
+
+pub(super) fn recv_slot_entries(
+    receiver: &Receiver<WorkingBankEntry>,
+    carryover_entry: &mut Option<WorkingBankEntry>,
+    process_stats: &mut ProcessShredsStats,
+) -> Result<ReceiveResults> {
+    let recv_start = Instant::now();
+
+    // If there is a carryover entry, use it. Else, see if there is a new entry.
+    let (mut bank, (entry, mut last_tick_height)) = match carryover_entry.take() {
+        Some((bank, (entry, tick_height))) => (bank, (entry, tick_height)),
+        None => receiver.recv_timeout(Duration::new(1, 0))?,
+    };
+    assert!(last_tick_height <= bank.max_tick_height());
+    let mut entries = vec![entry];
+
+    // Drain the channel of entries.
     while last_tick_height != bank.max_tick_height() {
         let Ok((try_bank, (entry, tick_height))) = receiver.try_recv() else {
             break;
@@ -63,14 +96,33 @@ pub(super) fn recv_slot_entries(receiver: &Receiver<WorkingBankEntry>) -> Result
 
     let mut serialized_batch_byte_count = serialized_size(&entries)?;
 
-    // Wait up to `ENTRY_COALESCE_DURATION` to try to coalesce entries into a 32 shred batch
+    // Determine the maximum batch size we will allow for coalescing. Normally
+    // this would just be the default target batch size, but if we happened to
+    // pull out a large number of entries from the channel, we might have
+    // already exceeded the default target, and we should try to build towards the
+    // next batch boundary to avoid excessive padding.
+    let next_full_batch_byte_count = serialized_batch_byte_count
+        .div_ceil(get_data_shred_bytes_per_batch_typical())
+        .saturating_mul(get_data_shred_bytes_per_batch_typical());
+    let max_batch_byte_count = next_full_batch_byte_count.max(get_target_batch_bytes_default());
+
+    // Coalesce entries until one of the following conditions are hit:
+    // 1. We ticked through the entire slot.
+    // 2. We hit the timeout.
+    // 3. We're over the max data target.
+    // 4. We're "close enough" to tightly packing erasure batches.
     let mut coalesce_start = Instant::now();
-    while last_tick_height != bank.max_tick_height()
-        && serialized_batch_byte_count < target_serialized_batch_byte_count
-    {
+    while keep_coalescing_entries(
+        last_tick_height,
+        bank.max_tick_height(),
+        serialized_batch_byte_count,
+        max_batch_byte_count,
+        process_stats,
+    ) {
         let Ok((try_bank, (entry, tick_height))) =
             receiver.recv_deadline(coalesce_start + ENTRY_COALESCE_DURATION)
         else {
+            process_stats.coalesce_exited_rcv_timeout += 1;
             break;
         };
         // If the bank changed, that implies the previous slot was interrupted and we do not have to
@@ -79,22 +131,29 @@ pub(super) fn recv_slot_entries(receiver: &Receiver<WorkingBankEntry>) -> Result
             warn!("Broadcast for slot: {} interrupted", bank.slot());
             entries.clear();
             serialized_batch_byte_count = 8; // Vec len
-            bank = try_bank;
+            bank = try_bank.clone();
             coalesce_start = Instant::now();
         }
         last_tick_height = tick_height;
+
         let entry_bytes = serialized_size(&entry)?;
+        if serialized_batch_byte_count + entry_bytes > max_batch_byte_count {
+            // This entry will push us over the batch byte limit. Save it for
+            // the next batch.
+            *carryover_entry = Some((try_bank, (entry, tick_height)));
+            process_stats.coalesce_exited_hit_max += 1;
+            break;
+        }
+
+        // Add the entry to the batch.
         serialized_batch_byte_count += entry_bytes;
         entries.push(entry);
         assert!(last_tick_height <= bank.max_tick_height());
     }
-    let time_coalesced = coalesce_start.elapsed();
-
-    let time_elapsed = recv_start.elapsed();
+    process_stats.receive_elapsed = recv_start.elapsed().as_micros() as u64;
+    process_stats.coalesce_elapsed = coalesce_start.elapsed().as_micros() as u64;
     Ok(ReceiveResults {
         entries,
-        time_elapsed,
-        time_coalesced,
         bank,
         last_tick_height,
     })
@@ -113,9 +172,9 @@ pub(super) fn get_chained_merkle_root_from_parent(
     debug_assert!(parent < slot, "parent: {parent} >= slot: {slot}");
     let index = blockstore
         .meta(parent)?
-        .ok_or_else(|| Error::UnknownSlotMeta(parent))?
+        .ok_or(Error::UnknownSlotMeta(parent))?
         .last_index
-        .ok_or_else(|| Error::UnknownLastIndex(parent))?;
+        .ok_or(Error::UnknownLastIndex(parent))?;
     let shred = blockstore
         .get_data_shred(parent, index)?
         .ok_or(Error::ShredNotFound {
@@ -133,11 +192,11 @@ mod tests {
     use {
         super::*,
         crossbeam_channel::unbounded,
+        solana_genesis_config::GenesisConfig,
         solana_ledger::genesis_utils::{create_genesis_config, GenesisConfigInfo},
-        solana_sdk::{
-            genesis_config::GenesisConfig, pubkey::Pubkey, system_transaction,
-            transaction::Transaction,
-        },
+        solana_pubkey::Pubkey,
+        solana_system_transaction as system_transaction,
+        solana_transaction::Transaction,
     };
 
     fn setup_test() -> (GenesisConfig, Arc<Bank>, Transaction) {
@@ -149,7 +208,7 @@ mod tests {
         let bank0 = Arc::new(Bank::new_for_tests(&genesis_config));
         let tx = system_transaction::transfer(
             &mint_keypair,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             1,
             genesis_config.hash(),
         );
@@ -177,7 +236,8 @@ mod tests {
 
         let mut res_entries = vec![];
         let mut last_tick_height = 0;
-        while let Ok(result) = recv_slot_entries(&r) {
+        while let Ok(result) = recv_slot_entries(&r, &mut None, &mut ProcessShredsStats::default())
+        {
             assert_eq!(result.bank.slot(), bank1.slot());
             last_tick_height = result.last_tick_height;
             res_entries.extend(result.entries);
@@ -212,14 +272,15 @@ mod tests {
                     None
                 }
             })
-            .last()
+            .next_back()
             .unwrap()
             .unwrap();
 
         let mut res_entries = vec![];
         let mut last_tick_height = 0;
         let mut bank_slot = 0;
-        while let Ok(result) = recv_slot_entries(&r) {
+        while let Ok(result) = recv_slot_entries(&r, &mut None, &mut ProcessShredsStats::default())
+        {
             bank_slot = result.bank.slot();
             last_tick_height = result.last_tick_height;
             res_entries = result.entries;

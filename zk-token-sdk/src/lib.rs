@@ -1,3 +1,22 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
+// Deprecate the crate
+#![cfg_attr(
+    feature = "agave-unstable-api",
+    deprecated(
+        since = "3.0.0",
+        note = "use the `solana-zk-sdk` instead: https://github.com/solana-program/zk-elgamal-proof/tree/main/zk-sdk"
+    )
+)]
+// Allow deprecated warnings to be suppressed in the crate
+#![allow(deprecated)]
 #![allow(clippy::arithmetic_side_effects, clippy::op_ref)]
 
 // The warning `clippy::op_ref` is disabled to allow efficient operator arithmetic of structs that
@@ -17,27 +36,27 @@
 //
 // `clippy::op_ref` is turned off to prevent clippy from warning that this is not idiomatic code.
 
+pub use solana_curve25519 as curve25519;
+
 #[cfg(not(target_os = "solana"))]
 #[macro_use]
 pub(crate) mod macros;
 #[cfg(not(target_os = "solana"))]
 pub mod encryption;
-#[cfg(not(target_os = "solana"))]
-pub mod errors;
-#[cfg(not(target_os = "solana"))]
 mod range_proof;
-#[cfg(not(target_os = "solana"))]
 mod sigma_proofs;
 #[cfg(not(target_os = "solana"))]
 mod transcript;
 
-// TODO: re-organize visibility
-pub mod curve25519;
+pub mod errors;
 pub mod instruction;
 pub mod zk_token_elgamal;
 pub mod zk_token_proof_instruction;
 pub mod zk_token_proof_program;
 pub mod zk_token_proof_state;
+
+#[cfg(not(target_os = "solana"))]
+pub use curve25519_dalek;
 
 /// Byte length of a compressed Ristretto point or scalar in Curve255519
 const UNIT_LEN: usize = 32;

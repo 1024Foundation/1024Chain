@@ -1,17 +1,16 @@
 //! Example Rust-based SBF noop program
 
-use solana_program::{
-    account_info::AccountInfo,
-    custom_heap_default,
-    entrypoint_deprecated::ProgramResult,
-    instruction::{AccountMeta, Instruction},
-    msg,
-    program::invoke,
-    pubkey::Pubkey,
+use {
+    solana_account_info::AccountInfo,
+    solana_instruction::{AccountMeta, Instruction},
+    solana_msg::msg,
+    solana_program::program::invoke,
+    solana_program_entrypoint::custom_heap_default,
+    solana_program_error::ProgramResult,
+    solana_pubkey::Pubkey,
 };
 
 solana_program::entrypoint_deprecated!(process_instruction);
-#[allow(clippy::unnecessary_wraps)]
 fn process_instruction(
     _program_id: &Pubkey,
     accounts: &[AccountInfo],

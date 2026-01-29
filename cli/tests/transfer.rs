@@ -1,5 +1,4 @@
 #![allow(clippy::arithmetic_side_effects)]
-#![allow(clippy::redundant_closure)]
 use {
     solana_cli::{
         check_balance,
@@ -8,30 +7,34 @@ use {
         test_utils::check_ready,
     },
     solana_cli_output::{parse_sign_only_reply_string, OutputFormat},
-    solana_faucet::faucet::run_local_faucet,
+    solana_commitment_config::CommitmentConfig,
+    solana_compute_budget_interface::ComputeBudgetInstruction,
+    solana_faucet::faucet::run_local_faucet_with_unique_port_for_tests,
+    solana_fee_structure::FeeStructure,
+    solana_keypair::{keypair_from_seed, Keypair},
+    solana_message::Message,
+    solana_native_token::LAMPORTS_PER_SOL,
+    solana_nonce::state::State as NonceState,
+    solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_nonce_utils::blockhash_query::{self, BlockhashQuery},
-    solana_sdk::{
-        commitment_config::CommitmentConfig,
-        fee::FeeStructure,
-        native_token::sol_to_lamports,
-        nonce::State as NonceState,
-        pubkey::Pubkey,
-        signature::{keypair_from_seed, Keypair, NullSigner, Signer},
-        stake,
-    },
+    solana_signer::{null_signer::NullSigner, Signer},
+    solana_stake_interface as stake,
     solana_streamer::socket::SocketAddrSpace,
+    solana_system_interface::instruction as system_instruction,
     solana_test_validator::TestValidator,
+    test_case::test_case,
 };
 
-#[test]
-fn test_transfer() {
-    solana_logger::setup();
+#[test_case(true; "Skip Preflight")]
+#[test_case(false; "Don`t skip Preflight")]
+fn test_transfer(skip_preflight: bool) {
+    agave_logger::setup();
     let fee_one_sig = FeeStructure::default().get_max_fee(1, 0);
     let fee_two_sig = FeeStructure::default().get_max_fee(2, 0);
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator = TestValidator::with_custom_fees(
         mint_pubkey,
         fee_one_sig,
@@ -48,20 +51,21 @@ fn test_transfer() {
     let mut config = CliConfig::recent_for_tests();
     config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&default_signer];
+    config.send_transaction_config.skip_preflight = skip_preflight;
 
     let sender_pubkey = config.signers[0].pubkey();
     let recipient_pubkey = Pubkey::from([1u8; 32]);
 
-    request_and_confirm_airdrop(&rpc_client, &config, &sender_pubkey, sol_to_lamports(5.0))
+    request_and_confirm_airdrop(&rpc_client, &config, &sender_pubkey, 5 * LAMPORTS_PER_SOL)
         .unwrap();
-    check_balance!(sol_to_lamports(5.0), &rpc_client, &sender_pubkey);
+    check_balance!(5 * LAMPORTS_PER_SOL, &rpc_client, &sender_pubkey);
     check_balance!(0, &rpc_client, &recipient_pubkey);
 
     check_ready(&rpc_client);
 
     // Plain ole transfer
     config.command = CliCommand::Transfer {
-        amount: SpendAmount::Some(sol_to_lamports(1.0)),
+        amount: SpendAmount::Some(LAMPORTS_PER_SOL),
         to: recipient_pubkey,
         from: 0,
         sign_only: false,
@@ -79,15 +83,15 @@ fn test_transfer() {
     };
     process_command(&config).unwrap();
     check_balance!(
-        sol_to_lamports(4.0) - fee_one_sig,
+        4 * LAMPORTS_PER_SOL - fee_one_sig,
         &rpc_client,
         &sender_pubkey
     );
-    check_balance!(sol_to_lamports(1.0), &rpc_client, &recipient_pubkey);
+    check_balance!(LAMPORTS_PER_SOL, &rpc_client, &recipient_pubkey);
 
     // Plain ole transfer, failure due to InsufficientFundsForSpendAndFee
     config.command = CliCommand::Transfer {
-        amount: SpendAmount::Some(sol_to_lamports(4.0)),
+        amount: SpendAmount::Some(4 * LAMPORTS_PER_SOL),
         to: recipient_pubkey,
         from: 0,
         sign_only: false,
@@ -105,11 +109,11 @@ fn test_transfer() {
     };
     assert!(process_command(&config).is_err());
     check_balance!(
-        sol_to_lamports(4.0) - fee_one_sig,
+        4 * LAMPORTS_PER_SOL - fee_one_sig,
         &rpc_client,
         &sender_pubkey
     );
-    check_balance!(sol_to_lamports(1.0), &rpc_client, &recipient_pubkey);
+    check_balance!(LAMPORTS_PER_SOL, &rpc_client, &recipient_pubkey);
 
     let mut offline = CliConfig::recent_for_tests();
     offline.json_rpc_url = String::default();
@@ -119,14 +123,13 @@ fn test_transfer() {
     process_command(&offline).unwrap_err();
 
     let offline_pubkey = offline.signers[0].pubkey();
-    request_and_confirm_airdrop(&rpc_client, &offline, &offline_pubkey, sol_to_lamports(1.0))
-        .unwrap();
-    check_balance!(sol_to_lamports(1.0), &rpc_client, &offline_pubkey);
+    request_and_confirm_airdrop(&rpc_client, &offline, &offline_pubkey, LAMPORTS_PER_SOL).unwrap();
+    check_balance!(LAMPORTS_PER_SOL, &rpc_client, &offline_pubkey);
 
     // Offline transfer
     let blockhash = rpc_client.get_latest_blockhash().unwrap();
     offline.command = CliCommand::Transfer {
-        amount: SpendAmount::Some(sol_to_lamports(0.5)),
+        amount: SpendAmount::Some(LAMPORTS_PER_SOL / 2),
         to: recipient_pubkey,
         from: 0,
         sign_only: true,
@@ -149,7 +152,7 @@ fn test_transfer() {
     let offline_presigner = sign_only.presigner_of(&offline_pubkey).unwrap();
     config.signers = vec![&offline_presigner];
     config.command = CliCommand::Transfer {
-        amount: SpendAmount::Some(sol_to_lamports(0.5)),
+        amount: SpendAmount::Some(LAMPORTS_PER_SOL / 2),
         to: recipient_pubkey,
         from: 0,
         sign_only: false,
@@ -167,11 +170,11 @@ fn test_transfer() {
     };
     process_command(&config).unwrap();
     check_balance!(
-        sol_to_lamports(0.5) - fee_one_sig,
+        LAMPORTS_PER_SOL / 2 - fee_one_sig,
         &rpc_client,
         &offline_pubkey
     );
-    check_balance!(sol_to_lamports(1.5), &rpc_client, &recipient_pubkey);
+    check_balance!(1_500_000_000, &rpc_client, &recipient_pubkey);
 
     // Create nonce account
     let nonce_account = keypair_from_seed(&[3u8; 32]).unwrap();
@@ -189,7 +192,7 @@ fn test_transfer() {
     };
     process_command(&config).unwrap();
     check_balance!(
-        sol_to_lamports(4.0) - fee_one_sig - fee_two_sig - minimum_nonce_balance,
+        4 * LAMPORTS_PER_SOL - fee_one_sig - fee_two_sig - minimum_nonce_balance,
         &rpc_client,
         &sender_pubkey,
     );
@@ -207,7 +210,7 @@ fn test_transfer() {
     // Nonced transfer
     config.signers = vec![&default_signer];
     config.command = CliCommand::Transfer {
-        amount: SpendAmount::Some(sol_to_lamports(1.0)),
+        amount: SpendAmount::Some(LAMPORTS_PER_SOL),
         to: recipient_pubkey,
         from: 0,
         sign_only: false,
@@ -228,11 +231,11 @@ fn test_transfer() {
     };
     process_command(&config).unwrap();
     check_balance!(
-        sol_to_lamports(3.0) - 2 * fee_one_sig - fee_two_sig - minimum_nonce_balance,
+        3 * LAMPORTS_PER_SOL - 2 * fee_one_sig - fee_two_sig - minimum_nonce_balance,
         &rpc_client,
         &sender_pubkey,
     );
-    check_balance!(sol_to_lamports(2.5), &rpc_client, &recipient_pubkey);
+    check_balance!(2_500_000_000, &rpc_client, &recipient_pubkey);
     let new_nonce_hash = solana_rpc_client_nonce_utils::get_account_with_commitment(
         &rpc_client,
         &nonce_account.pubkey(),
@@ -254,7 +257,7 @@ fn test_transfer() {
     };
     process_command(&config).unwrap();
     check_balance!(
-        sol_to_lamports(3.0) - 3 * fee_one_sig - fee_two_sig - minimum_nonce_balance,
+        3 * LAMPORTS_PER_SOL - 3 * fee_one_sig - fee_two_sig - minimum_nonce_balance,
         &rpc_client,
         &sender_pubkey,
     );
@@ -272,7 +275,7 @@ fn test_transfer() {
     // Offline, nonced transfer
     offline.signers = vec![&default_offline_signer];
     offline.command = CliCommand::Transfer {
-        amount: SpendAmount::Some(sol_to_lamports(0.4)),
+        amount: SpendAmount::Some(400_000_000),
         to: recipient_pubkey,
         from: 0,
         sign_only: true,
@@ -294,7 +297,7 @@ fn test_transfer() {
     let offline_presigner = sign_only.presigner_of(&offline_pubkey).unwrap();
     config.signers = vec![&offline_presigner];
     config.command = CliCommand::Transfer {
-        amount: SpendAmount::Some(sol_to_lamports(0.4)),
+        amount: SpendAmount::Some(400_000_000),
         to: recipient_pubkey,
         from: 0,
         sign_only: false,
@@ -315,21 +318,21 @@ fn test_transfer() {
     };
     process_command(&config).unwrap();
     check_balance!(
-        sol_to_lamports(0.1) - 2 * fee_one_sig,
+        LAMPORTS_PER_SOL / 10 - 2 * fee_one_sig,
         &rpc_client,
         &offline_pubkey
     );
-    check_balance!(sol_to_lamports(2.9), &rpc_client, &recipient_pubkey);
+    check_balance!(2_900_000_000, &rpc_client, &recipient_pubkey);
 }
 
 #[test]
 fn test_transfer_multisession_signing() {
-    solana_logger::setup();
+    agave_logger::setup();
     let fee_one_sig = FeeStructure::default().get_max_fee(1, 0);
     let fee_two_sig = FeeStructure::default().get_max_fee(2, 0);
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator = TestValidator::with_custom_fees(
         mint_pubkey,
         fee_one_sig,
@@ -349,23 +352,23 @@ fn test_transfer_multisession_signing() {
         &rpc_client,
         &CliConfig::recent_for_tests(),
         &offline_from_signer.pubkey(),
-        sol_to_lamports(43.0),
+        43 * LAMPORTS_PER_SOL,
     )
     .unwrap();
     request_and_confirm_airdrop(
         &rpc_client,
         &CliConfig::recent_for_tests(),
         &offline_fee_payer_signer.pubkey(),
-        sol_to_lamports(1.0) + 2 * fee_two_sig,
+        LAMPORTS_PER_SOL + 2 * fee_two_sig,
     )
     .unwrap();
     check_balance!(
-        sol_to_lamports(43.0),
+        43 * LAMPORTS_PER_SOL,
         &rpc_client,
         &offline_from_signer.pubkey(),
     );
     check_balance!(
-        sol_to_lamports(1.0) + 2 * fee_two_sig,
+        LAMPORTS_PER_SOL + 2 * fee_two_sig,
         &rpc_client,
         &offline_fee_payer_signer.pubkey(),
     );
@@ -383,7 +386,7 @@ fn test_transfer_multisession_signing() {
     fee_payer_config.command = CliCommand::ClusterVersion;
     process_command(&fee_payer_config).unwrap_err();
     fee_payer_config.command = CliCommand::Transfer {
-        amount: SpendAmount::Some(sol_to_lamports(42.0)),
+        amount: SpendAmount::Some(42 * LAMPORTS_PER_SOL),
         to: to_pubkey,
         from: 1,
         sign_only: true,
@@ -415,7 +418,7 @@ fn test_transfer_multisession_signing() {
     from_config.command = CliCommand::ClusterVersion;
     process_command(&from_config).unwrap_err();
     from_config.command = CliCommand::Transfer {
-        amount: SpendAmount::Some(sol_to_lamports(42.0)),
+        amount: SpendAmount::Some(42 * LAMPORTS_PER_SOL),
         to: to_pubkey,
         from: 1,
         sign_only: true,
@@ -444,7 +447,7 @@ fn test_transfer_multisession_signing() {
     config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&fee_payer_presigner, &from_presigner];
     config.command = CliCommand::Transfer {
-        amount: SpendAmount::Some(sol_to_lamports(42.0)),
+        amount: SpendAmount::Some(42 * LAMPORTS_PER_SOL),
         to: to_pubkey,
         from: 1,
         sign_only: false,
@@ -462,29 +465,26 @@ fn test_transfer_multisession_signing() {
     };
     process_command(&config).unwrap();
 
+    check_balance!(LAMPORTS_PER_SOL, &rpc_client, &offline_from_signer.pubkey(),);
     check_balance!(
-        sol_to_lamports(1.0),
-        &rpc_client,
-        &offline_from_signer.pubkey(),
-    );
-    check_balance!(
-        sol_to_lamports(1.0) + fee_two_sig,
+        LAMPORTS_PER_SOL + fee_two_sig,
         &rpc_client,
         &offline_fee_payer_signer.pubkey(),
     );
-    check_balance!(sol_to_lamports(42.0), &rpc_client, &to_pubkey);
+    check_balance!(42 * LAMPORTS_PER_SOL, &rpc_client, &to_pubkey);
 }
 
-#[test]
-fn test_transfer_all() {
-    solana_logger::setup();
-    let fee = FeeStructure::default().get_max_fee(1, 0);
+#[test_case(None; "default")]
+#[test_case(Some(100_000); "with_compute_unit_price")]
+fn test_transfer_all(compute_unit_price: Option<u64>) {
+    agave_logger::setup();
+    let lamports_per_signature = FeeStructure::default().get_max_fee(1, 0);
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator = TestValidator::with_custom_fees(
         mint_pubkey,
-        fee,
+        lamports_per_signature,
         Some(faucet_addr),
         SocketAddrSpace::Unspecified,
     );
@@ -493,13 +493,36 @@ fn test_transfer_all() {
         RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
 
     let default_signer = Keypair::new();
+    let recipient_pubkey = Pubkey::from([1u8; 32]);
+
+    let fee = {
+        let mut instructions = vec![system_instruction::transfer(
+            &default_signer.pubkey(),
+            &recipient_pubkey,
+            0,
+        )];
+        if let Some(compute_unit_price) = compute_unit_price {
+            // This is brittle and will need to be updated if the compute unit
+            // limit for the system program or compute budget program are changed,
+            // or if they're converted to BPF.
+            // See `solana_system_program::system_processor::DEFAULT_COMPUTE_UNITS`
+            // and `solana_compute_budget_program::DEFAULT_COMPUTE_UNITS`
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(450));
+            instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
+                compute_unit_price,
+            ));
+        }
+        let blockhash = rpc_client.get_latest_blockhash().unwrap();
+        let sample_message =
+            Message::new_with_blockhash(&instructions, Some(&default_signer.pubkey()), &blockhash);
+        rpc_client.get_fee_for_message(&sample_message).unwrap()
+    };
 
     let mut config = CliConfig::recent_for_tests();
     config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&default_signer];
 
     let sender_pubkey = config.signers[0].pubkey();
-    let recipient_pubkey = Pubkey::from([1u8; 32]);
 
     request_and_confirm_airdrop(&rpc_client, &config, &sender_pubkey, 500_000).unwrap();
     check_balance!(500_000, &rpc_client, &sender_pubkey);
@@ -523,7 +546,7 @@ fn test_transfer_all() {
         fee_payer: 0,
         derived_address_seed: None,
         derived_address_program_id: None,
-        compute_unit_price: None,
+        compute_unit_price,
     };
     process_command(&config).unwrap();
     check_balance!(0, &rpc_client, &sender_pubkey);
@@ -532,10 +555,10 @@ fn test_transfer_all() {
 
 #[test]
 fn test_transfer_unfunded_recipient() {
-    solana_logger::setup();
+    agave_logger::setup();
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator = TestValidator::with_custom_fees(
         mint_pubkey,
         1,
@@ -551,6 +574,7 @@ fn test_transfer_unfunded_recipient() {
     let mut config = CliConfig::recent_for_tests();
     config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&default_signer];
+    config.send_transaction_config.skip_preflight = false;
 
     let sender_pubkey = config.signers[0].pubkey();
     let recipient_pubkey = Pubkey::from([1u8; 32]);
@@ -586,11 +610,11 @@ fn test_transfer_unfunded_recipient() {
 
 #[test]
 fn test_transfer_with_seed() {
-    solana_logger::setup();
+    agave_logger::setup();
     let fee = FeeStructure::default().get_max_fee(1, 0);
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator = TestValidator::with_custom_fees(
         mint_pubkey,
         fee,
@@ -618,19 +642,18 @@ fn test_transfer_with_seed() {
     )
     .unwrap();
 
-    request_and_confirm_airdrop(&rpc_client, &config, &sender_pubkey, sol_to_lamports(1.0))
+    request_and_confirm_airdrop(&rpc_client, &config, &sender_pubkey, LAMPORTS_PER_SOL).unwrap();
+    request_and_confirm_airdrop(&rpc_client, &config, &derived_address, 5 * LAMPORTS_PER_SOL)
         .unwrap();
-    request_and_confirm_airdrop(&rpc_client, &config, &derived_address, sol_to_lamports(5.0))
-        .unwrap();
-    check_balance!(sol_to_lamports(1.0), &rpc_client, &sender_pubkey);
-    check_balance!(sol_to_lamports(5.0), &rpc_client, &derived_address);
+    check_balance!(LAMPORTS_PER_SOL, &rpc_client, &sender_pubkey);
+    check_balance!(5 * LAMPORTS_PER_SOL, &rpc_client, &derived_address);
     check_balance!(0, &rpc_client, &recipient_pubkey);
 
     check_ready(&rpc_client);
 
     // Transfer with seed
     config.command = CliCommand::Transfer {
-        amount: SpendAmount::Some(sol_to_lamports(5.0)),
+        amount: SpendAmount::Some(5 * LAMPORTS_PER_SOL),
         to: recipient_pubkey,
         from: 0,
         sign_only: false,
@@ -647,7 +670,7 @@ fn test_transfer_with_seed() {
         compute_unit_price: None,
     };
     process_command(&config).unwrap();
-    check_balance!(sol_to_lamports(1.0) - fee, &rpc_client, &sender_pubkey);
-    check_balance!(sol_to_lamports(5.0), &rpc_client, &recipient_pubkey);
+    check_balance!(LAMPORTS_PER_SOL - fee, &rpc_client, &sender_pubkey);
+    check_balance!(5 * LAMPORTS_PER_SOL, &rpc_client, &recipient_pubkey);
     check_balance!(0, &rpc_client, &derived_address);
 }

@@ -4,15 +4,13 @@ use {
         ConnectionCache as BackendConnectionCache, ConnectionManager, ConnectionPool,
         NewConnectionConfig,
     },
+    solana_message::Message,
     solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool},
     solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{
-        message::Message,
-        signers::Signers,
-        transaction::{Transaction, TransactionError},
-        transport::Result as TransportResult,
-    },
+    solana_signer::signers::Signers,
     solana_tpu_client::tpu_client::{Result, TpuClient as BackendTpuClient},
+    solana_transaction::Transaction,
+    solana_transaction_error::{TransactionError, TransportResult},
     solana_udp_client::{UdpConfig, UdpConnectionManager, UdpPool},
     std::sync::Arc,
 };
@@ -21,11 +19,9 @@ pub use {
     solana_tpu_client::tpu_client::{TpuClientConfig, DEFAULT_FANOUT_SLOTS, MAX_FANOUT_SLOTS},
 };
 
-pub type QuicTpuClient = TpuClient<QuicPool, QuicConnectionManager, QuicConfig>;
-
 pub enum TpuClientWrapper {
-    Quic(TpuClient<QuicPool, QuicConnectionManager, QuicConfig>),
-    Udp(TpuClient<UdpPool, UdpConnectionManager, UdpConfig>),
+    Quic(BackendTpuClient<QuicPool, QuicConnectionManager, QuicConfig>),
+    Udp(BackendTpuClient<UdpPool, UdpConnectionManager, UdpConfig>),
 }
 
 /// Client which sends transactions directly to the current leader's TPU port over UDP.

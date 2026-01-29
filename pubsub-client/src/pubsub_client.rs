@@ -32,7 +32,7 @@
 //! By default the [`block_subscribe`] and [`vote_subscribe`] events are
 //! disabled on RPC nodes. They can be enabled by passing
 //! `--rpc-pubsub-enable-block-subscription` and
-//! `--rpc-pubsub-enable-vote-subscription` to `solana-validator`. When these
+//! `--rpc-pubsub-enable-vote-subscription` to `agave-validator`. When these
 //! methods are disabled, the RPC server will return a "Method not found" error
 //! message.
 //!
@@ -46,10 +46,10 @@
 //!
 //! ```
 //! use anyhow::Result;
-//! use solana_sdk::commitment_config::CommitmentConfig;
+//! use solana_commitment_config::CommitmentConfig;
+//! use solana_pubkey::Pubkey;
 //! use solana_pubsub_client::pubsub_client::PubsubClient;
-//! use solana_rpc_client_api::config::RpcAccountInfoConfig;
-//! use solana_sdk::pubkey::Pubkey;
+//! use solana_rpc_client_types::config::RpcAccountInfoConfig;
 //! use std::thread;
 //!
 //! fn get_account_updates(account_pubkey: Pubkey) -> Result<()> {
@@ -82,7 +82,7 @@
 //!     Ok(())
 //! }
 //! #
-//! # get_account_updates(solana_sdk::pubkey::new_rand());
+//! # get_account_updates(solana_pubkey::new_rand());
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
@@ -96,20 +96,21 @@ use {
         value::Value::{Number, Object},
         Map, Value,
     },
-    solana_account_decoder::UiAccount,
-    solana_rpc_client_api::{
+    solana_account_decoder_client_types::UiAccount,
+    solana_clock::Slot,
+    solana_pubkey::Pubkey,
+    solana_rpc_client_types::{
         config::{
             RpcAccountInfoConfig, RpcBlockSubscribeConfig, RpcBlockSubscribeFilter,
             RpcProgramAccountsConfig, RpcSignatureSubscribeConfig, RpcTransactionLogsConfig,
             RpcTransactionLogsFilter,
         },
-        filter,
         response::{
             Response as RpcResponse, RpcBlockUpdate, RpcKeyedAccount, RpcLogsResponse,
             RpcSignatureResult, RpcVote, SlotInfo, SlotUpdate,
         },
     },
-    solana_sdk::{clock::Slot, pubkey::Pubkey, signature::Signature},
+    solana_signature::Signature,
     std::{
         marker::PhantomData,
         net::TcpStream,
@@ -120,8 +121,13 @@ use {
         thread::{sleep, JoinHandle},
         time::Duration,
     },
-    tungstenite::{connect, stream::MaybeTlsStream, Message, WebSocket},
-    url::Url,
+    tungstenite::{
+        client::IntoClientRequest,
+        connect,
+        http::{header, StatusCode},
+        stream::MaybeTlsStream,
+        Message, WebSocket,
+    },
 };
 
 /// A subscription.
@@ -164,13 +170,17 @@ where
         writable_socket: &Arc<RwLock<WebSocket<MaybeTlsStream<TcpStream>>>>,
         body: String,
     ) -> Result<u64, PubsubClientError> {
-        writable_socket.write().unwrap().send(Message::Text(body))?;
-        let message = writable_socket.write().unwrap().read()?;
+        writable_socket
+            .write()
+            .unwrap()
+            .send(Message::Text(body.into()))
+            .map_err(Box::new)?;
+        let message = writable_socket.write().unwrap().read().map_err(Box::new)?;
         Self::extract_subscription_id(message)
     }
 
     fn extract_subscription_id(message: Message) -> Result<u64, PubsubClientError> {
-        let message_text = &message.into_text()?;
+        let message_text = &message.into_text().map_err(Box::new)?;
 
         if let Ok(json_msg) = serde_json::from_str::<Map<String, Value>>(message_text) {
             if let Some(Number(x)) = json_msg.get("result") {
@@ -202,48 +212,21 @@ where
                 json!({
                 "jsonrpc":"2.0","id":1,"method":method,"params":[self.subscription_id]
                 })
-                .to_string(),
+                .to_string()
+                .into(),
             ))
+            .map_err(Box::new)
             .map_err(|err| err.into())
-    }
-
-    fn get_version(
-        writable_socket: &Arc<RwLock<WebSocket<MaybeTlsStream<TcpStream>>>>,
-    ) -> Result<semver::Version, PubsubClientError> {
-        writable_socket.write().unwrap().send(Message::Text(
-            json!({
-                "jsonrpc":"2.0","id":1,"method":"getVersion",
-            })
-            .to_string(),
-        ))?;
-        let message = writable_socket.write().unwrap().read()?;
-        let message_text = &message.into_text()?;
-
-        if let Ok(json_msg) = serde_json::from_str::<Map<String, Value>>(message_text) {
-            if let Some(Object(version_map)) = json_msg.get("result") {
-                if let Some(node_version) = version_map.get("solana-core") {
-                    if let Some(node_version) = node_version.as_str() {
-                        if let Ok(parsed) = semver::Version::parse(node_version) {
-                            return Ok(parsed);
-                        }
-                    }
-                }
-            }
-        }
-
-        Err(PubsubClientError::UnexpectedGetVersionResponse(format!(
-            "msg={message_text}"
-        )))
     }
 
     fn read_message(
         writable_socket: &Arc<RwLock<WebSocket<MaybeTlsStream<TcpStream>>>>,
     ) -> Result<Option<T>, PubsubClientError> {
-        let message = writable_socket.write().unwrap().read()?;
+        let message = writable_socket.write().unwrap().read().map_err(Box::new)?;
         if message.is_ping() {
             return Ok(None);
         }
-        let message_text = &message.into_text()?;
+        let message_text = &message.into_text().map_err(Box::new)?;
         if let Ok(json_msg) = serde_json::from_str::<Map<String, Value>>(message_text) {
             if let Some(Object(params)) = json_msg.get("params") {
                 if let Some(result) = params.get("result") {
@@ -326,17 +309,17 @@ pub type RootSubscription = (PubsubRootClientSubscription, Receiver<Slot>);
 /// See the [module documentation][self].
 pub struct PubsubClient {}
 
-fn connect_with_retry(
-    url: Url,
-) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, tungstenite::Error> {
+fn connect_with_retry<R: IntoClientRequest>(
+    request: R,
+) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, Box<tungstenite::Error>> {
     let mut connection_retries = 5;
+    let client_request = request.into_client_request().map_err(Box::new)?;
     loop {
-        let result = connect(url.clone()).map(|(socket, _)| socket);
+        let result = connect(client_request.clone()).map(|(socket, _)| socket);
         if let Err(tungstenite::Error::Http(response)) = &result {
-            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && connection_retries > 0
-            {
+            if response.status() == StatusCode::TOO_MANY_REQUESTS && connection_retries > 0 {
                 let mut duration = Duration::from_millis(500);
-                if let Some(retry_after) = response.headers().get(reqwest::header::RETRY_AFTER) {
+                if let Some(retry_after) = response.headers().get(header::RETRY_AFTER) {
                     if let Ok(retry_after) = retry_after.to_str() {
                         if let Ok(retry_after) = retry_after.parse::<u64>() {
                             if retry_after < 120 {
@@ -348,15 +331,15 @@ fn connect_with_retry(
 
                 connection_retries -= 1;
                 debug!(
-                    "Too many requests: server responded with {:?}, {} retries left, pausing for {:?}",
-                    response, connection_retries, duration
+                    "Too many requests: server responded with {response:?}, {connection_retries} \
+                     retries left, pausing for {duration:?}"
                 );
 
                 sleep(duration);
                 continue;
             }
         }
-        return result;
+        return result.map_err(Box::new);
     }
 }
 
@@ -370,13 +353,13 @@ impl PubsubClient {
     /// This method corresponds directly to the [`accountSubscribe`] RPC method.
     ///
     /// [`accountSubscribe`]: https://solana.com/docs/rpc/websocket/accountsubscribe
-    pub fn account_subscribe(
-        url: &str,
+    pub fn account_subscribe<R: IntoClientRequest>(
+        request: R,
         pubkey: &Pubkey,
         config: Option<RpcAccountInfoConfig>,
     ) -> Result<AccountSubscription, PubsubClientError> {
-        let url = Url::parse(url)?;
-        let socket = connect_with_retry(url)?;
+        let client_request = request.into_client_request().map_err(Box::new)?;
+        let socket = connect_with_retry(client_request)?;
         let (sender, receiver) = unbounded();
 
         let socket = Arc::new(RwLock::new(socket));
@@ -416,20 +399,20 @@ impl PubsubClient {
     /// Receives messages of type [`RpcBlockUpdate`] when a block is confirmed or finalized.
     ///
     /// This method is disabled by default. It can be enabled by passing
-    /// `--rpc-pubsub-enable-block-subscription` to `solana-validator`.
+    /// `--rpc-pubsub-enable-block-subscription` to `agave-validator`.
     ///
     /// # RPC Reference
     ///
     /// This method corresponds directly to the [`blockSubscribe`] RPC method.
     ///
     /// [`blockSubscribe`]: https://solana.com/docs/rpc/websocket/blocksubscribe
-    pub fn block_subscribe(
-        url: &str,
+    pub fn block_subscribe<R: IntoClientRequest>(
+        request: R,
         filter: RpcBlockSubscribeFilter,
         config: Option<RpcBlockSubscribeConfig>,
     ) -> Result<BlockSubscription, PubsubClientError> {
-        let url = Url::parse(url)?;
-        let socket = connect_with_retry(url)?;
+        let client_request = request.into_client_request().map_err(Box::new)?;
+        let socket = connect_with_retry(client_request)?;
         let (sender, receiver) = unbounded();
 
         let socket = Arc::new(RwLock::new(socket));
@@ -471,13 +454,13 @@ impl PubsubClient {
     /// This method corresponds directly to the [`logsSubscribe`] RPC method.
     ///
     /// [`logsSubscribe`]: https://solana.com/docs/rpc/websocket/logssubscribe
-    pub fn logs_subscribe(
-        url: &str,
+    pub fn logs_subscribe<R: IntoClientRequest>(
+        request: R,
         filter: RpcTransactionLogsFilter,
         config: RpcTransactionLogsConfig,
     ) -> Result<LogsSubscription, PubsubClientError> {
-        let url = Url::parse(url)?;
-        let socket = connect_with_retry(url)?;
+        let client_request = request.into_client_request().map_err(Box::new)?;
+        let socket = connect_with_retry(client_request)?;
         let (sender, receiver) = unbounded();
 
         let socket = Arc::new(RwLock::new(socket));
@@ -520,29 +503,19 @@ impl PubsubClient {
     /// This method corresponds directly to the [`programSubscribe`] RPC method.
     ///
     /// [`programSubscribe`]: https://solana.com/docs/rpc/websocket/programsubscribe
-    pub fn program_subscribe(
-        url: &str,
+    pub fn program_subscribe<R: IntoClientRequest>(
+        request: R,
         pubkey: &Pubkey,
-        mut config: Option<RpcProgramAccountsConfig>,
+        config: Option<RpcProgramAccountsConfig>,
     ) -> Result<ProgramSubscription, PubsubClientError> {
-        let url = Url::parse(url)?;
-        let socket = connect_with_retry(url)?;
+        let client_request = request.into_client_request().map_err(Box::new)?;
+        let socket = connect_with_retry(client_request)?;
         let (sender, receiver) = unbounded();
 
         let socket = Arc::new(RwLock::new(socket));
         let socket_clone = socket.clone();
         let exit = Arc::new(AtomicBool::new(false));
         let exit_clone = exit.clone();
-
-        if let Some(ref mut config) = config {
-            if let Some(ref mut filters) = config.filters {
-                let node_version = PubsubProgramClientSubscription::get_version(&socket_clone).ok();
-                // If node does not support the pubsub `getVersion` method, assume version is old
-                // and filters should be mapped (node_version.is_none()).
-                filter::maybe_map_filters(node_version, filters)
-                    .map_err(PubsubClientError::RequestError)?;
-            }
-        }
 
         let body = json!({
             "jsonrpc":"2.0",
@@ -578,16 +551,18 @@ impl PubsubClient {
     /// votes are observed prior to confirmation and may never be confirmed.
     ///
     /// This method is disabled by default. It can be enabled by passing
-    /// `--rpc-pubsub-enable-vote-subscription` to `solana-validator`.
+    /// `--rpc-pubsub-enable-vote-subscription` to `agave-validator`.
     ///
     /// # RPC Reference
     ///
     /// This method corresponds directly to the [`voteSubscribe`] RPC method.
     ///
     /// [`voteSubscribe`]: https://solana.com/docs/rpc/websocket/votesubscribe
-    pub fn vote_subscribe(url: &str) -> Result<VoteSubscription, PubsubClientError> {
-        let url = Url::parse(url)?;
-        let socket = connect_with_retry(url)?;
+    pub fn vote_subscribe<R: IntoClientRequest>(
+        request: R,
+    ) -> Result<VoteSubscription, PubsubClientError> {
+        let client_request = request.into_client_request().map_err(Box::new)?;
+        let socket = connect_with_retry(client_request)?;
         let (sender, receiver) = unbounded();
 
         let socket = Arc::new(RwLock::new(socket));
@@ -630,9 +605,11 @@ impl PubsubClient {
     /// This method corresponds directly to the [`rootSubscribe`] RPC method.
     ///
     /// [`rootSubscribe`]: https://solana.com/docs/rpc/websocket/rootsubscribe
-    pub fn root_subscribe(url: &str) -> Result<RootSubscription, PubsubClientError> {
-        let url = Url::parse(url)?;
-        let socket = connect_with_retry(url)?;
+    pub fn root_subscribe<R: IntoClientRequest>(
+        request: R,
+    ) -> Result<RootSubscription, PubsubClientError> {
+        let client_request = request.into_client_request().map_err(Box::new)?;
+        let socket = connect_with_retry(client_request)?;
         let (sender, receiver) = unbounded();
 
         let socket = Arc::new(RwLock::new(socket));
@@ -676,13 +653,13 @@ impl PubsubClient {
     /// This method corresponds directly to the [`signatureSubscribe`] RPC method.
     ///
     /// [`signatureSubscribe`]: https://solana.com/docs/rpc/websocket/signaturesubscribe
-    pub fn signature_subscribe(
-        url: &str,
+    pub fn signature_subscribe<R: IntoClientRequest>(
+        request: R,
         signature: &Signature,
         config: Option<RpcSignatureSubscribeConfig>,
     ) -> Result<SignatureSubscription, PubsubClientError> {
-        let url = Url::parse(url)?;
-        let socket = connect_with_retry(url)?;
+        let client_request = request.into_client_request().map_err(Box::new)?;
+        let socket = connect_with_retry(client_request)?;
         let (sender, receiver) = unbounded();
 
         let socket = Arc::new(RwLock::new(socket));
@@ -727,9 +704,11 @@ impl PubsubClient {
     /// This method corresponds directly to the [`slotSubscribe`] RPC method.
     ///
     /// [`slotSubscribe`]: https://solana.com/docs/rpc/websocket/slotsubscribe
-    pub fn slot_subscribe(url: &str) -> Result<SlotsSubscription, PubsubClientError> {
-        let url = Url::parse(url)?;
-        let socket = connect_with_retry(url)?;
+    pub fn slot_subscribe<R: IntoClientRequest>(
+        request: R,
+    ) -> Result<SlotsSubscription, PubsubClientError> {
+        let client_request = request.into_client_request().map_err(Box::new)?;
+        let socket = connect_with_retry(client_request)?;
         let (sender, receiver) = unbounded::<SlotInfo>();
 
         let socket = Arc::new(RwLock::new(socket));
@@ -775,12 +754,12 @@ impl PubsubClient {
     /// This method corresponds directly to the [`slotUpdatesSubscribe`] RPC method.
     ///
     /// [`slotUpdatesSubscribe`]: https://solana.com/docs/rpc/websocket/slotsupdatessubscribe
-    pub fn slot_updates_subscribe(
-        url: &str,
+    pub fn slot_updates_subscribe<R: IntoClientRequest>(
+        request: R,
         handler: impl Fn(SlotUpdate) + Send + 'static,
     ) -> Result<PubsubClientSubscription<SlotUpdate>, PubsubClientError> {
-        let url = Url::parse(url)?;
-        let socket = connect_with_retry(url)?;
+        let client_request = request.into_client_request().map_err(Box::new)?;
+        let socket = connect_with_retry(client_request)?;
 
         let socket = Arc::new(RwLock::new(socket));
         let socket_clone = socket.clone();
@@ -819,7 +798,7 @@ impl PubsubClient {
         let handler = move |message| match sender.send(message) {
             Ok(_) => (),
             Err(err) => {
-                info!("receive error: {:?}", err);
+                info!("receive error: {err:?}");
             }
         };
         Self::cleanup_with_handler(exit, socket, handler);
@@ -844,7 +823,7 @@ impl PubsubClient {
                     // Nothing useful, means we received a ping message
                 }
                 Err(err) => {
-                    info!("receive error: {:?}", err);
+                    info!("receive error: {err:?}");
                     break;
                 }
             }

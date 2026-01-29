@@ -1,27 +1,40 @@
-#![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(min_specialization))]
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
+#![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 
-extern crate serde_derive;
 pub use self::legacy::{LegacyVersion1, LegacyVersion2};
 use {
-    serde_derive::{Deserialize, Serialize},
-    solana_sdk::{sanitize::Sanitize, serde_varint},
+    rand::{thread_rng, Rng},
+    serde::{Deserialize, Serialize},
+    solana_sanitize::Sanitize,
+    solana_serde_varint as serde_varint,
     std::{convert::TryInto, fmt},
 };
-#[macro_use]
+#[cfg_attr(feature = "frozen-abi", macro_use)]
+#[cfg(feature = "frozen-abi")]
 extern crate solana_frozen_abi_macro;
 
 mod legacy;
 
 #[derive(Debug, Eq, PartialEq)]
-enum ClientId {
+pub enum ClientId {
     SolanaLabs,
     JitoLabs,
     Firedancer,
+    Agave,
     // If new variants are added, update From<u16> and TryFrom<ClientId>.
     Unknown(u16),
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, AbiExample)]
+#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Version {
     #[serde(with = "serde_varint")]
     pub major: u16,
@@ -40,7 +53,7 @@ impl Version {
         semver::Version::new(self.major as u64, self.minor as u64, self.patch as u64)
     }
 
-    fn client(&self) -> ClientId {
+    pub fn client(&self) -> ClientId {
         ClientId::from(self.client)
     }
 }
@@ -51,19 +64,18 @@ fn compute_commit(sha1: Option<&'static str>) -> Option<u32> {
 
 impl Default for Version {
     fn default() -> Self {
-        let feature_set = u32::from_le_bytes(
-            solana_sdk::feature_set::ID.as_ref()[..4]
-                .try_into()
-                .unwrap(),
-        );
+        let feature_set =
+            u32::from_le_bytes(agave_feature_set::ID.as_ref()[..4].try_into().unwrap());
         Self {
             major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
             minor: env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
             patch: env!("CARGO_PKG_VERSION_PATCH").parse().unwrap(),
-            commit: compute_commit(option_env!("CI_COMMIT")).unwrap_or_default(),
+            commit: compute_commit(option_env!("CI_COMMIT"))
+                .or(compute_commit(option_env!("AGAVE_GIT_COMMIT_HASH")))
+                .unwrap_or_else(|| thread_rng().gen::<u32>()),
             feature_set,
             // Other client implementations need to modify this line.
-            client: u16::try_from(ClientId::SolanaLabs).unwrap(),
+            client: u16::try_from(ClientId::Agave).unwrap(),
         }
     }
 }
@@ -97,6 +109,7 @@ impl From<u16> for ClientId {
             0u16 => Self::SolanaLabs,
             1u16 => Self::JitoLabs,
             2u16 => Self::Firedancer,
+            3u16 => Self::Agave,
             _ => Self::Unknown(client),
         }
     }
@@ -110,7 +123,8 @@ impl TryFrom<ClientId> for u16 {
             ClientId::SolanaLabs => Ok(0u16),
             ClientId::JitoLabs => Ok(1u16),
             ClientId::Firedancer => Ok(2u16),
-            ClientId::Unknown(client @ 0u16..=2u16) => Err(format!("Invalid client: {client}")),
+            ClientId::Agave => Ok(3u16),
+            ClientId::Unknown(client @ 0u16..=3u16) => Err(format!("Invalid client: {client}")),
             ClientId::Unknown(client) => Ok(client),
         }
     }
@@ -147,19 +161,21 @@ mod test {
         assert_eq!(ClientId::from(0u16), ClientId::SolanaLabs);
         assert_eq!(ClientId::from(1u16), ClientId::JitoLabs);
         assert_eq!(ClientId::from(2u16), ClientId::Firedancer);
-        for client in 3u16..=u16::MAX {
+        assert_eq!(ClientId::from(3u16), ClientId::Agave);
+        for client in 4u16..=u16::MAX {
             assert_eq!(ClientId::from(client), ClientId::Unknown(client));
         }
         assert_eq!(u16::try_from(ClientId::SolanaLabs), Ok(0u16));
         assert_eq!(u16::try_from(ClientId::JitoLabs), Ok(1u16));
         assert_eq!(u16::try_from(ClientId::Firedancer), Ok(2u16));
-        for client in 0..=2u16 {
+        assert_eq!(u16::try_from(ClientId::Agave), Ok(3u16));
+        for client in 0..=3u16 {
             assert_eq!(
                 u16::try_from(ClientId::Unknown(client)),
                 Err(format!("Invalid client: {client}"))
             );
         }
-        for client in 3u16..=u16::MAX {
+        for client in 4u16..=u16::MAX {
             assert_eq!(u16::try_from(ClientId::Unknown(client)), Ok(client));
         }
     }

@@ -1,4 +1,4 @@
-use solana_program::hash::{hashv, Hash};
+use {solana_hash::Hash, solana_sha256_hasher::hashv};
 
 // We need to discern between leaf and intermediate nodes to prevent trivial second
 // pre-image attacks.
@@ -68,7 +68,7 @@ impl MerkleTree {
         if level_len == 1 {
             0
         } else {
-            (level_len + 1) / 2
+            level_len.div_ceil(2)
         }
     }
 
@@ -139,7 +139,7 @@ impl MerkleTree {
         self.nodes.iter().last()
     }
 
-    pub fn find_path(&self, index: usize) -> Option<Proof> {
+    pub fn find_path(&self, index: usize) -> Option<Proof<'_>> {
         if index >= self.leaf_count {
             return None;
         }
@@ -179,7 +179,7 @@ impl MerkleTree {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, solana_hash::HASH_BYTES};
 
     const TEST: &[&[u8]] = &[
         b"my", b"very", b"eager", b"mother", b"just", b"served", b"us", b"nine", b"pizzas",
@@ -209,7 +209,9 @@ mod tests {
         // changes
         let bytes = hex::decode("b40c847546fdceea166f927fc46c5ca33c3638236a36275c1346d3dffb84e1bc")
             .unwrap();
-        let expected = Hash::new(&bytes);
+        let expected = <[u8; HASH_BYTES]>::try_from(bytes)
+            .map(Hash::new_from_array)
+            .unwrap();
         assert_eq!(mt.get_root(), Some(&expected));
     }
 

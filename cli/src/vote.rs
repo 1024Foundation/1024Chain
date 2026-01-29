@@ -5,15 +5,18 @@ use {
             log_instruction_custom_error, CliCommand, CliCommandInfo, CliConfig, CliError,
             ProcessResult,
         },
-        compute_unit_price::WithComputeUnitPrice,
+        compute_budget::{
+            simulate_and_update_compute_unit_limit, ComputeUnitConfig, WithComputeUnitConfig,
+        },
         memo::WithMemo,
         nonce::check_nonce_account,
         spend_utils::{resolve_spend_tx_and_check_account_balances, SpendAmount},
         stake::check_current_authority,
     },
     clap::{value_t_or_exit, App, Arg, ArgMatches, SubCommand},
+    solana_account::Account,
     solana_clap_utils::{
-        compute_unit_price::{compute_unit_price_arg, COMPUTE_UNIT_PRICE_ARG},
+        compute_budget::{compute_unit_price_arg, ComputeUnitLimit, COMPUTE_UNIT_PRICE_ARG},
         fee_payer::{fee_payer_arg, FEE_PAYER_ARG},
         input_parsers::*,
         input_validators::*,
@@ -23,22 +26,22 @@ use {
         offline::*,
     },
     solana_cli_output::{
-        return_signers_with_config, CliEpochVotingHistory, CliLandedVote, CliVoteAccount,
-        ReturnSignersConfig,
+        display::build_balance_message, return_signers_with_config, CliEpochVotingHistory,
+        CliLandedVote, CliVoteAccount, ReturnSignersConfig,
     },
+    solana_commitment_config::CommitmentConfig,
+    solana_message::Message,
+    solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::config::RpcGetVoteAccountsConfig,
     solana_rpc_client_nonce_utils::blockhash_query::BlockhashQuery,
-    solana_sdk::{
-        account::Account, commitment_config::CommitmentConfig, feature, message::Message,
-        native_token::lamports_to_sol, pubkey::Pubkey, system_instruction::SystemError,
-        transaction::Transaction,
-    },
+    solana_system_interface::error::SystemError,
+    solana_transaction::Transaction,
     solana_vote_program::{
         vote_error::VoteError,
         vote_instruction::{self, withdraw, CreateVoteAccountConfig},
-        vote_state::{VoteAuthorize, VoteInit, VoteState, VoteStateVersions},
+        vote_state::{VoteAuthorize, VoteInit, VoteStateV4, VOTE_CREDITS_MAXIMUM_PER_SLOT},
     },
     std::rc::Rc,
 };
@@ -349,6 +352,14 @@ impl VoteSubCommands for App<'_, '_> {
                         .help("Format rewards in a CSV table"),
                 )
                 .arg(
+                    Arg::with_name("starting_epoch")
+                        .long("starting-epoch")
+                        .takes_value(true)
+                        .value_name("NUM")
+                        .requires("with_rewards")
+                        .help("Start displaying from epoch NUM"),
+                )
+                .arg(
                     Arg::with_name("num_rewards_epochs")
                         .long("num-rewards-epochs")
                         .takes_value(true)
@@ -357,8 +368,8 @@ impl VoteSubCommands for App<'_, '_> {
                         .default_value_if("with_rewards", None, "1")
                         .requires("with_rewards")
                         .help(
-                            "Display rewards for NUM recent epochs, max 10 \
-                            [default: latest epoch only]",
+                            "Display rewards for NUM recent epochs, max 10 [default: latest epoch \
+                             only]",
                         ),
                 ),
         )
@@ -673,15 +684,16 @@ pub fn parse_vote_get_account_command(
     } else {
         None
     };
-    Ok(CliCommandInfo {
-        command: CliCommand::ShowVoteAccount {
+    let starting_epoch = value_of(matches, "starting_epoch");
+    Ok(CliCommandInfo::without_signers(
+        CliCommand::ShowVoteAccount {
             pubkey: vote_account_pubkey,
             use_lamports_unit,
             use_csv,
             with_rewards,
+            starting_epoch,
         },
-        signers: vec![],
-    })
+    ))
 }
 
 pub fn parse_withdraw_from_vote_account(
@@ -792,7 +804,7 @@ pub fn process_create_vote_account(
     nonce_authority: SignerIndex,
     memo: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let vote_account = config.signers[vote_account];
     let vote_account_pubkey = vote_account.pubkey();
@@ -814,20 +826,18 @@ pub fn process_create_vote_account(
     )?;
 
     let required_balance = rpc_client
-        .get_minimum_balance_for_rent_exemption(VoteState::size_of())?
+        .get_minimum_balance_for_rent_exemption(VoteStateV4::size_of())?
         .max(1);
     let amount = SpendAmount::Some(required_balance);
 
     let fee_payer = config.signers[fee_payer];
     let nonce_authority = config.signers[nonce_authority];
+    let space = VoteStateV4::size_of() as u64;
 
-    let is_feature_active = (!sign_only)
-        .then(solana_sdk::feature_set::vote_state_add_vote_latency::id)
-        .and_then(|feature_address| rpc_client.get_account(&feature_address).ok())
-        .and_then(|account| feature::from_account(&account))
-        .map_or(false, |feature| feature.activated_at.is_some());
-    let space = VoteStateVersions::vote_state_size_of(is_feature_active) as u64;
-
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     let build_message = |lamports| {
         let vote_init = VoteInit {
             node_pubkey: identity_pubkey,
@@ -854,7 +864,10 @@ pub fn process_create_vote_account(
             create_vote_account_config,
         )
         .with_memo(memo)
-        .with_compute_unit_price(compute_unit_price);
+        .with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit,
+        });
 
         if let Some(nonce_account) = &nonce_account {
             Message::new_with_nonce(
@@ -877,6 +890,7 @@ pub fn process_create_vote_account(
         &recent_blockhash,
         &config.signers[0].pubkey(),
         &fee_payer.pubkey(),
+        compute_unit_limit,
         build_message,
         config.commitment,
     )?;
@@ -919,7 +933,11 @@ pub fn process_create_vote_account(
         )
     } else {
         tx.try_sign(&config.signers, recent_blockhash)?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+            &tx,
+            config.commitment,
+            config.send_transaction_config,
+        );
         log_instruction_custom_error::<SystemError>(result, config)
     }
 }
@@ -940,7 +958,7 @@ pub fn process_vote_authorize(
     nonce_authority: SignerIndex,
     memo: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let authorized = config.signers[authorized];
     let new_authorized_signer = new_authorized.map(|index| config.signers[index]);
@@ -955,7 +973,7 @@ pub fn process_vote_authorize(
             if let Some(vote_state) = vote_state {
                 let current_epoch = rpc_client.get_epoch_info()?.epoch;
                 let current_authorized_voter = vote_state
-                    .authorized_voters()
+                    .authorized_voters
                     .get_authorized_voter(current_epoch)
                     .ok_or_else(|| {
                         CliError::RpcRequestError(
@@ -1003,16 +1021,24 @@ pub fn process_vote_authorize(
             vote_authorize,        // vote or withdraw
         )
     };
+
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     let ixs = vec![vote_ix]
         .with_memo(memo)
-        .with_compute_unit_price(compute_unit_price);
+        .with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit,
+        });
 
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
 
     let nonce_authority = config.signers[nonce_authority];
     let fee_payer = config.signers[fee_payer];
 
-    let message = if let Some(nonce_account) = &nonce_account {
+    let mut message = if let Some(nonce_account) = &nonce_account {
         Message::new_with_nonce(
             ixs,
             Some(&fee_payer.pubkey()),
@@ -1022,6 +1048,7 @@ pub fn process_vote_authorize(
     } else {
         Message::new(&ixs, Some(&fee_payer.pubkey()))
     };
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
 
     if sign_only {
@@ -1049,7 +1076,11 @@ pub fn process_vote_authorize(
             &tx.message,
             config.commitment,
         )?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+            &tx,
+            config.commitment,
+            config.send_transaction_config,
+        );
         log_instruction_custom_error::<VoteError>(result, config)
     }
 }
@@ -1068,7 +1099,7 @@ pub fn process_vote_update_validator(
     nonce_authority: SignerIndex,
     memo: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let authorized_withdrawer = config.signers[withdraw_authority];
     let new_identity_account = config.signers[new_identity_account];
@@ -1078,17 +1109,24 @@ pub fn process_vote_update_validator(
         (&new_identity_pubkey, "new_identity_account".to_string()),
     )?;
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     let ixs = vec![vote_instruction::update_validator_identity(
         vote_account_pubkey,
         &authorized_withdrawer.pubkey(),
         &new_identity_pubkey,
     )]
     .with_memo(memo)
-    .with_compute_unit_price(compute_unit_price);
+    .with_compute_unit_config(&ComputeUnitConfig {
+        compute_unit_price,
+        compute_unit_limit,
+    });
     let nonce_authority = config.signers[nonce_authority];
     let fee_payer = config.signers[fee_payer];
 
-    let message = if let Some(nonce_account) = &nonce_account {
+    let mut message = if let Some(nonce_account) = &nonce_account {
         Message::new_with_nonce(
             ixs,
             Some(&fee_payer.pubkey()),
@@ -1098,6 +1136,7 @@ pub fn process_vote_update_validator(
     } else {
         Message::new(&ixs, Some(&fee_payer.pubkey()))
     };
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
 
     if sign_only {
@@ -1125,7 +1164,11 @@ pub fn process_vote_update_validator(
             &tx.message,
             config.commitment,
         )?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+            &tx,
+            config.commitment,
+            config.send_transaction_config,
+        );
         log_instruction_custom_error::<VoteError>(result, config)
     }
 }
@@ -1144,21 +1187,28 @@ pub fn process_vote_update_commission(
     nonce_authority: SignerIndex,
     memo: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let authorized_withdrawer = config.signers[withdraw_authority];
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     let ixs = vec![vote_instruction::update_commission(
         vote_account_pubkey,
         &authorized_withdrawer.pubkey(),
         commission,
     )]
     .with_memo(memo)
-    .with_compute_unit_price(compute_unit_price);
+    .with_compute_unit_config(&ComputeUnitConfig {
+        compute_unit_price,
+        compute_unit_limit,
+    });
     let nonce_authority = config.signers[nonce_authority];
     let fee_payer = config.signers[fee_payer];
 
-    let message = if let Some(nonce_account) = &nonce_account {
+    let mut message = if let Some(nonce_account) = &nonce_account {
         Message::new_with_nonce(
             ixs,
             Some(&fee_payer.pubkey()),
@@ -1168,6 +1218,7 @@ pub fn process_vote_update_commission(
     } else {
         Message::new(&ixs, Some(&fee_payer.pubkey()))
     };
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
     if sign_only {
         tx.try_partial_sign(&config.signers, recent_blockhash)?;
@@ -1194,7 +1245,11 @@ pub fn process_vote_update_commission(
             &tx.message,
             config.commitment,
         )?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+            &tx,
+            config.commitment,
+            config.send_transaction_config,
+        );
         log_instruction_custom_error::<VoteError>(result, config)
     }
 }
@@ -1203,7 +1258,7 @@ pub(crate) fn get_vote_account(
     rpc_client: &RpcClient,
     vote_account_pubkey: &Pubkey,
     commitment_config: CommitmentConfig,
-) -> Result<(Account, VoteState), Box<dyn std::error::Error>> {
+) -> Result<(Account, VoteStateV4), Box<dyn std::error::Error>> {
     let vote_account = rpc_client
         .get_account_with_commitment(vote_account_pubkey, commitment_config)?
         .value
@@ -1217,11 +1272,12 @@ pub(crate) fn get_vote_account(
         ))
         .into());
     }
-    let vote_state = VoteState::deserialize(&vote_account.data).map_err(|_| {
-        CliError::RpcRequestError(
-            "Account data could not be deserialized to vote state".to_string(),
-        )
-    })?;
+    let vote_state =
+        VoteStateV4::deserialize(&vote_account.data, vote_account_pubkey).map_err(|_| {
+            CliError::RpcRequestError(
+                "Account data could not be deserialized to vote state".to_string(),
+            )
+        })?;
 
     Ok((vote_account, vote_state))
 }
@@ -1233,11 +1289,15 @@ pub fn process_show_vote_account(
     use_lamports_unit: bool,
     use_csv: bool,
     with_rewards: Option<usize>,
+    starting_epoch: Option<u64>,
 ) -> ProcessResult {
     let (vote_account, vote_state) =
         get_vote_account(rpc_client, vote_account_address, config.commitment)?;
 
     let epoch_schedule = rpc_client.get_epoch_schedule()?;
+    let tvc_activation_slot =
+        rpc_client.get_feature_activation_slot(&agave_feature_set::timely_vote_credits::id())?;
+    let tvc_activation_epoch = tvc_activation_slot.map(|s| epoch_schedule.get_epoch(s));
 
     let mut votes: Vec<CliLandedVote> = vec![];
     let mut epoch_voting_history: Vec<CliEpochVotingHistory> = vec![];
@@ -1245,22 +1305,34 @@ pub fn process_show_vote_account(
         for vote in &vote_state.votes {
             votes.push(vote.into());
         }
-        for (epoch, credits, prev_credits) in vote_state.epoch_credits().iter().copied() {
-            let credits_earned = credits - prev_credits;
+        for (epoch, credits, prev_credits) in vote_state.epoch_credits.iter().copied() {
+            let credits_earned = credits.saturating_sub(prev_credits);
             let slots_in_epoch = epoch_schedule.get_slots_in_epoch(epoch);
+            let is_tvc_active = tvc_activation_epoch.map(|e| epoch >= e).unwrap_or_default();
+            let max_credits_per_slot = if is_tvc_active {
+                VOTE_CREDITS_MAXIMUM_PER_SLOT
+            } else {
+                1
+            };
             epoch_voting_history.push(CliEpochVotingHistory {
                 epoch,
                 slots_in_epoch,
                 credits_earned,
                 credits,
                 prev_credits,
+                max_credits_per_slot,
             });
         }
     }
 
     let epoch_rewards =
         with_rewards.and_then(|num_epochs| {
-            match crate::stake::fetch_epoch_rewards(rpc_client, vote_account_address, num_epochs) {
+            match crate::stake::fetch_epoch_rewards(
+                rpc_client,
+                vote_account_address,
+                num_epochs,
+                starting_epoch,
+            ) {
                 Ok(rewards) => Some(rewards),
                 Err(error) => {
                     eprintln!("Failed to fetch epoch rewards: {error:?}");
@@ -1272,10 +1344,10 @@ pub fn process_show_vote_account(
     let vote_account_data = CliVoteAccount {
         account_balance: vote_account.lamports,
         validator_identity: vote_state.node_pubkey.to_string(),
-        authorized_voters: vote_state.authorized_voters().into(),
+        authorized_voters: (&vote_state.authorized_voters).into(),
         authorized_withdrawer: vote_state.authorized_withdrawer.to_string(),
         credits: vote_state.credits(),
-        commission: vote_state.commission,
+        commission: (vote_state.inflation_rewards_commission_bps / 100) as u8,
         root_slot: vote_state.root_slot,
         recent_timestamp: vote_state.last_timestamp.clone(),
         votes,
@@ -1283,6 +1355,14 @@ pub fn process_show_vote_account(
         use_lamports_unit,
         use_csv,
         epoch_rewards,
+        inflation_rewards_commission_bps: vote_state.inflation_rewards_commission_bps,
+        inflation_rewards_collector: vote_state.inflation_rewards_collector.to_string(),
+        block_revenue_collector: vote_state.block_revenue_collector.to_string(),
+        block_revenue_commission_bps: vote_state.block_revenue_commission_bps,
+        pending_delegator_rewards: vote_state.pending_delegator_rewards,
+        bls_pubkey_compressed: vote_state
+            .bls_pubkey_compressed
+            .map(|bytes| bs58::encode(bytes).into_string()),
     };
 
     Ok(config.output_format.formatted_string(&vote_account_data))
@@ -1303,7 +1383,7 @@ pub fn process_withdraw_from_vote_account(
     nonce_authority: SignerIndex,
     memo: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let withdraw_authority = config.signers[withdraw_authority];
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
@@ -1311,6 +1391,10 @@ pub fn process_withdraw_from_vote_account(
     let fee_payer = config.signers[fee_payer];
     let nonce_authority = config.signers[nonce_authority];
 
+    let compute_unit_limit = match blockhash_query {
+        BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+    };
     let build_message = |lamports| {
         let ixs = vec![withdraw(
             vote_account_pubkey,
@@ -1319,7 +1403,10 @@ pub fn process_withdraw_from_vote_account(
             destination_account_pubkey,
         )]
         .with_memo(memo)
-        .with_compute_unit_price(compute_unit_price);
+        .with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit,
+        });
 
         if let Some(nonce_account) = &nonce_account {
             Message::new_with_nonce(
@@ -1340,6 +1427,7 @@ pub fn process_withdraw_from_vote_account(
         &recent_blockhash,
         vote_account_pubkey,
         &fee_payer.pubkey(),
+        compute_unit_limit,
         build_message,
         config.commitment,
     )?;
@@ -1347,14 +1435,14 @@ pub fn process_withdraw_from_vote_account(
     if !sign_only {
         let current_balance = rpc_client.get_balance(vote_account_pubkey)?;
         let minimum_balance =
-            rpc_client.get_minimum_balance_for_rent_exemption(VoteState::size_of())?;
+            rpc_client.get_minimum_balance_for_rent_exemption(VoteStateV4::size_of())?;
         if let SpendAmount::Some(withdraw_amount) = withdraw_amount {
             let balance_remaining = current_balance.saturating_sub(withdraw_amount);
             if balance_remaining < minimum_balance && balance_remaining != 0 {
                 return Err(CliError::BadParameter(format!(
                     "Withdraw amount too large. The vote account balance must be at least {} SOL \
                      to remain rent exempt",
-                    lamports_to_sol(minimum_balance)
+                    build_balance_message(minimum_balance, false, false)
                 ))
                 .into());
             }
@@ -1388,7 +1476,11 @@ pub fn process_withdraw_from_vote_account(
             &tx.message,
             config.commitment,
         )?;
-        let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+        let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+            &tx,
+            config.commitment,
+            config.send_transaction_config,
+        );
         log_instruction_custom_error::<VoteError>(result, config)
     }
 }
@@ -1401,7 +1493,7 @@ pub fn process_close_vote_account(
     destination_account_pubkey: &Pubkey,
     memo: Option<&String>,
     fee_payer: SignerIndex,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let vote_account_status =
         rpc_client.get_vote_accounts_with_config(RpcGetVoteAccountsConfig {
@@ -1429,6 +1521,7 @@ pub fn process_close_vote_account(
 
     let current_balance = rpc_client.get_balance(vote_account_pubkey)?;
 
+    let compute_unit_limit = ComputeUnitLimit::Simulated;
     let ixs = vec![withdraw(
         vote_account_pubkey,
         &withdraw_authority.pubkey(),
@@ -1436,9 +1529,13 @@ pub fn process_close_vote_account(
         destination_account_pubkey,
     )]
     .with_memo(memo)
-    .with_compute_unit_price(compute_unit_price);
+    .with_compute_unit_config(&ComputeUnitConfig {
+        compute_unit_price,
+        compute_unit_limit,
+    });
 
-    let message = Message::new(&ixs, Some(&fee_payer.pubkey()));
+    let mut message = Message::new(&ixs, Some(&fee_payer.pubkey()));
+    simulate_and_update_compute_unit_limit(&compute_unit_limit, rpc_client, &mut message)?;
     let mut tx = Transaction::new_unsigned(message);
     tx.try_sign(&config.signers, latest_blockhash)?;
     check_account_for_fee_with_commitment(
@@ -1447,7 +1544,11 @@ pub fn process_close_vote_account(
         &tx.message,
         config.commitment,
     )?;
-    let result = rpc_client.send_and_confirm_transaction_with_spinner(&tx);
+    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+        &tx,
+        config.commitment,
+        config.send_transaction_config,
+    );
     log_instruction_custom_error::<VoteError>(result, config)
 }
 
@@ -1456,12 +1557,11 @@ mod tests {
     use {
         super::*,
         crate::{clap_app::get_clap_app, cli::parse_command},
+        solana_hash::Hash,
+        solana_keypair::{read_keypair_file, write_keypair, Keypair},
+        solana_presigner::Presigner,
         solana_rpc_client_nonce_utils::blockhash_query,
-        solana_sdk::{
-            hash::Hash,
-            signature::{read_keypair_file, write_keypair, Keypair, Signer},
-            signer::presigner::Presigner,
-        },
+        solana_signer::Signer,
         tempfile::NamedTempFile,
     };
 
@@ -1898,7 +1998,7 @@ mod tests {
         );
 
         // test init with an authed voter
-        let authed = solana_sdk::pubkey::new_rand();
+        let authed = solana_pubkey::new_rand();
         let (keypair_file, mut tmp_file) = make_tmp_file();
         let keypair = Keypair::new();
         write_keypair(&keypair, tmp_file.as_file_mut()).unwrap();

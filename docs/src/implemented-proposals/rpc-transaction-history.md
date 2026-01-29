@@ -42,7 +42,7 @@ different tables for quick searching.
 
 New data may be copied into the instance at anytime without affecting the
 existing data, and all data is immutable. Generally the expectation is that new
-data will be uploaded once an current epoch completes but there is no limitation
+data will be uploaded once a current epoch completes but there is no limitation
 on the frequency of data dumps.
 
 Cleanup of old data is automatic by configuring the data retention policy of the
@@ -61,14 +61,14 @@ all transactions to build up the necessary metadata.
 ## Accessing BigTable
 
 BigTable has a gRPC endpoint that can be accessed using the
-[tonic](https://crates.io/crates/crate)] and the raw protobuf API, as currently
+[tonic](https://crates.io/crates/tonic) and the raw protobuf API, as currently
 no higher-level Rust crate for BigTable exists. Practically this makes parsing
 the results of BigTable queries more complicated but is not a significant issue.
 
 ## Data Population
 
 The ongoing population of instance data will occur on an epoch cadence through
-the use of a new `solana-ledger-tool` command that will convert rocksdb data for
+the use of a new `agave-ledger-tool` command that will convert rocksdb data for
 a given slot range into the instance schema.
 
 The same process will be run once, manually, to backfill the existing ledger

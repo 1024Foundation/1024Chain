@@ -21,7 +21,7 @@ use {
         instruction::{ProofType, ZkProofData},
         zk_token_elgamal::pod,
     },
-    bytemuck::{Pod, Zeroable},
+    bytemuck_derive::{Pod, Zeroable},
 };
 
 /// The instruction data that is needed for the `ProofInstruction::VerifyPubkeyValidity`
@@ -50,7 +50,7 @@ pub struct PubkeyValidityProofContext {
 #[cfg(not(target_os = "solana"))]
 impl PubkeyValidityData {
     pub fn new(keypair: &ElGamalKeypair) -> Result<Self, ProofGenerationError> {
-        let pod_pubkey = pod::ElGamalPubkey(keypair.pubkey().to_bytes());
+        let pod_pubkey = pod::ElGamalPubkey(keypair.pubkey().into());
 
         let context = PubkeyValidityProofContext { pubkey: pod_pubkey };
 

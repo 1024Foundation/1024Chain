@@ -1,8 +1,9 @@
 //! Helpers for AppendVec tests and benches
+#![cfg(feature = "dev-context-only-utils")]
 use {
-    super::StoredMeta,
     rand::{distributions::Alphanumeric, Rng},
-    solana_sdk::{account::AccountSharedData, pubkey::Pubkey},
+    solana_account::AccountSharedData,
+    solana_pubkey::Pubkey,
     std::path::PathBuf,
 };
 
@@ -35,14 +36,18 @@ pub fn get_append_vec_path(path: &str) -> TempFile {
     TempFile { path: buf }
 }
 
-pub fn create_test_account(sample: usize) -> (StoredMeta, AccountSharedData) {
+/// return a test account.
+/// Note that `sample`=0 returns a fully default account with a default pubkey.
+pub fn create_test_account(sample: usize) -> (Pubkey, AccountSharedData) {
     let data_len = sample % 256;
     let mut account = AccountSharedData::new(sample as u64, 0, &Pubkey::default());
     account.set_data_from_slice(&vec![data_len as u8; data_len]);
-    let stored_meta = StoredMeta {
-        write_version_obsolete: 0,
-        pubkey: Pubkey::default(),
-        data_len: data_len as u64,
-    };
-    (stored_meta, account)
+    (Pubkey::default(), account)
+}
+
+/// Create a test account for the given `data_len`.
+/// This is useful to create very large test account.
+pub fn create_test_account_with(data_len: usize) -> (Pubkey, AccountSharedData) {
+    let account = AccountSharedData::new(100, data_len, &Pubkey::default());
+    (Pubkey::default(), account)
 }

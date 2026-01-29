@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 use thiserror::Error;
 
 pub struct ArgConstant<'a> {
@@ -27,6 +36,7 @@ pub fn hidden_unless_forced() -> bool {
     std::env::var("SOLANA_NO_HIDDEN_CLI_ARGS").is_err()
 }
 
+pub mod compute_budget;
 pub mod compute_unit_price;
 pub mod fee_payer;
 pub mod input_parsers;

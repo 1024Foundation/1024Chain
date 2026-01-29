@@ -5,14 +5,29 @@ extern crate test;
 
 use {
     solana_entry::poh::Poh,
-    solana_poh::poh_service::DEFAULT_HASHES_PER_BATCH,
-    solana_sdk::hash::Hash,
+    solana_hash::Hash,
+    solana_ledger::{
+        blockstore::Blockstore,
+        genesis_utils::{create_genesis_config, GenesisConfigInfo},
+        get_tmp_ledger_path_auto_delete,
+        leader_schedule_cache::LeaderScheduleCache,
+    },
+    solana_perf::test_tx::test_tx,
+    solana_poh::{poh_recorder::PohRecorder, poh_service::DEFAULT_HASHES_PER_BATCH},
+    solana_poh_config::PohConfig,
+    solana_runtime::bank::Bank,
+    solana_sha256_hasher::hash,
+    solana_transaction::sanitized::SanitizedTransaction,
     std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
     test::Bencher,
 };
+
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 const NUM_HASHES: u64 = 30_000; // Should require ~10ms on a 2017 MacBook Pro
 
@@ -64,4 +79,78 @@ fn bench_poh_lock_time_per_batch(bencher: &mut Bencher) {
     bencher.iter(|| {
         poh.hash(DEFAULT_HASHES_PER_BATCH);
     })
+}
+
+#[bench]
+fn bench_poh_recorder_record(bencher: &mut Bencher) {
+    let ledger_path = get_tmp_ledger_path_auto_delete!();
+    let blockstore =
+        Blockstore::open(ledger_path.path()).expect("Expected to be able to open database ledger");
+    let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+    let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+    let prev_hash = bank.last_blockhash();
+
+    let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
+        0,
+        prev_hash,
+        bank.clone(),
+        Some((4, 4)),
+        bank.ticks_per_slot(),
+        Arc::new(blockstore),
+        &std::sync::Arc::new(LeaderScheduleCache::new_from_bank(&bank)),
+        &PohConfig::default(),
+        Arc::new(AtomicBool::default()),
+    );
+    let h1 = hash(b"hello Agave, hello Anza!");
+
+    poh_recorder.set_bank_for_test(bank.clone());
+    poh_recorder.tick();
+    let txs: [SanitizedTransaction; 7] = [
+        SanitizedTransaction::from_transaction_for_tests(test_tx()),
+        SanitizedTransaction::from_transaction_for_tests(test_tx()),
+        SanitizedTransaction::from_transaction_for_tests(test_tx()),
+        SanitizedTransaction::from_transaction_for_tests(test_tx()),
+        SanitizedTransaction::from_transaction_for_tests(test_tx()),
+        SanitizedTransaction::from_transaction_for_tests(test_tx()),
+        SanitizedTransaction::from_transaction_for_tests(test_tx()),
+    ];
+
+    let txs: Vec<_> = txs.iter().map(|tx| tx.to_versioned_transaction()).collect();
+    bencher.iter(|| {
+        let _record_result = poh_recorder
+            .record(
+                bank.slot(),
+                vec![test::black_box(h1)],
+                vec![test::black_box(txs.clone())],
+            )
+            .unwrap();
+    });
+    poh_recorder.tick();
+}
+
+#[bench]
+fn bench_poh_recorder_set_bank(bencher: &mut Bencher) {
+    let ledger_path = get_tmp_ledger_path_auto_delete!();
+    let blockstore =
+        Blockstore::open(ledger_path.path()).expect("Expected to be able to open database ledger");
+    let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+    let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+    let prev_hash = bank.last_blockhash();
+
+    let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
+        0,
+        prev_hash,
+        bank.clone(),
+        Some((4, 4)),
+        bank.ticks_per_slot(),
+        Arc::new(blockstore),
+        &std::sync::Arc::new(LeaderScheduleCache::new_from_bank(&bank)),
+        &PohConfig::default(),
+        Arc::new(AtomicBool::default()),
+    );
+    bencher.iter(|| {
+        poh_recorder.set_bank_for_test(bank.clone());
+        poh_recorder.tick();
+        poh_recorder.clear_bank_for_test();
+    });
 }

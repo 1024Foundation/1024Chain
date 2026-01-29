@@ -7,17 +7,12 @@
 //! [JSON-RPC]: https://www.jsonrpc.org/specification
 
 pub use crate::mock_sender::Mocks;
-#[allow(deprecated)]
-use solana_rpc_client_api::deprecated_config::{
-    RpcConfirmedBlockConfig, RpcConfirmedTransactionConfig,
-    RpcGetConfirmedSignaturesForAddress2Config,
-};
 #[cfg(feature = "spinner")]
-use {crate::spinner, solana_sdk::clock::MAX_HASH_AGE_IN_SECONDS, std::cmp::min};
+use {crate::spinner, solana_clock::MAX_HASH_AGE_IN_SECONDS, std::cmp::min};
 use {
     crate::{
         http_sender::HttpSender,
-        mock_sender::MockSender,
+        mock_sender::{mock_encoded_account, MockSender, MocksMap},
         rpc_client::{
             GetConfirmedSignaturesForAddress2Config, RpcClientConfig, SerializableMessage,
             SerializableTransaction,
@@ -26,44 +21,41 @@ use {
     },
     base64::{prelude::BASE64_STANDARD, Engine},
     bincode::serialize,
+    futures::join,
     log::*,
     serde_json::{json, Value},
-    solana_account_decoder::{
-        parse_token::{TokenAccountType, UiTokenAccount, UiTokenAmount},
+    solana_account::Account,
+    solana_account_decoder_client_types::{
+        token::{TokenAccountType, UiTokenAccount, UiTokenAmount},
         UiAccount, UiAccountData, UiAccountEncoding,
     },
+    solana_clock::{Epoch, Slot, UnixTimestamp, DEFAULT_MS_PER_SLOT},
+    solana_commitment_config::CommitmentConfig,
+    solana_epoch_info::EpochInfo,
+    solana_epoch_schedule::EpochSchedule,
+    solana_hash::Hash,
+    solana_pubkey::Pubkey,
     solana_rpc_client_api::{
         client_error::{
             Error as ClientError, ErrorKind as ClientErrorKind, Result as ClientResult,
         },
         config::{RpcAccountInfoConfig, *},
-        filter::{self, RpcFilterType},
         request::{RpcError, RpcRequest, RpcResponseErrorData, TokenAccountsFilter},
         response::*,
     },
-    solana_sdk::{
-        account::Account,
-        clock::{Epoch, Slot, UnixTimestamp, DEFAULT_MS_PER_SLOT},
-        commitment_config::{CommitmentConfig, CommitmentLevel},
-        epoch_info::EpochInfo,
-        epoch_schedule::EpochSchedule,
-        fee_calculator::{FeeCalculator, FeeRateGovernor},
-        hash::Hash,
-        pubkey::Pubkey,
-        signature::Signature,
-        transaction,
-    },
-    solana_transaction_status::{
+    solana_signature::Signature,
+    solana_transaction_error::TransactionResult,
+    solana_transaction_status_client_types::{
         EncodedConfirmedBlock, EncodedConfirmedTransactionWithStatusMeta, TransactionStatus,
         UiConfirmedBlock, UiTransactionEncoding,
     },
-    solana_vote_program::vote_state::MAX_LOCKOUT_HISTORY,
+    solana_vote_interface::state::MAX_LOCKOUT_HISTORY,
     std::{
         net::SocketAddr,
         str::FromStr,
         time::{Duration, Instant},
     },
-    tokio::{sync::RwLock, time::sleep},
+    tokio::time::sleep,
 };
 
 /// A client of a remote Solana node.
@@ -122,14 +114,15 @@ use {
 /// field, so it is common for the value to be accessed with `?.value`, as in
 ///
 /// ```
-/// # use solana_sdk::system_transaction;
+/// # use solana_hash::Hash;
+/// # use solana_system_transaction as system_transaction;
 /// # use solana_rpc_client_api::client_error::Error;
 /// # use solana_rpc_client::rpc_client::RpcClient;
-/// # use solana_sdk::signature::{Keypair, Signer};
-/// # use solana_sdk::hash::Hash;
+/// # use solana_keypair::Keypair;
+/// # use solana_signer::Signer;
 /// # let rpc_client = RpcClient::new_mock("succeeds".to_string());
 /// # let key = Keypair::new();
-/// # let to = solana_sdk::pubkey::new_rand();
+/// # let to = solana_pubkey::new_rand();
 /// # let lamports = 50;
 /// # let latest_blockhash = Hash::default();
 /// # let tx = system_transaction::transfer(&key, &to, lamports, latest_blockhash);
@@ -147,7 +140,6 @@ use {
 pub struct RpcClient {
     sender: Box<dyn RpcSender + Send + Sync + 'static>,
     config: RpcClientConfig,
-    node_version: RwLock<Option<semver::Version>>,
 }
 
 impl RpcClient {
@@ -163,7 +155,6 @@ impl RpcClient {
     ) -> Self {
         Self {
             sender: Box::new(sender),
-            node_version: RwLock::new(None),
             config,
         }
     }
@@ -202,7 +193,7 @@ impl RpcClient {
     /// # Examples
     ///
     /// ```
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
     /// let url = "http://localhost:8899".to_string();
     /// let commitment_config = CommitmentConfig::processed();
@@ -253,7 +244,7 @@ impl RpcClient {
     /// ```
     /// # use std::time::Duration;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// let url = "http://localhost::8899".to_string();
     /// let timeout = Duration::from_secs(1);
     /// let commitment_config = CommitmentConfig::processed();
@@ -294,7 +285,7 @@ impl RpcClient {
     /// ```
     /// # use std::time::Duration;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// let url = "http://localhost::8899".to_string();
     /// let timeout = Duration::from_secs(1);
     /// let commitment_config = CommitmentConfig::processed();
@@ -442,6 +433,101 @@ impl RpcClient {
             RpcClientConfig::with_commitment(CommitmentConfig::default()),
         )
     }
+    /// Create a mock `RpcClient`.
+    ///
+    /// A mock `RpcClient` contains an implementation of [`RpcSender`] that does
+    /// not use the network, and instead returns synthetic responses, for use in
+    /// tests.
+    ///
+    /// It is primarily for internal use, with limited customizability, and
+    /// behaviors determined by internal Solana test cases. New users should
+    /// consider implementing `RpcSender` themselves and constructing
+    /// `RpcClient` with [`RpcClient::new_sender`] to get mock behavior.
+    ///
+    /// Unless directed otherwise, a mock `RpcClient` will generally return a
+    /// reasonable default response to any request, at least for [`RpcRequest`]
+    /// values for which responses have been implemented.
+    ///
+    /// This mock can be customized in two ways:
+    ///
+    /// 1) By changing the `url` argument, which is not actually a URL, but a
+    ///    simple string directive that changes the mock behavior in specific
+    ///    scenarios.
+    ///
+    ///    It is customary to set the `url` to "succeeds" for mocks that should
+    ///    return successfully, though this value is not actually interpreted.
+    ///
+    ///    If `url` is "fails" then any call to `send` will return `Ok(Value::Null)`.
+    ///
+    ///    Other possible values of `url` are specific to different `RpcRequest`
+    ///    values. Read the implementation of `MockSender` (which is non-public)
+    ///    for details.
+    ///
+    /// 2) Custom responses can be configured by providing [`MocksMap`]. This type
+    ///    is a [`HashMap`] from [`RpcRequest`] to a [`Vec`] of JSON [`Value`] responses,
+    ///    Any entries in this map override the default behavior for the given
+    ///    request.
+    ///
+    /// The [`RpcClient::new_mock_with_mocks_map`] function offers further
+    /// customization options.
+    ///
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use solana_rpc_client_api::{
+    /// #     request::RpcRequest,
+    /// #     response::{Response, RpcResponseContext},
+    /// # };
+    /// # use solana_rpc_client::{rpc_client::RpcClient, mock_sender::MocksMap};
+    /// # use serde_json::json;
+    /// // Create a mock with a custom response to the `GetBalance` request
+    /// let account_balance_x = 50;
+    /// let account_balance_y = 100;
+    /// let account_balance_z = 150;
+    /// let account_balance_req_responses = vec![
+    ///     (
+    ///         RpcRequest::GetBalance,
+    ///         json!(Response {
+    ///             context: RpcResponseContext {
+    ///                 slot: 1,
+    ///                 api_version: None,
+    ///             },
+    ///             value: json!(account_balance_x),
+    ///         })
+    ///     ),
+    ///     (
+    ///         RpcRequest::GetBalance,
+    ///         json!(Response {
+    ///             context: RpcResponseContext {
+    ///                 slot: 1,
+    ///                 api_version: None,
+    ///             },
+    ///             value: json!(account_balance_y),
+    ///         })
+    ///     ),
+    /// ];
+    ///
+    /// let mut mocks = MocksMap::from_iter(account_balance_req_responses);
+    /// mocks.insert(
+    ///     RpcRequest::GetBalance,
+    ///     json!(Response {
+    ///         context: RpcResponseContext {
+    ///             slot: 1,
+    ///             api_version: None,
+    ///         },
+    ///         value: json!(account_balance_z),
+    ///     }),
+    /// );
+    /// let url = "succeeds".to_string();
+    /// let client = RpcClient::new_mock_with_mocks_map(url, mocks);
+    /// ```
+    pub fn new_mock_with_mocks_map<U: ToString>(url: U, mocks: MocksMap) -> Self {
+        Self::new_sender(
+            MockSender::new_with_mocks_map(url, mocks),
+            RpcClientConfig::with_commitment(CommitmentConfig::default()),
+        )
+    }
 
     /// Create an HTTP `RpcClient` from a [`SocketAddr`].
     ///
@@ -474,7 +560,7 @@ impl RpcClient {
     /// ```
     /// # use std::net::{Ipv4Addr, SocketAddr};
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 8899));
     /// let commitment_config = CommitmentConfig::processed();
     /// let client = RpcClient::new_socket_with_commitment(
@@ -515,30 +601,6 @@ impl RpcClient {
         self.sender.url()
     }
 
-    pub async fn set_node_version(&self, version: semver::Version) -> Result<(), ()> {
-        let mut w_node_version = self.node_version.write().await;
-        *w_node_version = Some(version);
-        Ok(())
-    }
-
-    async fn get_node_version(&self) -> Result<semver::Version, RpcError> {
-        let r_node_version = self.node_version.read().await;
-        if let Some(version) = &*r_node_version {
-            Ok(version.clone())
-        } else {
-            drop(r_node_version);
-            let mut w_node_version = self.node_version.write().await;
-            let node_version = self.get_version().await.map_err(|e| {
-                RpcError::RpcRequestError(format!("cluster version query failed: {e}"))
-            })?;
-            let node_version = semver::Version::parse(&node_version.solana_core).map_err(|e| {
-                RpcError::RpcRequestError(format!("failed to parse cluster version: {e}"))
-            })?;
-            *w_node_version = Some(node_version.clone());
-            Ok(node_version)
-        }
-    }
-
     /// Get the configured default [commitment level][cl].
     ///
     /// [cl]: https://solana.com/docs/rpc#configuring-state-commitment
@@ -554,54 +616,6 @@ impl RpcClient {
     /// [`RpcClient::confirm_transaction_with_commitment`].
     pub fn commitment(&self) -> CommitmentConfig {
         self.config.commitment_config
-    }
-
-    async fn use_deprecated_commitment(&self) -> Result<bool, RpcError> {
-        Ok(self.get_node_version().await? < semver::Version::new(1, 5, 5))
-    }
-
-    async fn maybe_map_commitment(
-        &self,
-        requested_commitment: CommitmentConfig,
-    ) -> Result<CommitmentConfig, RpcError> {
-        if matches!(
-            requested_commitment.commitment,
-            CommitmentLevel::Finalized | CommitmentLevel::Confirmed | CommitmentLevel::Processed
-        ) && self.use_deprecated_commitment().await?
-        {
-            return Ok(CommitmentConfig::use_deprecated_commitment(
-                requested_commitment,
-            ));
-        }
-        Ok(requested_commitment)
-    }
-
-    #[allow(deprecated)]
-    async fn maybe_map_request(&self, mut request: RpcRequest) -> Result<RpcRequest, RpcError> {
-        if self.get_node_version().await? < semver::Version::new(1, 7, 0) {
-            request = match request {
-                RpcRequest::GetBlock => RpcRequest::GetConfirmedBlock,
-                RpcRequest::GetBlocks => RpcRequest::GetConfirmedBlocks,
-                RpcRequest::GetBlocksWithLimit => RpcRequest::GetConfirmedBlocksWithLimit,
-                RpcRequest::GetSignaturesForAddress => {
-                    RpcRequest::GetConfirmedSignaturesForAddress2
-                }
-                RpcRequest::GetTransaction => RpcRequest::GetConfirmedTransaction,
-                _ => request,
-            };
-        }
-        Ok(request)
-    }
-
-    #[allow(deprecated)]
-    async fn maybe_map_filters(
-        &self,
-        mut filters: Vec<RpcFilterType>,
-    ) -> Result<Vec<RpcFilterType>, RpcError> {
-        let node_version = self.get_node_version().await?;
-        filter::maybe_map_filters(Some(node_version), &mut filters)
-            .map_err(RpcError::RpcRequestError)?;
-        Ok(filters)
     }
 
     /// Submit a transaction and wait for confirmation.
@@ -647,12 +661,10 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signature::Signature,
-    /// #     signer::keypair::Keypair,
-    /// #     system_transaction,
-    /// # };
+    /// # use solana_keypair::Keypair;
+    /// # use solana_system_transaction as system_transaction;
+    /// # use solana_signature::Signature;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -673,16 +685,9 @@ impl RpcClient {
         const GET_STATUS_RETRIES: usize = usize::MAX;
 
         'sending: for _ in 0..SEND_RETRIES {
-            let signature = self.send_transaction(transaction).await?;
-
-            let recent_blockhash = if transaction.uses_durable_nonce() {
-                let (recent_blockhash, ..) = self
-                    .get_latest_blockhash_with_commitment(CommitmentConfig::processed())
-                    .await?;
-                recent_blockhash
-            } else {
-                *transaction.get_recent_blockhash()
-            };
+            let (latest_blockhash, signature) = self
+                .send_transaction_and_get_latest_blockhash(transaction, None)
+                .await?;
 
             for status_retry in 0..GET_STATUS_RETRIES {
                 match self.get_signature_status(&signature).await? {
@@ -690,7 +695,7 @@ impl RpcClient {
                     Some(Err(e)) => return Err(e.into()),
                     None => {
                         if !self
-                            .is_blockhash_valid(&recent_blockhash, CommitmentConfig::processed())
+                            .is_blockhash_valid(&latest_blockhash, CommitmentConfig::processed())
                             .await?
                         {
                             // Block hash is not found by some reason
@@ -709,9 +714,8 @@ impl RpcClient {
         }
 
         Err(RpcError::ForUser(
-            "unable to confirm transaction. \
-             This can happen in situations such as transaction expiration \
-             and insufficient fee-payer funds"
+            "unable to confirm transaction. This can happen in situations such as transaction \
+             expiration and insufficient fee-payer funds"
                 .to_string(),
         )
         .into())
@@ -746,6 +750,33 @@ impl RpcClient {
         .await
     }
 
+    async fn send_transaction_and_get_latest_blockhash(
+        &self,
+        transaction: &impl SerializableTransaction,
+        config: Option<RpcSendTransactionConfig>,
+    ) -> ClientResult<(Hash, Signature)> {
+        let (latest_blockhash, signature) = join!(
+            async {
+                if transaction.uses_durable_nonce() {
+                    self.get_latest_blockhash_with_commitment(CommitmentConfig::processed())
+                        .await
+                        .map(|v| v.0)
+                } else {
+                    Ok(*transaction.get_recent_blockhash())
+                }
+            },
+            async {
+                if let Some(config) = config {
+                    self.send_transaction_with_config(transaction, config).await
+                } else {
+                    self.send_transaction(transaction).await
+                }
+            },
+        );
+
+        Ok((latest_blockhash?, signature?))
+    }
+
     #[cfg(feature = "spinner")]
     pub async fn send_and_confirm_transaction_with_spinner_and_config(
         &self,
@@ -753,17 +784,10 @@ impl RpcClient {
         commitment: CommitmentConfig,
         config: RpcSendTransactionConfig,
     ) -> ClientResult<Signature> {
-        let recent_blockhash = if transaction.uses_durable_nonce() {
-            self.get_latest_blockhash_with_commitment(CommitmentConfig::processed())
-                .await?
-                .0
-        } else {
-            *transaction.get_recent_blockhash()
-        };
-        let signature = self
-            .send_transaction_with_config(transaction, config)
+        let (latest_blockhash, signature) = self
+            .send_transaction_and_get_latest_blockhash(transaction, Some(config))
             .await?;
-        self.confirm_transaction_with_spinner(&signature, &recent_blockhash, commitment)
+        self.confirm_transaction_with_spinner(&signature, &latest_blockhash, commitment)
             .await?;
         Ok(signature)
     }
@@ -818,13 +842,11 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signature::Signature,
-    /// #     signer::keypair::Keypair,
-    /// #     hash::Hash,
-    /// #     system_transaction,
-    /// # };
+    /// # use solana_hash::Hash;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_system_transaction as system_transaction;
+    /// # use solana_signature::Signature;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// // Transfer lamports from Alice to Bob
@@ -845,11 +867,7 @@ impl RpcClient {
         self.send_transaction_with_config(
             transaction,
             RpcSendTransactionConfig {
-                preflight_commitment: Some(
-                    self.maybe_map_commitment(self.commitment())
-                        .await?
-                        .commitment,
-                ),
+                preflight_commitment: Some(self.commitment().commitment),
                 ..RpcSendTransactionConfig::default()
             },
         )
@@ -910,13 +928,11 @@ impl RpcClient {
     /// #     config::RpcSendTransactionConfig,
     /// # };
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signature::Signature,
-    /// #     signer::keypair::Keypair,
-    /// #     hash::Hash,
-    /// #     system_transaction,
-    /// # };
+    /// # use solana_hash::Hash;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_system_transaction as system_transaction;
+    /// # use solana_signature::Signature;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// // Transfer lamports from Alice to Bob
@@ -942,15 +958,10 @@ impl RpcClient {
         transaction: &impl SerializableTransaction,
         config: RpcSendTransactionConfig,
     ) -> ClientResult<Signature> {
-        let encoding = if let Some(encoding) = config.encoding {
-            encoding
-        } else {
-            self.default_cluster_transaction_encoding().await?
-        };
+        let encoding = config.encoding.unwrap_or(UiTransactionEncoding::Base64);
         let preflight_commitment = CommitmentConfig {
             commitment: config.preflight_commitment.unwrap_or_default(),
         };
-        let preflight_commitment = self.maybe_map_commitment(preflight_commitment).await?;
         let config = RpcSendTransactionConfig {
             encoding: Some(encoding),
             preflight_commitment: Some(preflight_commitment.commitment),
@@ -970,9 +981,9 @@ impl RpcClient {
                     code,
                     message,
                     data,
-                }) = &err.kind
+                }) = err.kind()
                 {
-                    debug!("{} {}", code, message);
+                    debug!("{code} {message}");
                     if let RpcResponseErrorData::SendTransactionPreflightFailure(
                         RpcSimulateTransactionResult {
                             logs: Some(logs), ..
@@ -1035,12 +1046,10 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signature::Signature,
-    /// #     signer::keypair::Keypair,
-    /// #     system_transaction,
-    /// # };
+    /// # use solana_keypair::Keypair;
+    /// # use solana_system_transaction as system_transaction;
+    /// # use solana_signature::Signature;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// // Transfer lamports from Alice to Bob and wait for confirmation
@@ -1094,13 +1103,11 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     commitment_config::CommitmentConfig,
-    /// #     signature::Signer,
-    /// #     signature::Signature,
-    /// #     signer::keypair::Keypair,
-    /// #     system_transaction,
-    /// # };
+    /// # use solana_commitment_config::CommitmentConfig;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signature::Signature;
+    /// # use solana_signer::Signer;
+    /// # use solana_system_transaction as system_transaction;
     /// # use std::time::Duration;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
@@ -1191,9 +1198,8 @@ impl RpcClient {
             }
         } else {
             return Err(RpcError::ForUser(
-                "unable to confirm transaction. \
-                                      This can happen in situations such as transaction expiration \
-                                      and insufficient fee-payer funds"
+                "unable to confirm transaction. This can happen in situations such as transaction \
+                 expiration and insufficient fee-payer funds"
                     .to_string(),
             )
             .into());
@@ -1224,22 +1230,13 @@ impl RpcClient {
                 .await
                 .unwrap_or(confirmations);
             if now.elapsed().as_secs() >= MAX_HASH_AGE_IN_SECONDS as u64 {
-                return Err(
-                    RpcError::ForUser("transaction not finalized. \
-                                      This can happen when a transaction lands in an abandoned fork. \
-                                      Please retry.".to_string()).into(),
-                );
+                return Err(RpcError::ForUser(
+                    "transaction not finalized. This can happen when a transaction lands in an \
+                     abandoned fork. Please retry."
+                        .to_string(),
+                )
+                .into());
             }
-        }
-    }
-
-    async fn default_cluster_transaction_encoding(
-        &self,
-    ) -> Result<UiTransactionEncoding, RpcError> {
-        if self.get_node_version().await? < semver::Version::new(1, 3, 16) {
-            Ok(UiTransactionEncoding::Base58)
-        } else {
-            Ok(UiTransactionEncoding::Base64)
         }
     }
 
@@ -1279,13 +1276,11 @@ impl RpcClient {
     /// #     response::RpcSimulateTransactionResult,
     /// # };
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signature::Signature,
-    /// #     signer::keypair::Keypair,
-    /// #     hash::Hash,
-    /// #     system_transaction,
-    /// # };
+    /// # use solana_hash::Hash;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_system_transaction as system_transaction;
+    /// # use solana_signature::Signature;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// // Transfer lamports from Alice to Bob
@@ -1354,18 +1349,16 @@ impl RpcClient {
     /// # Examples
     ///
     /// ```
+    /// # use solana_hash::Hash;
+    /// # use solana_keypair::Keypair;
     /// # use solana_rpc_client_api::{
     /// #     client_error::Error,
     /// #     config::RpcSimulateTransactionConfig,
     /// #     response::RpcSimulateTransactionResult,
     /// # };
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signer::keypair::Keypair,
-    /// #     hash::Hash,
-    /// #     system_transaction,
-    /// # };
+    /// # use solana_signer::Signer;
+    /// # use solana_system_transaction as system_transaction;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// // Transfer lamports from Alice to Bob
@@ -1392,13 +1385,8 @@ impl RpcClient {
         transaction: &impl SerializableTransaction,
         config: RpcSimulateTransactionConfig,
     ) -> RpcResult<RpcSimulateTransactionResult> {
-        let encoding = if let Some(encoding) = config.encoding {
-            encoding
-        } else {
-            self.default_cluster_transaction_encoding().await?
-        };
+        let encoding = config.encoding.unwrap_or(UiTransactionEncoding::Base64);
         let commitment = config.commitment.unwrap_or_default();
-        let commitment = self.maybe_map_commitment(commitment).await?;
         let config = RpcSimulateTransactionConfig {
             encoding: Some(encoding),
             commitment: Some(commitment),
@@ -1436,27 +1424,8 @@ impl RpcClient {
     /// # Ok::<(), Error>(())
     /// ```
     pub async fn get_highest_snapshot_slot(&self) -> ClientResult<RpcSnapshotSlotInfo> {
-        if self.get_node_version().await? < semver::Version::new(1, 9, 0) {
-            #[allow(deprecated)]
-            self.get_snapshot_slot()
-                .await
-                .map(|full| RpcSnapshotSlotInfo {
-                    full,
-                    incremental: None,
-                })
-        } else {
-            self.send(RpcRequest::GetHighestSnapshotSlot, Value::Null)
-                .await
-        }
-    }
-
-    #[deprecated(
-        since = "1.8.0",
-        note = "Please use RpcClient::get_highest_snapshot_slot() instead"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_snapshot_slot(&self) -> ClientResult<Slot> {
-        self.send(RpcRequest::GetSnapshotSlot, Value::Null).await
+        self.send(RpcRequest::GetHighestSnapshotSlot, Value::Null)
+            .await
     }
 
     /// Check if a transaction has been processed with the default [commitment level][cl].
@@ -1474,11 +1443,11 @@ impl RpcClient {
     /// and the transaction failed, this method returns `Ok(Some(Err(_)))`,
     /// where the interior error is type [`TransactionError`].
     ///
-    /// [`TransactionError`]: solana_sdk::transaction::TransactionError
+    /// [`TransactionError`]: solana_transaction_error::TransactionError
     ///
     /// This function only searches a node's recent history, including all
     /// recent slots, plus up to
-    /// [`MAX_RECENT_BLOCKHASHES`][solana_sdk::clock::MAX_RECENT_BLOCKHASHES]
+    /// [`MAX_RECENT_BLOCKHASHES`][solana_clock::MAX_RECENT_BLOCKHASHES]
     /// rooted slots. To search the full transaction history use the
     /// [`get_signature_status_with_commitment_and_history`][RpcClient::get_signature_status_with_commitment_and_history]
     /// method.
@@ -1494,13 +1463,11 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signature::Signature,
-    /// #     signer::keypair::Keypair,
-    /// #     hash::Hash,
-    /// #     system_transaction,
-    /// # };
+    /// # use solana_hash::Hash;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_system_transaction as system_transaction;
+    /// # use solana_signature::Signature;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -1517,7 +1484,7 @@ impl RpcClient {
     pub async fn get_signature_status(
         &self,
         signature: &Signature,
-    ) -> ClientResult<Option<transaction::Result<()>>> {
+    ) -> ClientResult<Option<TransactionResult<()>>> {
         self.get_signature_status_with_commitment(signature, self.commitment())
             .await
     }
@@ -1541,7 +1508,7 @@ impl RpcClient {
     ///
     /// This function only searches a node's recent history, including all
     /// recent slots, plus up to
-    /// [`MAX_RECENT_BLOCKHASHES`][solana_sdk::clock::MAX_RECENT_BLOCKHASHES]
+    /// [`MAX_RECENT_BLOCKHASHES`][solana_clock::MAX_RECENT_BLOCKHASHES]
     /// rooted slots. To search the full transaction history use the
     /// [`get_signature_statuses_with_history`][RpcClient::get_signature_statuses_with_history]
     /// method.
@@ -1563,13 +1530,11 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signature::Signature,
-    /// #     signer::keypair::Keypair,
-    /// #     hash::Hash,
-    /// #     system_transaction,
-    /// # };
+    /// # use solana_hash::Hash;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_system_transaction as system_transaction;
+    /// # use solana_signature::Signature;
+    /// # use solana_signer::Signer;
     /// # use std::time::Duration;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
@@ -1643,13 +1608,11 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signature::Signature,
-    /// #     signer::keypair::Keypair,
-    /// #     hash::Hash,
-    /// #     system_transaction,
-    /// # };
+    /// # use solana_hash::Hash;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_system_transaction as system_transaction;
+    /// # use solana_signature::Signature;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -1694,11 +1657,11 @@ impl RpcClient {
     /// and the transaction failed, this method returns `Ok(Some(Err(_)))`,
     /// where the interior error is type [`TransactionError`].
     ///
-    /// [`TransactionError`]: solana_sdk::transaction::TransactionError
+    /// [`TransactionError`]: solana_transaction_error::TransactionError
     ///
     /// This function only searches a node's recent history, including all
     /// recent slots, plus up to
-    /// [`MAX_RECENT_BLOCKHASHES`][solana_sdk::clock::MAX_RECENT_BLOCKHASHES]
+    /// [`MAX_RECENT_BLOCKHASHES`][solana_clock::MAX_RECENT_BLOCKHASHES]
     /// rooted slots. To search the full transaction history use the
     /// [`get_signature_status_with_commitment_and_history`][RpcClient::get_signature_status_with_commitment_and_history]
     /// method.
@@ -1714,13 +1677,11 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     commitment_config::CommitmentConfig,
-    /// #     signature::Signer,
-    /// #     signature::Signature,
-    /// #     signer::keypair::Keypair,
-    /// #     system_transaction,
-    /// # };
+    /// # use solana_commitment_config::CommitmentConfig;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signature::Signature;
+    /// # use solana_signer::Signer;
+    /// # use solana_system_transaction as system_transaction;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -1742,7 +1703,7 @@ impl RpcClient {
         &self,
         signature: &Signature,
         commitment_config: CommitmentConfig,
-    ) -> ClientResult<Option<transaction::Result<()>>> {
+    ) -> ClientResult<Option<TransactionResult<()>>> {
         let result: Response<Vec<Option<TransactionStatus>>> = self
             .send(
                 RpcRequest::GetSignatureStatuses,
@@ -1770,7 +1731,7 @@ impl RpcClient {
     /// and the transaction failed, this method returns `Ok(Some(Err(_)))`,
     /// where the interior error is type [`TransactionError`].
     ///
-    /// [`TransactionError`]: solana_sdk::transaction::TransactionError
+    /// [`TransactionError`]: solana_transaction_error::TransactionError
     ///
     /// This method optionally searches a node's full ledger history and (if
     /// implemented) long-term storage.
@@ -1786,13 +1747,11 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     commitment_config::CommitmentConfig,
-    /// #     signature::Signer,
-    /// #     signature::Signature,
-    /// #     signer::keypair::Keypair,
-    /// #     system_transaction,
-    /// # };
+    /// # use solana_commitment_config::CommitmentConfig;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signature::Signature;
+    /// # use solana_signer::Signer;
+    /// # use solana_system_transaction as system_transaction;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -1817,7 +1776,7 @@ impl RpcClient {
         signature: &Signature,
         commitment_config: CommitmentConfig,
         search_transaction_history: bool,
-    ) -> ClientResult<Option<transaction::Result<()>>> {
+    ) -> ClientResult<Option<TransactionResult<()>>> {
         let result: Response<Vec<Option<TransactionStatus>>> = self
             .send(
                 RpcRequest::GetSignatureStatuses,
@@ -1873,7 +1832,7 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// let commitment_config = CommitmentConfig::processed();
@@ -1886,11 +1845,8 @@ impl RpcClient {
         &self,
         commitment_config: CommitmentConfig,
     ) -> ClientResult<Slot> {
-        self.send(
-            RpcRequest::GetSlot,
-            json!([self.maybe_map_commitment(commitment_config).await?]),
-        )
-        .await
+        self.send(RpcRequest::GetSlot, json!([commitment_config]))
+            .await
     }
 
     /// Returns the block height that has reached the configured [commitment level][cl].
@@ -1935,7 +1891,7 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// let commitment_config = CommitmentConfig::processed();
@@ -1950,11 +1906,8 @@ impl RpcClient {
         &self,
         commitment_config: CommitmentConfig,
     ) -> ClientResult<u64> {
-        self.send(
-            RpcRequest::GetBlockHeight,
-            json!([self.maybe_map_commitment(commitment_config).await?]),
-        )
-        .await
+        self.send(RpcRequest::GetBlockHeight, json!([commitment_config]))
+            .await
     }
 
     /// Returns the slot leaders for a given slot range.
@@ -1970,7 +1923,7 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::slot_history::Slot;
+    /// # use solana_clock::Slot;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// let start_slot = 1;
@@ -2041,11 +1994,9 @@ impl RpcClient {
     /// #     config::RpcBlockProductionConfigRange,
     /// # };
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signer::keypair::Keypair,
-    /// #     commitment_config::CommitmentConfig,
-    /// # };
+    /// # use solana_commitment_config::CommitmentConfig;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let start_slot = 1;
@@ -2074,99 +2025,6 @@ impl RpcClient {
     ) -> RpcResult<RpcBlockProduction> {
         self.send(RpcRequest::GetBlockProduction, json!([config]))
             .await
-    }
-
-    /// Returns epoch activation information for a stake account.
-    ///
-    /// This method uses the configured [commitment level].
-    ///
-    /// [cl]: https://solana.com/docs/rpc#configuring-state-commitment
-    ///
-    /// # RPC Reference
-    ///
-    /// This method corresponds directly to the [`getStakeActivation`] RPC method.
-    ///
-    /// [`getStakeActivation`]: https://solana.com/docs/rpc/http/getstakeactivation
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use solana_rpc_client_api::{
-    /// #     client_error::Error,
-    /// #     response::StakeActivationState,
-    /// # };
-    /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signer::keypair::Keypair,
-    /// #     signature::Signer,
-    /// #     pubkey::Pubkey,
-    /// #     stake,
-    /// #     stake::state::{Authorized, Lockup},
-    /// #     transaction::Transaction
-    /// # };
-    /// # use std::str::FromStr;
-    /// # futures::executor::block_on(async {
-    /// #     let alice = Keypair::new();
-    /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
-    /// // Find some vote account to delegate to
-    /// let vote_accounts = rpc_client.get_vote_accounts().await?;
-    /// let vote_account = vote_accounts.current.get(0).unwrap_or_else(|| &vote_accounts.delinquent[0]);
-    /// let vote_account_pubkey = &vote_account.vote_pubkey;
-    /// let vote_account_pubkey = Pubkey::from_str(vote_account_pubkey).expect("pubkey");
-    ///
-    /// // Create a stake account
-    /// let stake_account = Keypair::new();
-    /// let stake_account_pubkey = stake_account.pubkey();
-    ///
-    /// // Build the instructions to create new stake account,
-    /// // funded by alice, and delegate to a validator's vote account.
-    /// let instrs = stake::instruction::create_account_and_delegate_stake(
-    ///     &alice.pubkey(),
-    ///     &stake_account_pubkey,
-    ///     &vote_account_pubkey,
-    ///     &Authorized::auto(&stake_account_pubkey),
-    ///     &Lockup::default(),
-    ///     1_000_000,
-    /// );
-    ///
-    /// let latest_blockhash = rpc_client.get_latest_blockhash().await?;
-    /// let tx = Transaction::new_signed_with_payer(
-    ///     &instrs,
-    ///     Some(&alice.pubkey()),
-    ///     &[&alice, &stake_account],
-    ///     latest_blockhash,
-    /// );
-    ///
-    /// rpc_client.send_and_confirm_transaction(&tx).await?;
-    ///
-    /// let epoch_info = rpc_client.get_epoch_info().await?;
-    /// let activation = rpc_client.get_stake_activation(
-    ///     stake_account_pubkey,
-    ///     Some(epoch_info.epoch),
-    /// ).await?;
-    ///
-    /// assert_eq!(activation.state, StakeActivationState::Activating);
-    /// #     Ok::<(), Error>(())
-    /// # })?;
-    /// # Ok::<(), Error>(())
-    /// ```
-    pub async fn get_stake_activation(
-        &self,
-        stake_account: Pubkey,
-        epoch: Option<Epoch>,
-    ) -> ClientResult<RpcStakeActivation> {
-        self.send(
-            RpcRequest::GetStakeActivation,
-            json!([
-                stake_account.to_string(),
-                RpcEpochConfig {
-                    epoch,
-                    commitment: Some(self.commitment()),
-                    min_context_slot: None,
-                }
-            ]),
-        )
-        .await
     }
 
     /// Returns information about the current supply.
@@ -2210,7 +2068,7 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// let commitment_config = CommitmentConfig::processed();
@@ -2225,11 +2083,8 @@ impl RpcClient {
         &self,
         commitment_config: CommitmentConfig,
     ) -> RpcResult<RpcSupply> {
-        self.send(
-            RpcRequest::GetSupply,
-            json!([self.maybe_map_commitment(commitment_config).await?]),
-        )
-        .await
+        self.send(RpcRequest::GetSupply, json!([commitment_config]))
+            .await
     }
 
     /// Returns the 20 largest accounts, by lamport balance.
@@ -2250,13 +2105,14 @@ impl RpcClient {
     /// #     config::RpcLargestAccountsFilter,
     /// # };
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// let commitment_config = CommitmentConfig::processed();
     /// let config = RpcLargestAccountsConfig {
     ///     commitment: Some(commitment_config),
     ///     filter: Some(RpcLargestAccountsFilter::Circulating),
+    ///     sort_results: None,
     /// };
     /// let accounts = rpc_client.get_largest_accounts_with_config(
     ///     config,
@@ -2270,7 +2126,6 @@ impl RpcClient {
         config: RpcLargestAccountsConfig,
     ) -> RpcResult<Vec<RpcAccountBalance>> {
         let commitment = config.commitment.unwrap_or_default();
-        let commitment = self.maybe_map_commitment(commitment).await?;
         let config = RpcLargestAccountsConfig {
             commitment: Some(commitment),
             ..config
@@ -2322,7 +2177,7 @@ impl RpcClient {
     /// # Examples
     ///
     /// ```
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
     /// # futures::executor::block_on(async {
@@ -2340,7 +2195,7 @@ impl RpcClient {
         commitment_config: CommitmentConfig,
     ) -> ClientResult<RpcVoteAccountStatus> {
         self.get_vote_accounts_with_config(RpcGetVoteAccountsConfig {
-            commitment: Some(self.maybe_map_commitment(commitment_config).await?),
+            commitment: Some(commitment_config),
             ..RpcGetVoteAccountsConfig::default()
         })
         .await
@@ -2365,11 +2220,9 @@ impl RpcClient {
     /// #     config::RpcGetVoteAccountsConfig,
     /// # };
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signer::keypair::Keypair,
-    /// #     signature::Signer,
-    /// #     commitment_config::CommitmentConfig,
-    /// # };
+    /// # use solana_commitment_config::CommitmentConfig;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let vote_keypair = Keypair::new();
@@ -2401,7 +2254,36 @@ impl RpcClient {
         commitment: CommitmentConfig,
         max_stake_percent: f32,
     ) -> ClientResult<()> {
+        self.wait_for_max_stake_below_threshold_with_timeout_helper(
+            commitment,
+            max_stake_percent,
+            None,
+        )
+        .await
+    }
+
+    pub async fn wait_for_max_stake_below_threshold_with_timeout(
+        &self,
+        commitment: CommitmentConfig,
+        max_stake_percent: f32,
+        timeout: Duration,
+    ) -> ClientResult<()> {
+        self.wait_for_max_stake_below_threshold_with_timeout_helper(
+            commitment,
+            max_stake_percent,
+            Some(timeout),
+        )
+        .await
+    }
+
+    async fn wait_for_max_stake_below_threshold_with_timeout_helper(
+        &self,
+        commitment: CommitmentConfig,
+        max_stake_percent: f32,
+        timeout: Option<Duration>,
+    ) -> ClientResult<()> {
         let mut current_percent;
+        let start = Instant::now();
         loop {
             let vote_accounts = self.get_vote_accounts_with_commitment(commitment).await?;
 
@@ -2418,12 +2300,19 @@ impl RpcClient {
             current_percent = 100f32 * max as f32 / total_active_stake as f32;
             if current_percent < max_stake_percent {
                 break;
+            } else if let Some(timeout) = timeout {
+                if start.elapsed() > timeout {
+                    return Err(ClientErrorKind::Custom(
+                        "timed out waiting for max stake to drop".to_string(),
+                    )
+                    .into());
+                }
             }
+
             info!(
-                "Waiting for stake to drop below {} current: {:.1}",
-                max_stake_percent, current_percent
+                "Waiting for stake to drop below {max_stake_percent} current: {current_percent:.1}"
             );
-            sleep(Duration::from_secs(10)).await;
+            sleep(Duration::from_secs(5)).await;
         }
         Ok(())
     }
@@ -2498,7 +2387,7 @@ impl RpcClient {
     /// # Examples
     ///
     /// ```
-    /// # use solana_transaction_status::UiTransactionEncoding;
+    /// # use solana_transaction_status_client_types::UiTransactionEncoding;
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
     /// # futures::executor::block_on(async {
@@ -2518,11 +2407,8 @@ impl RpcClient {
         slot: Slot,
         encoding: UiTransactionEncoding,
     ) -> ClientResult<EncodedConfirmedBlock> {
-        self.send(
-            self.maybe_map_request(RpcRequest::GetBlock).await?,
-            json!([slot, encoding]),
-        )
-        .await
+        self.send(RpcRequest::GetBlock, json!([slot, encoding]))
+            .await
     }
 
     /// Returns identity and transaction information about a confirmed block in the ledger.
@@ -2536,7 +2422,7 @@ impl RpcClient {
     /// # Examples
     ///
     /// ```
-    /// # use solana_transaction_status::{
+    /// # use solana_transaction_status_client_types::{
     /// #     TransactionDetails,
     /// #     UiTransactionEncoding,
     /// # };
@@ -2568,46 +2454,7 @@ impl RpcClient {
         slot: Slot,
         config: RpcBlockConfig,
     ) -> ClientResult<UiConfirmedBlock> {
-        self.send(
-            self.maybe_map_request(RpcRequest::GetBlock).await?,
-            json!([slot, config]),
-        )
-        .await
-    }
-
-    #[deprecated(since = "1.7.0", note = "Please use RpcClient::get_block() instead")]
-    #[allow(deprecated)]
-    pub async fn get_confirmed_block(&self, slot: Slot) -> ClientResult<EncodedConfirmedBlock> {
-        self.get_confirmed_block_with_encoding(slot, UiTransactionEncoding::Json)
-            .await
-    }
-
-    #[deprecated(
-        since = "1.7.0",
-        note = "Please use RpcClient::get_block_with_encoding() instead"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_confirmed_block_with_encoding(
-        &self,
-        slot: Slot,
-        encoding: UiTransactionEncoding,
-    ) -> ClientResult<EncodedConfirmedBlock> {
-        self.send(RpcRequest::GetConfirmedBlock, json!([slot, encoding]))
-            .await
-    }
-
-    #[deprecated(
-        since = "1.7.0",
-        note = "Please use RpcClient::get_block_with_config() instead"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_confirmed_block_with_config(
-        &self,
-        slot: Slot,
-        config: RpcConfirmedBlockConfig,
-    ) -> ClientResult<UiConfirmedBlock> {
-        self.send(RpcRequest::GetConfirmedBlock, json!([slot, config]))
-            .await
+        self.send(RpcRequest::GetBlock, json!([slot, config])).await
     }
 
     /// Returns a list of finalized blocks between two slots.
@@ -2634,12 +2481,9 @@ impl RpcClient {
     ///
     /// # RPC Reference
     ///
-    /// This method corresponds directly to the [`getBlocks`] RPC method, unless
-    /// the remote node version is less than 1.7, in which case it maps to the
-    /// [`getConfirmedBlocks`] RPC method.
+    /// This method corresponds directly to the [`getBlocks`] RPC method.
     ///
     /// [`getBlocks`]: https://solana.com/docs/rpc/http/getblocks
-    /// [`getConfirmedBlocks`]: https://solana.com/docs/rpc/deprecated/getconfirmedblocks
     ///
     /// # Examples
     ///
@@ -2661,11 +2505,8 @@ impl RpcClient {
         start_slot: Slot,
         end_slot: Option<Slot>,
     ) -> ClientResult<Vec<Slot>> {
-        self.send(
-            self.maybe_map_request(RpcRequest::GetBlocks).await?,
-            json!([start_slot, end_slot]),
-        )
-        .await
+        self.send(RpcRequest::GetBlocks, json!([start_slot, end_slot]))
+            .await
     }
 
     /// Returns a list of confirmed blocks between two slots.
@@ -2696,17 +2537,14 @@ impl RpcClient {
     ///
     /// # RPC Reference
     ///
-    /// This method corresponds directly to the [`getBlocks`] RPC method, unless
-    /// the remote node version is less than 1.7, in which case it maps to the
-    /// [`getConfirmedBlocks`] RPC method.
+    /// This method corresponds directly to the [`getBlocks`] RPC method.
     ///
     /// [`getBlocks`]: https://solana.com/docs/rpc/http/getblocks
-    /// [`getConfirmedBlocks`]: https://solana.com/docs/rpc/deprecated/getconfirmedblocks
     ///
     /// # Examples
     ///
     /// ```
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
     /// # futures::executor::block_on(async {
@@ -2732,19 +2570,11 @@ impl RpcClient {
         commitment_config: CommitmentConfig,
     ) -> ClientResult<Vec<Slot>> {
         let json = if end_slot.is_some() {
-            json!([
-                start_slot,
-                end_slot,
-                self.maybe_map_commitment(commitment_config).await?
-            ])
+            json!([start_slot, end_slot, commitment_config])
         } else {
-            json!([
-                start_slot,
-                self.maybe_map_commitment(commitment_config).await?
-            ])
+            json!([start_slot, commitment_config])
         };
-        self.send(self.maybe_map_request(RpcRequest::GetBlocks).await?, json)
-            .await
+        self.send(RpcRequest::GetBlocks, json).await
     }
 
     /// Returns a list of finalized blocks starting at the given slot.
@@ -2761,11 +2591,9 @@ impl RpcClient {
     /// # RPC Reference
     ///
     /// This method corresponds directly to the [`getBlocksWithLimit`] RPC
-    /// method, unless the remote node version is less than 1.7, in which case
-    /// it maps to the [`getConfirmedBlocksWithLimit`] RPC method.
+    /// method.
     ///
     /// [`getBlocksWithLimit`]: https://solana.com/docs/rpc/http/getblockswithlimit
-    /// [`getConfirmedBlocksWithLimit`]: https://solana.com/docs/rpc/deprecated/getconfirmedblockswithlimit
     ///
     /// # Examples
     ///
@@ -2787,12 +2615,8 @@ impl RpcClient {
         start_slot: Slot,
         limit: usize,
     ) -> ClientResult<Vec<Slot>> {
-        self.send(
-            self.maybe_map_request(RpcRequest::GetBlocksWithLimit)
-                .await?,
-            json!([start_slot, limit]),
-        )
-        .await
+        self.send(RpcRequest::GetBlocksWithLimit, json!([start_slot, limit]))
+            .await
     }
 
     /// Returns a list of confirmed blocks starting at the given slot.
@@ -2810,16 +2634,14 @@ impl RpcClient {
     /// # RPC Reference
     ///
     /// This method corresponds directly to the [`getBlocksWithLimit`] RPC
-    /// method, unless the remote node version is less than 1.7, in which case
-    /// it maps to the `getConfirmedBlocksWithLimit` RPC method.
+    /// method.
     ///
     /// [`getBlocksWithLimit`]: https://solana.com/docs/rpc/http/getblockswithlimit
-    /// [`getConfirmedBlocksWithLimit`]: https://solana.com/docs/rpc/deprecated/getconfirmedblockswithlimit
     ///
     /// # Examples
     ///
     /// ```
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
     /// # futures::executor::block_on(async {
@@ -2844,92 +2666,8 @@ impl RpcClient {
         commitment_config: CommitmentConfig,
     ) -> ClientResult<Vec<Slot>> {
         self.send(
-            self.maybe_map_request(RpcRequest::GetBlocksWithLimit)
-                .await?,
-            json!([
-                start_slot,
-                limit,
-                self.maybe_map_commitment(commitment_config).await?
-            ]),
-        )
-        .await
-    }
-
-    #[deprecated(since = "1.7.0", note = "Please use RpcClient::get_blocks() instead")]
-    #[allow(deprecated)]
-    pub async fn get_confirmed_blocks(
-        &self,
-        start_slot: Slot,
-        end_slot: Option<Slot>,
-    ) -> ClientResult<Vec<Slot>> {
-        self.send(
-            RpcRequest::GetConfirmedBlocks,
-            json!([start_slot, end_slot]),
-        )
-        .await
-    }
-
-    #[deprecated(
-        since = "1.7.0",
-        note = "Please use RpcClient::get_blocks_with_commitment() instead"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_confirmed_blocks_with_commitment(
-        &self,
-        start_slot: Slot,
-        end_slot: Option<Slot>,
-        commitment_config: CommitmentConfig,
-    ) -> ClientResult<Vec<Slot>> {
-        let json = if end_slot.is_some() {
-            json!([
-                start_slot,
-                end_slot,
-                self.maybe_map_commitment(commitment_config).await?
-            ])
-        } else {
-            json!([
-                start_slot,
-                self.maybe_map_commitment(commitment_config).await?
-            ])
-        };
-        self.send(RpcRequest::GetConfirmedBlocks, json).await
-    }
-
-    #[deprecated(
-        since = "1.7.0",
-        note = "Please use RpcClient::get_blocks_with_limit() instead"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_confirmed_blocks_with_limit(
-        &self,
-        start_slot: Slot,
-        limit: usize,
-    ) -> ClientResult<Vec<Slot>> {
-        self.send(
-            RpcRequest::GetConfirmedBlocksWithLimit,
-            json!([start_slot, limit]),
-        )
-        .await
-    }
-
-    #[deprecated(
-        since = "1.7.0",
-        note = "Please use RpcClient::get_blocks_with_limit_and_commitment() instead"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_confirmed_blocks_with_limit_and_commitment(
-        &self,
-        start_slot: Slot,
-        limit: usize,
-        commitment_config: CommitmentConfig,
-    ) -> ClientResult<Vec<Slot>> {
-        self.send(
-            RpcRequest::GetConfirmedBlocksWithLimit,
-            json!([
-                start_slot,
-                limit,
-                self.maybe_map_commitment(commitment_config).await?
-            ]),
+            RpcRequest::GetBlocksWithLimit,
+            json!([start_slot, limit, commitment_config]),
         )
         .await
     }
@@ -2955,11 +2693,9 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signer::keypair::Keypair,
-    /// #     system_transaction,
-    /// # };
+    /// # use solana_keypair::Keypair;
+    /// # use solana_system_transaction as system_transaction;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -3006,12 +2742,10 @@ impl RpcClient {
     /// #     nonblocking::rpc_client::RpcClient,
     /// #     rpc_client::GetConfirmedSignaturesForAddress2Config,
     /// # };
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signer::keypair::Keypair,
-    /// #     system_transaction,
-    /// #     commitment_config::CommitmentConfig,
-    /// # };
+    /// # use solana_commitment_config::CommitmentConfig;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_system_transaction as system_transaction;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -3049,51 +2783,7 @@ impl RpcClient {
 
         let result: Vec<RpcConfirmedTransactionStatusWithSignature> = self
             .send(
-                self.maybe_map_request(RpcRequest::GetSignaturesForAddress)
-                    .await?,
-                json!([address.to_string(), config]),
-            )
-            .await?;
-
-        Ok(result)
-    }
-
-    #[deprecated(
-        since = "1.7.0",
-        note = "Please use RpcClient::get_signatures_for_address() instead"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_confirmed_signatures_for_address2(
-        &self,
-        address: &Pubkey,
-    ) -> ClientResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
-        self.get_confirmed_signatures_for_address2_with_config(
-            address,
-            GetConfirmedSignaturesForAddress2Config::default(),
-        )
-        .await
-    }
-
-    #[deprecated(
-        since = "1.7.0",
-        note = "Please use RpcClient::get_signatures_for_address_with_config() instead"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_confirmed_signatures_for_address2_with_config(
-        &self,
-        address: &Pubkey,
-        config: GetConfirmedSignaturesForAddress2Config,
-    ) -> ClientResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
-        let config = RpcGetConfirmedSignaturesForAddress2Config {
-            before: config.before.map(|signature| signature.to_string()),
-            until: config.until.map(|signature| signature.to_string()),
-            limit: config.limit,
-            commitment: config.commitment,
-        };
-
-        let result: Vec<RpcConfirmedTransactionStatusWithSignature> = self
-            .send(
-                RpcRequest::GetConfirmedSignaturesForAddress2,
+                RpcRequest::GetSignaturesForAddress,
                 json!([address.to_string(), config]),
             )
             .await?;
@@ -3110,25 +2800,20 @@ impl RpcClient {
     ///
     /// # RPC Reference
     ///
-    /// This method corresponds directly to the [`getTransaction`] RPC method,
-    /// unless the remote node version is less than 1.7, in which case it maps
-    /// to the [`getConfirmedTransaction`] RPC method.
+    /// This method corresponds directly to the [`getTransaction`] RPC method.
     ///
     /// [`getTransaction`]: https://solana.com/docs/rpc/http/gettransaction
-    /// [`getConfirmedTransaction`]: https://solana.com/docs/rpc/deprecated/getConfirmedTransaction
     ///
     /// # Examples
     ///
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signature::Signature,
-    /// #     signer::keypair::Keypair,
-    /// #     system_transaction,
-    /// # };
-    /// # use solana_transaction_status::UiTransactionEncoding;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_system_transaction as system_transaction;
+    /// # use solana_signature::Signature;
+    /// # use solana_signer::Signer;
+    /// # use solana_transaction_status_client_types::UiTransactionEncoding;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -3151,7 +2836,7 @@ impl RpcClient {
         encoding: UiTransactionEncoding,
     ) -> ClientResult<EncodedConfirmedTransactionWithStatusMeta> {
         self.send(
-            self.maybe_map_request(RpcRequest::GetTransaction).await?,
+            RpcRequest::GetTransaction,
             json!([signature.to_string(), encoding]),
         )
         .await
@@ -3169,12 +2854,9 @@ impl RpcClient {
     ///
     /// # RPC Reference
     ///
-    /// This method corresponds directly to the [`getTransaction`] RPC method,
-    /// unless the remote node version is less than 1.7, in which case it maps
-    /// to the [`getConfirmedTransaction`] RPC method.
+    /// This method corresponds directly to the [`getTransaction`] RPC method.
     ///
     /// [`getTransaction`]: https://solana.com/docs/rpc/http/gettransaction
-    /// [`getConfirmedTransaction`]: https://solana.com/docs/rpc/deprecated/getConfirmedTransaction
     ///
     /// # Examples
     ///
@@ -3184,14 +2866,12 @@ impl RpcClient {
     /// #     config::RpcTransactionConfig,
     /// # };
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signature::Signature,
-    /// #     signer::keypair::Keypair,
-    /// #     system_transaction,
-    /// #     commitment_config::CommitmentConfig,
-    /// # };
-    /// # use solana_transaction_status::UiTransactionEncoding;
+    /// # use solana_commitment_config::CommitmentConfig;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_system_transaction as system_transaction;
+    /// # use solana_signature::Signature;
+    /// # use solana_signer::Signer;
+    /// # use solana_transaction_status_client_types::UiTransactionEncoding;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -3219,41 +2899,7 @@ impl RpcClient {
         config: RpcTransactionConfig,
     ) -> ClientResult<EncodedConfirmedTransactionWithStatusMeta> {
         self.send(
-            self.maybe_map_request(RpcRequest::GetTransaction).await?,
-            json!([signature.to_string(), config]),
-        )
-        .await
-    }
-
-    #[deprecated(
-        since = "1.7.0",
-        note = "Please use RpcClient::get_transaction() instead"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_confirmed_transaction(
-        &self,
-        signature: &Signature,
-        encoding: UiTransactionEncoding,
-    ) -> ClientResult<EncodedConfirmedTransactionWithStatusMeta> {
-        self.send(
-            RpcRequest::GetConfirmedTransaction,
-            json!([signature.to_string(), encoding]),
-        )
-        .await
-    }
-
-    #[deprecated(
-        since = "1.7.0",
-        note = "Please use RpcClient::get_transaction_with_config() instead"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_confirmed_transaction_with_config(
-        &self,
-        signature: &Signature,
-        config: RpcConfirmedTransactionConfig,
-    ) -> ClientResult<EncodedConfirmedTransactionWithStatusMeta> {
-        self.send(
-            RpcRequest::GetConfirmedTransaction,
+            RpcRequest::GetTransaction,
             json!([signature.to_string(), config]),
         )
         .await
@@ -3292,7 +2938,7 @@ impl RpcClient {
                 }
                 let result = serde_json::from_value(result_json)
                     .map_err(|err| ClientError::new_with_request(err.into(), request))?;
-                trace!("Response block timestamp {:?} {:?}", slot, result);
+                trace!("Response block timestamp {slot:?} {result:?}");
                 Ok(result)
             })
             .map_err(|err| err.into_with_request(request))?
@@ -3339,7 +2985,7 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// let commitment_config = CommitmentConfig::confirmed();
@@ -3354,11 +3000,8 @@ impl RpcClient {
         &self,
         commitment_config: CommitmentConfig,
     ) -> ClientResult<EpochInfo> {
-        self.send(
-            RpcRequest::GetEpochInfo,
-            json!([self.maybe_map_commitment(commitment_config).await?]),
-        )
-        .await
+        self.send(RpcRequest::GetEpochInfo, json!([commitment_config]))
+            .await
     }
 
     /// Returns the leader schedule for an epoch.
@@ -3378,7 +3021,7 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let slot = rpc_client.get_slot().await?;
@@ -3410,7 +3053,7 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let slot = rpc_client.get_slot().await?;
@@ -3431,7 +3074,7 @@ impl RpcClient {
         self.get_leader_schedule_with_config(
             slot,
             RpcLeaderScheduleConfig {
-                commitment: Some(self.maybe_map_commitment(commitment_config).await?),
+                commitment: Some(commitment_config),
                 ..RpcLeaderScheduleConfig::default()
             },
         )
@@ -3454,7 +3097,7 @@ impl RpcClient {
     /// #     config::RpcLeaderScheduleConfig,
     /// # };
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let slot = rpc_client.get_slot().await?;
@@ -3556,7 +3199,8 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::signature::{Keypair, Signer};
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -3684,7 +3328,8 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::signature::{Keypair, Signer};
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let epoch_info = rpc_client.get_epoch_info().await?;
@@ -3736,7 +3381,8 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::signature::{Keypair, Signer};
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// let expected_version = semver::Version::new(1, 7, 0);
@@ -3808,11 +3454,9 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::{self, RpcClient};
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signer::keypair::Keypair,
-    /// #     pubkey::Pubkey,
-    /// # };
+    /// # use solana_keypair::Keypair;
+    /// # use solana_pubkey::Pubkey;
+    /// # use solana_signer::Signer;
     /// # use std::str::FromStr;
     /// # futures::executor::block_on(async {
     /// #     let mocks = rpc_client::create_rpc_client_mocks();
@@ -3849,12 +3493,10 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::{self, RpcClient};
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signer::keypair::Keypair,
-    /// #     pubkey::Pubkey,
-    /// #     commitment_config::CommitmentConfig,
-    /// # };
+    /// # use solana_commitment_config::CommitmentConfig;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signer::Signer;
+    /// # use solana_pubkey::Pubkey;
     /// # use std::str::FromStr;
     /// # futures::executor::block_on(async {
     /// #     let mocks = rpc_client::create_rpc_client_mocks();
@@ -3877,68 +3519,34 @@ impl RpcClient {
     ) -> RpcResult<Option<Account>> {
         let config = RpcAccountInfoConfig {
             encoding: Some(UiAccountEncoding::Base64Zstd),
-            commitment: Some(self.maybe_map_commitment(commitment_config).await?),
+            commitment: Some(commitment_config),
             data_slice: None,
             min_context_slot: None,
         };
 
-        self.get_account_with_config(pubkey, config).await
+        self.get_ui_account_with_config(pubkey, config)
+            .await
+            .map(|response| Response {
+                context: response.context,
+                value: response.value.map(|ui_account| {
+                    ui_account.decode().expect(
+                        "It should be impossible at this point for the account data not to be \
+                         decodable. Ensure that the account was fetched using a binary encoding.",
+                    )
+                }),
+            })
     }
 
-    /// Returns all information associated with the account of the provided pubkey.
-    ///
-    /// If the account does not exist, this method returns `Ok(None)`.
-    ///
-    /// To get multiple accounts at once, use the [`get_multiple_accounts_with_config`] method.
-    ///
-    /// [`get_multiple_accounts_with_config`]: RpcClient::get_multiple_accounts_with_config
-    ///
-    /// # RPC Reference
-    ///
-    /// This method is built on the [`getAccountInfo`] RPC method.
-    ///
-    /// [`getAccountInfo`]: https://solana.com/docs/rpc/http/getaccountinfo
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use solana_rpc_client_api::{
-    /// #     config::RpcAccountInfoConfig,
-    /// #     client_error::Error,
-    /// # };
-    /// # use solana_rpc_client::nonblocking::rpc_client::{self, RpcClient};
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signer::keypair::Keypair,
-    /// #     pubkey::Pubkey,
-    /// #     commitment_config::CommitmentConfig,
-    /// # };
-    /// # use solana_account_decoder::UiAccountEncoding;
-    /// # use std::str::FromStr;
-    /// # futures::executor::block_on(async {
-    /// #     let mocks = rpc_client::create_rpc_client_mocks();
-    /// #     let rpc_client = RpcClient::new_mock_with_mocks("succeeds".to_string(), mocks);
-    /// let alice_pubkey = Pubkey::from_str("BgvYtJEfmZYdVKiptmMjxGzv8iQoo4MWjsP3QsTkhhxa").unwrap();
-    /// let commitment_config = CommitmentConfig::processed();
-    /// let config = RpcAccountInfoConfig {
-    ///     encoding: Some(UiAccountEncoding::Base64),
-    ///     commitment: Some(commitment_config),
-    ///     .. RpcAccountInfoConfig::default()
-    /// };
-    /// let account = rpc_client.get_account_with_config(
-    ///     &alice_pubkey,
-    ///     config,
-    /// ).await?;
-    /// assert!(account.value.is_some());
-    /// #     Ok::<(), Error>(())
-    /// # })?;
-    /// # Ok::<(), Error>(())
-    /// ```
+    #[deprecated(
+        note = "Use `get_ui_account_with_config()` instead. This function will be removed in a \
+                future version of `solana_rpc_client`."
+    )]
     pub async fn get_account_with_config(
         &self,
         pubkey: &Pubkey,
         config: RpcAccountInfoConfig,
     ) -> RpcResult<Option<Account>> {
+        #[allow(deprecated)]
         let response = self
             .send(
                 RpcRequest::GetAccountInfo,
@@ -3957,12 +3565,95 @@ impl RpcClient {
                     context,
                     value: rpc_account,
                 } = serde_json::from_value::<Response<Option<UiAccount>>>(result_json)?;
-                trace!("Response account {:?} {:?}", pubkey, rpc_account);
+                trace!("Response account {pubkey:?} {rpc_account:?}");
                 let account = rpc_account.and_then(|rpc_account| rpc_account.decode());
 
                 Ok(Response {
                     context,
                     value: account,
+                })
+            })
+            .map_err(|err| {
+                Into::<ClientError>::into(RpcError::ForUser(format!(
+                    "AccountNotFound: pubkey={pubkey}: {err}"
+                )))
+            })?
+    }
+
+    /// Returns all information associated with the account of the provided pubkey.
+    ///
+    /// If the account does not exist, this method returns `Ok(None)`.
+    ///
+    /// To get multiple accounts at once, use the [`get_multiple_ui_accounts_with_config`] method.
+    ///
+    /// [`get_multiple_ui_accounts_with_config`]: RpcClient::get_multiple_ui_accounts_with_config
+    ///
+    /// # RPC Reference
+    ///
+    /// This method is built on the [`getAccountInfo`] RPC method.
+    ///
+    /// [`getAccountInfo`]: https://solana.com/docs/rpc/http/getaccountinfo
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use solana_rpc_client_api::{
+    /// #     config::RpcAccountInfoConfig,
+    /// #     client_error::Error,
+    /// # };
+    /// # use solana_rpc_client::nonblocking::rpc_client::{self, RpcClient};
+    /// # use solana_commitment_config::CommitmentConfig;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signer::Signer;
+    /// # use solana_pubkey::Pubkey;
+    /// # use solana_account_decoder_client_types::UiAccountEncoding;
+    /// # use std::str::FromStr;
+    /// # futures::executor::block_on(async {
+    /// #     let mocks = rpc_client::create_rpc_client_mocks();
+    /// #     let rpc_client = RpcClient::new_mock_with_mocks("succeeds".to_string(), mocks);
+    /// let alice_pubkey = Pubkey::from_str("BgvYtJEfmZYdVKiptmMjxGzv8iQoo4MWjsP3QsTkhhxa").unwrap();
+    /// let commitment_config = CommitmentConfig::processed();
+    /// let config = RpcAccountInfoConfig {
+    ///     encoding: Some(UiAccountEncoding::Base64),
+    ///     commitment: Some(commitment_config),
+    ///     .. RpcAccountInfoConfig::default()
+    /// };
+    /// let ui_account = rpc_client.get_ui_account_with_config(
+    ///     &alice_pubkey,
+    ///     config,
+    /// ).await?;
+    /// assert!(ui_account.value.is_some());
+    /// #     Ok::<(), Error>(())
+    /// # })?;
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub async fn get_ui_account_with_config(
+        &self,
+        pubkey: &Pubkey,
+        config: RpcAccountInfoConfig,
+    ) -> RpcResult<Option<UiAccount>> {
+        let response = self
+            .send(
+                RpcRequest::GetAccountInfo,
+                json!([pubkey.to_string(), config]),
+            )
+            .await;
+
+        response
+            .map(|result_json: Value| {
+                if result_json.is_null() {
+                    return Err(
+                        RpcError::ForUser(format!("AccountNotFound: pubkey={pubkey}")).into(),
+                    );
+                }
+                let Response {
+                    context,
+                    value: ui_account,
+                } = serde_json::from_value::<Response<Option<UiAccount>>>(result_json)?;
+                trace!("Response account {pubkey:?} {ui_account:?}");
+                Ok(Response {
+                    context,
+                    value: ui_account,
                 })
             })
             .map_err(|err| {
@@ -4039,10 +3730,8 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signer::keypair::Keypair,
-    /// # };
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -4076,11 +3765,9 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signer::keypair::Keypair,
-    /// #     commitment_config::CommitmentConfig,
-    /// # };
+    /// # use solana_commitment_config::CommitmentConfig;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -4100,16 +3787,66 @@ impl RpcClient {
         pubkeys: &[Pubkey],
         commitment_config: CommitmentConfig,
     ) -> RpcResult<Vec<Option<Account>>> {
-        self.get_multiple_accounts_with_config(
+        self.get_multiple_ui_accounts_with_config(
             pubkeys,
             RpcAccountInfoConfig {
                 encoding: Some(UiAccountEncoding::Base64Zstd),
-                commitment: Some(self.maybe_map_commitment(commitment_config).await?),
+                commitment: Some(commitment_config),
                 data_slice: None,
                 min_context_slot: None,
             },
         )
         .await
+        .map(|response| Response {
+            context: response.context,
+            value: response
+                .value
+                .into_iter()
+                .map(|ui_account| {
+                    ui_account.map(|ui_account| {
+                        ui_account.decode().expect(
+                            "It should be impossible at this point for the account data not to be \
+                             decodable. Ensure that the account was fetched using a binary \
+                             encoding.",
+                        )
+                    })
+                })
+                .collect(),
+        })
+    }
+
+    #[deprecated(
+        note = "Use `get_multiple_ui_accounts_with_config()` instead. This function will be \
+                removed in a future version of `solana_rpc_client`."
+    )]
+    pub async fn get_multiple_accounts_with_config(
+        &self,
+        pubkeys: &[Pubkey],
+        config: RpcAccountInfoConfig,
+    ) -> RpcResult<Vec<Option<Account>>> {
+        #[allow(deprecated)]
+        {
+            let config = RpcAccountInfoConfig {
+                commitment: config.commitment.or_else(|| Some(self.commitment())),
+                ..config
+            };
+            let pubkeys: Vec<_> = pubkeys.iter().map(|pubkey| pubkey.to_string()).collect();
+            let response = self
+                .send(RpcRequest::GetMultipleAccounts, json!([pubkeys, config]))
+                .await?;
+            let Response {
+                context,
+                value: accounts,
+            } = serde_json::from_value::<Response<Vec<Option<UiAccount>>>>(response)?;
+            let accounts: Vec<Option<Account>> = accounts
+                .into_iter()
+                .map(|rpc_account| rpc_account.and_then(|a| a.decode()))
+                .collect();
+            Ok(Response {
+                context,
+                value: accounts,
+            })
+        }
     }
 
     /// Returns the account information for a list of pubkeys.
@@ -4128,12 +3865,10 @@ impl RpcClient {
     /// #     client_error::Error,
     /// # };
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signer::keypair::Keypair,
-    /// #     commitment_config::CommitmentConfig,
-    /// # };
-    /// # use solana_account_decoder::UiAccountEncoding;
+    /// # use solana_commitment_config::CommitmentConfig;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signer::Signer;
+    /// # use solana_account_decoder_client_types::UiAccountEncoding;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -4145,7 +3880,7 @@ impl RpcClient {
     ///     commitment: Some(commitment_config),
     ///     .. RpcAccountInfoConfig::default()
     /// };
-    /// let accounts = rpc_client.get_multiple_accounts_with_config(
+    /// let ui_accounts = rpc_client.get_multiple_ui_accounts_with_config(
     ///     &pubkeys,
     ///     config,
     /// ).await?;
@@ -4153,11 +3888,11 @@ impl RpcClient {
     /// # })?;
     /// # Ok::<(), Error>(())
     /// ```
-    pub async fn get_multiple_accounts_with_config(
+    pub async fn get_multiple_ui_accounts_with_config(
         &self,
         pubkeys: &[Pubkey],
         config: RpcAccountInfoConfig,
-    ) -> RpcResult<Vec<Option<Account>>> {
+    ) -> RpcResult<Vec<Option<UiAccount>>> {
         let config = RpcAccountInfoConfig {
             commitment: config.commitment.or_else(|| Some(self.commitment())),
             ..config
@@ -4168,15 +3903,11 @@ impl RpcClient {
             .await?;
         let Response {
             context,
-            value: accounts,
+            value: ui_accounts,
         } = serde_json::from_value::<Response<Vec<Option<UiAccount>>>>(response)?;
-        let accounts: Vec<Option<Account>> = accounts
-            .into_iter()
-            .map(|rpc_account| rpc_account.and_then(|a| a.decode()))
-            .collect();
         Ok(Response {
             context,
-            value: accounts,
+            value: ui_accounts,
         })
     }
 
@@ -4199,11 +3930,9 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::{self, RpcClient};
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signer::keypair::Keypair,
-    /// #     pubkey::Pubkey,
-    /// # };
+    /// # use solana_keypair::Keypair;
+    /// # use solana_pubkey::Pubkey;
+    /// # use solana_signer::Signer;
     /// # use std::str::FromStr;
     /// # futures::executor::block_on(async {
     /// #     let mocks = rpc_client::create_rpc_client_mocks();
@@ -4252,11 +3981,7 @@ impl RpcClient {
 
         let minimum_balance: u64 = serde_json::from_value(minimum_balance_json)
             .map_err(|err| ClientError::new_with_request(err.into(), request))?;
-        trace!(
-            "Response minimum balance {:?} {:?}",
-            data_len,
-            minimum_balance
-        );
+        trace!("Response minimum balance {data_len:?} {minimum_balance:?}");
         Ok(minimum_balance)
     }
 
@@ -4277,10 +4002,8 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signer::keypair::Keypair,
-    /// # };
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -4309,11 +4032,9 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signer::keypair::Keypair,
-    /// #     commitment_config::CommitmentConfig,
-    /// # };
+    /// # use solana_commitment_config::CommitmentConfig;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -4333,10 +4054,7 @@ impl RpcClient {
     ) -> RpcResult<u64> {
         self.send(
             RpcRequest::GetBalance,
-            json!([
-                pubkey.to_string(),
-                self.maybe_map_commitment(commitment_config).await?
-            ]),
+            json!([pubkey.to_string(), commitment_config]),
         )
         .await
     }
@@ -4359,10 +4077,8 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signer::keypair::Keypair,
-    /// # };
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signer::Signer;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -4375,7 +4091,7 @@ impl RpcClient {
         &self,
         pubkey: &Pubkey,
     ) -> ClientResult<Vec<(Pubkey, Account)>> {
-        self.get_program_accounts_with_config(
+        self.get_program_ui_accounts_with_config(
             pubkey,
             RpcProgramAccountsConfig {
                 account_config: RpcAccountInfoConfig {
@@ -4386,6 +4102,49 @@ impl RpcClient {
             },
         )
         .await
+        .map(|response| {
+            response
+                .into_iter()
+                .map(|(pubkey, ui_account)| {
+                    (
+                        pubkey,
+                        ui_account.decode().expect(
+                            "It should be impossible at this point for the account data not to be \
+                             decodable. Ensure that the account was fetched using a binary \
+                             encoding.",
+                        ),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    #[deprecated(
+        note = "Use `get_program_ui_accounts_with_config()` instead. This function will be \
+                removed in a future version of `solana_rpc_client`."
+    )]
+    pub async fn get_program_accounts_with_config(
+        &self,
+        pubkey: &Pubkey,
+        mut config: RpcProgramAccountsConfig,
+    ) -> ClientResult<Vec<(Pubkey, Account)>> {
+        #[allow(deprecated)]
+        {
+            let commitment = config
+                .account_config
+                .commitment
+                .unwrap_or_else(|| self.commitment());
+            config.account_config.commitment = Some(commitment);
+
+            let accounts = self
+                .send::<OptionalContext<Vec<RpcKeyedAccount>>>(
+                    RpcRequest::GetProgramAccounts,
+                    json!([pubkey.to_string(), config]),
+                )
+                .await?
+                .parse_value();
+            parse_keyed_accounts(accounts, RpcRequest::GetProgramAccounts)
+        }
     }
 
     /// Returns all accounts owned by the provided program pubkey.
@@ -4405,12 +4164,10 @@ impl RpcClient {
     /// #     filter::{MemcmpEncodedBytes, RpcFilterType, Memcmp},
     /// # };
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::{
-    /// #     signature::Signer,
-    /// #     signer::keypair::Keypair,
-    /// #     commitment_config::CommitmentConfig,
-    /// # };
-    /// # use solana_account_decoder::{UiDataSliceConfig, UiAccountEncoding};
+    /// # use solana_commitment_config::CommitmentConfig;
+    /// # use solana_keypair::Keypair;
+    /// # use solana_signer::Signer;
+    /// # use solana_account_decoder_client_types::{UiDataSliceConfig, UiAccountEncoding};
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// #     let alice = Keypair::new();
@@ -4437,8 +4194,9 @@ impl RpcClient {
     ///         min_context_slot: Some(1234),
     ///     },
     ///     with_context: Some(false),
+    ///     sort_results: Some(true),
     /// };
-    /// let accounts = rpc_client.get_program_accounts_with_config(
+    /// let ui_accounts = rpc_client.get_program_ui_accounts_with_config(
     ///     &alice.pubkey(),
     ///     config,
     /// ).await?;
@@ -4446,20 +4204,16 @@ impl RpcClient {
     /// # })?;
     /// # Ok::<(), Error>(())
     /// ```
-    pub async fn get_program_accounts_with_config(
+    pub async fn get_program_ui_accounts_with_config(
         &self,
         pubkey: &Pubkey,
         mut config: RpcProgramAccountsConfig,
-    ) -> ClientResult<Vec<(Pubkey, Account)>> {
+    ) -> ClientResult<Vec<(Pubkey, UiAccount)>> {
         let commitment = config
             .account_config
             .commitment
             .unwrap_or_else(|| self.commitment());
-        let commitment = self.maybe_map_commitment(commitment).await?;
         config.account_config.commitment = Some(commitment);
-        if let Some(filters) = config.filters {
-            config.filters = Some(self.maybe_map_filters(filters).await?);
-        }
 
         let accounts = self
             .send::<OptionalContext<Vec<RpcKeyedAccount>>>(
@@ -4468,7 +4222,10 @@ impl RpcClient {
             )
             .await?
             .parse_value();
-        parse_keyed_accounts(accounts, RpcRequest::GetProgramAccounts)
+        pubkey_ui_account_client_result_from_keyed_accounts(
+            accounts,
+            RpcRequest::GetProgramAccounts,
+        )
     }
 
     /// Returns the stake minimum delegation, in lamports.
@@ -4509,7 +4266,7 @@ impl RpcClient {
     /// ```
     /// # use solana_rpc_client_api::client_error::Error;
     /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-    /// # use solana_sdk::commitment_config::CommitmentConfig;
+    /// # use solana_commitment_config::CommitmentConfig;
     /// # futures::executor::block_on(async {
     /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
     /// let stake_minimum_delegation = rpc_client.get_stake_minimum_delegation_with_commitment(CommitmentConfig::confirmed()).await?;
@@ -4524,7 +4281,7 @@ impl RpcClient {
         Ok(self
             .send::<Response<u64>>(
                 RpcRequest::GetStakeMinimumDelegation,
-                json!([self.maybe_map_commitment(commitment_config).await?]),
+                json!([commitment_config]),
             )
             .await?
             .value)
@@ -4540,233 +4297,8 @@ impl RpcClient {
         &self,
         commitment_config: CommitmentConfig,
     ) -> ClientResult<u64> {
-        self.send(
-            RpcRequest::GetTransactionCount,
-            json!([self.maybe_map_commitment(commitment_config).await?]),
-        )
-        .await
-    }
-
-    #[deprecated(
-        since = "1.9.0",
-        note = "Please use `get_latest_blockhash` and `get_fee_for_message` instead"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_fees(&self) -> ClientResult<Fees> {
-        #[allow(deprecated)]
-        Ok(self
-            .get_fees_with_commitment(self.commitment())
-            .await?
-            .value)
-    }
-
-    #[deprecated(
-        since = "1.9.0",
-        note = "Please use `get_latest_blockhash_with_commitment` and `get_fee_for_message` instead"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_fees_with_commitment(
-        &self,
-        commitment_config: CommitmentConfig,
-    ) -> RpcResult<Fees> {
-        let Response {
-            context,
-            value: fees,
-        } = self
-            .send::<Response<RpcFees>>(
-                RpcRequest::GetFees,
-                json!([self.maybe_map_commitment(commitment_config).await?]),
-            )
-            .await?;
-        let blockhash = fees.blockhash.parse().map_err(|_| {
-            ClientError::new_with_request(
-                RpcError::ParseError("Hash".to_string()).into(),
-                RpcRequest::GetFees,
-            )
-        })?;
-        Ok(Response {
-            context,
-            value: Fees {
-                blockhash,
-                fee_calculator: fees.fee_calculator,
-                last_valid_block_height: fees.last_valid_block_height,
-            },
-        })
-    }
-
-    #[deprecated(since = "1.9.0", note = "Please use `get_latest_blockhash` instead")]
-    #[allow(deprecated)]
-    pub async fn get_recent_blockhash(&self) -> ClientResult<(Hash, FeeCalculator)> {
-        #[allow(deprecated)]
-        let (blockhash, fee_calculator, _last_valid_slot) = self
-            .get_recent_blockhash_with_commitment(self.commitment())
-            .await?
-            .value;
-        Ok((blockhash, fee_calculator))
-    }
-
-    #[deprecated(
-        since = "1.9.0",
-        note = "Please use `get_latest_blockhash_with_commitment` instead"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_recent_blockhash_with_commitment(
-        &self,
-        commitment_config: CommitmentConfig,
-    ) -> RpcResult<(Hash, FeeCalculator, Slot)> {
-        let (context, blockhash, fee_calculator, last_valid_slot) = if let Ok(Response {
-            context,
-            value:
-                RpcFees {
-                    blockhash,
-                    fee_calculator,
-                    last_valid_slot,
-                    ..
-                },
-        }) = self
-            .send::<Response<RpcFees>>(
-                RpcRequest::GetFees,
-                json!([self.maybe_map_commitment(commitment_config).await?]),
-            )
+        self.send(RpcRequest::GetTransactionCount, json!([commitment_config]))
             .await
-        {
-            (context, blockhash, fee_calculator, last_valid_slot)
-        } else if let Ok(Response {
-            context,
-            value:
-                DeprecatedRpcFees {
-                    blockhash,
-                    fee_calculator,
-                    last_valid_slot,
-                },
-        }) = self
-            .send::<Response<DeprecatedRpcFees>>(
-                RpcRequest::GetFees,
-                json!([self.maybe_map_commitment(commitment_config).await?]),
-            )
-            .await
-        {
-            (context, blockhash, fee_calculator, last_valid_slot)
-        } else if let Ok(Response {
-            context,
-            value:
-                RpcBlockhashFeeCalculator {
-                    blockhash,
-                    fee_calculator,
-                },
-        }) = self
-            .send::<Response<RpcBlockhashFeeCalculator>>(
-                RpcRequest::GetRecentBlockhash,
-                json!([self.maybe_map_commitment(commitment_config).await?]),
-            )
-            .await
-        {
-            (context, blockhash, fee_calculator, 0)
-        } else {
-            return Err(ClientError::new_with_request(
-                RpcError::ParseError("RpcBlockhashFeeCalculator or RpcFees".to_string()).into(),
-                RpcRequest::GetRecentBlockhash,
-            ));
-        };
-
-        let blockhash = blockhash.parse().map_err(|_| {
-            ClientError::new_with_request(
-                RpcError::ParseError("Hash".to_string()).into(),
-                RpcRequest::GetRecentBlockhash,
-            )
-        })?;
-        Ok(Response {
-            context,
-            value: (blockhash, fee_calculator, last_valid_slot),
-        })
-    }
-
-    #[deprecated(since = "1.9.0", note = "Please `get_fee_for_message` instead")]
-    #[allow(deprecated)]
-    pub async fn get_fee_calculator_for_blockhash(
-        &self,
-        blockhash: &Hash,
-    ) -> ClientResult<Option<FeeCalculator>> {
-        #[allow(deprecated)]
-        Ok(self
-            .get_fee_calculator_for_blockhash_with_commitment(blockhash, self.commitment())
-            .await?
-            .value)
-    }
-
-    #[deprecated(
-        since = "1.9.0",
-        note = "Please `get_latest_blockhash_with_commitment` and `get_fee_for_message` instead"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_fee_calculator_for_blockhash_with_commitment(
-        &self,
-        blockhash: &Hash,
-        commitment_config: CommitmentConfig,
-    ) -> RpcResult<Option<FeeCalculator>> {
-        let Response { context, value } = self
-            .send::<Response<Option<RpcFeeCalculator>>>(
-                RpcRequest::GetFeeCalculatorForBlockhash,
-                json!([
-                    blockhash.to_string(),
-                    self.maybe_map_commitment(commitment_config).await?
-                ]),
-            )
-            .await?;
-
-        Ok(Response {
-            context,
-            value: value.map(|rf| rf.fee_calculator),
-        })
-    }
-
-    #[deprecated(
-        since = "1.9.0",
-        note = "Please do not use, will no longer be available in the future"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_fee_rate_governor(&self) -> RpcResult<FeeRateGovernor> {
-        let Response {
-            context,
-            value: RpcFeeRateGovernor { fee_rate_governor },
-        } = self
-            .send::<Response<RpcFeeRateGovernor>>(RpcRequest::GetFeeRateGovernor, Value::Null)
-            .await?;
-
-        Ok(Response {
-            context,
-            value: fee_rate_governor,
-        })
-    }
-
-    #[deprecated(
-        since = "1.9.0",
-        note = "Please do not use, will no longer be available in the future"
-    )]
-    #[allow(deprecated)]
-    pub async fn get_new_blockhash(&self, blockhash: &Hash) -> ClientResult<(Hash, FeeCalculator)> {
-        let mut num_retries = 0;
-        let start = Instant::now();
-        while start.elapsed().as_secs() < 5 {
-            #[allow(deprecated)]
-            if let Ok((new_blockhash, fee_calculator)) = self.get_recent_blockhash().await {
-                if new_blockhash != *blockhash {
-                    return Ok((new_blockhash, fee_calculator));
-                }
-            }
-            debug!("Got same blockhash ({:?}), will retry...", blockhash);
-
-            // Retry ~twice during a slot
-            sleep(Duration::from_millis(DEFAULT_MS_PER_SLOT / 2)).await;
-            num_retries += 1;
-        }
-        Err(RpcError::ForUser(format!(
-            "Unable to get new blockhash after {}ms (retried {} times), stuck at {}",
-            start.elapsed().as_millis(),
-            num_retries,
-            blockhash
-        ))
-        .into())
     }
 
     pub async fn get_first_available_block(&self) -> ClientResult<Slot> {
@@ -4805,7 +4337,7 @@ impl RpcClient {
     ) -> RpcResult<Option<UiTokenAccount>> {
         let config = RpcAccountInfoConfig {
             encoding: Some(UiAccountEncoding::JsonParsed),
-            commitment: Some(self.maybe_map_commitment(commitment_config).await?),
+            commitment: Some(commitment_config),
             data_slice: None,
             min_context_slot: None,
         };
@@ -4827,7 +4359,7 @@ impl RpcClient {
                     context,
                     value: rpc_account,
                 } = serde_json::from_value::<Response<Option<UiAccount>>>(result_json)?;
-                trace!("Response account {:?} {:?}", pubkey, rpc_account);
+                trace!("Response account {pubkey:?} {rpc_account:?}");
                 let response = {
                     if let Some(rpc_account) = rpc_account {
                         if let UiAccountData::Json(account_data) = rpc_account.data {
@@ -4868,10 +4400,7 @@ impl RpcClient {
     ) -> RpcResult<UiTokenAmount> {
         self.send(
             RpcRequest::GetTokenAccountBalance,
-            json!([
-                pubkey.to_string(),
-                self.maybe_map_commitment(commitment_config).await?
-            ]),
+            json!([pubkey.to_string(), commitment_config]),
         )
         .await
     }
@@ -4906,7 +4435,7 @@ impl RpcClient {
 
         let config = RpcAccountInfoConfig {
             encoding: Some(UiAccountEncoding::JsonParsed),
-            commitment: Some(self.maybe_map_commitment(commitment_config).await?),
+            commitment: Some(commitment_config),
             data_slice: None,
             min_context_slot: None,
         };
@@ -4948,7 +4477,7 @@ impl RpcClient {
 
         let config = RpcAccountInfoConfig {
             encoding: Some(UiAccountEncoding::JsonParsed),
-            commitment: Some(self.maybe_map_commitment(commitment_config).await?),
+            commitment: Some(commitment_config),
             data_slice: None,
             min_context_slot: None,
         };
@@ -4977,10 +4506,7 @@ impl RpcClient {
     ) -> RpcResult<Vec<RpcTokenAccountBalance>> {
         self.send(
             RpcRequest::GetTokenLargestAccounts,
-            json!([
-                mint.to_string(),
-                self.maybe_map_commitment(commitment_config).await?
-            ]),
+            json!([mint.to_string(), commitment_config]),
         )
         .await
     }
@@ -4999,10 +4525,7 @@ impl RpcClient {
     ) -> RpcResult<UiTokenAmount> {
         self.send(
             RpcRequest::GetTokenSupply,
-            json!([
-                mint.to_string(),
-                self.maybe_map_commitment(commitment_config).await?
-            ]),
+            json!([mint.to_string(), commitment_config]),
         )
         .await
     }
@@ -5043,7 +4566,6 @@ impl RpcClient {
         config: RpcRequestAirdropConfig,
     ) -> ClientResult<Signature> {
         let commitment = config.commitment.unwrap_or_default();
-        let commitment = self.maybe_map_commitment(commitment).await?;
         let config = RpcRequestAirdropConfig {
             commitment: Some(commitment),
             ..config
@@ -5060,8 +4582,7 @@ impl RpcClient {
         })
         .map_err(|_| {
             RpcError::ForUser(
-                "airdrop request failed. \
-                    This can happen when the rate limit is reached."
+                "airdrop request failed. This can happen when the rate limit is reached."
                     .to_string(),
             )
             .into()
@@ -5124,10 +4645,7 @@ impl RpcClient {
                 return balance_result;
             }
             trace!(
-                "wait_for_balance_with_commitment [{}] {:?} {:?}",
-                run,
-                balance_result,
-                expected_balance
+                "wait_for_balance_with_commitment [{run}] {balance_result:?} {expected_balance:?}"
             );
             if let (Some(expected_balance), Ok(balance_result)) = (expected_balance, balance_result)
             {
@@ -5201,7 +4719,7 @@ impl RpcClient {
                     }
                 }
                 Err(err) => {
-                    debug!("check_confirmations request failed: {:?}", err);
+                    debug!("check_confirmations request failed: {err:?}");
                 }
             };
             if now.elapsed().as_secs() > 20 {
@@ -5258,69 +4776,46 @@ impl RpcClient {
         Ok(blockhash)
     }
 
-    #[allow(deprecated)]
     pub async fn get_latest_blockhash_with_commitment(
         &self,
         commitment: CommitmentConfig,
     ) -> ClientResult<(Hash, u64)> {
-        let (blockhash, last_valid_block_height) =
-            if self.get_node_version().await? < semver::Version::new(1, 9, 0) {
-                let Fees {
-                    blockhash,
-                    last_valid_block_height,
-                    ..
-                } = self.get_fees_with_commitment(commitment).await?.value;
-                (blockhash, last_valid_block_height)
-            } else {
-                let RpcBlockhash {
-                    blockhash,
-                    last_valid_block_height,
-                } = self
-                    .send::<Response<RpcBlockhash>>(
-                        RpcRequest::GetLatestBlockhash,
-                        json!([self.maybe_map_commitment(commitment).await?]),
-                    )
-                    .await?
-                    .value;
-                let blockhash = blockhash.parse().map_err(|_| {
-                    ClientError::new_with_request(
-                        RpcError::ParseError("Hash".to_string()).into(),
-                        RpcRequest::GetLatestBlockhash,
-                    )
-                })?;
-                (blockhash, last_valid_block_height)
-            };
+        let RpcBlockhash {
+            blockhash,
+            last_valid_block_height,
+        } = self
+            .send::<Response<RpcBlockhash>>(RpcRequest::GetLatestBlockhash, json!([commitment]))
+            .await?
+            .value;
+        let blockhash = blockhash.parse().map_err(|_| {
+            ClientError::new_with_request(
+                RpcError::ParseError("Hash".to_string()).into(),
+                RpcRequest::GetLatestBlockhash,
+            )
+        })?;
         Ok((blockhash, last_valid_block_height))
     }
 
-    #[allow(deprecated)]
     pub async fn is_blockhash_valid(
         &self,
         blockhash: &Hash,
         commitment: CommitmentConfig,
     ) -> ClientResult<bool> {
-        let result = if self.get_node_version().await? < semver::Version::new(1, 9, 0) {
-            self.get_fee_calculator_for_blockhash_with_commitment(blockhash, commitment)
-                .await?
-                .value
-                .is_some()
-        } else {
-            self.send::<Response<bool>>(
+        Ok(self
+            .send::<Response<bool>>(
                 RpcRequest::IsBlockhashValid,
                 json!([blockhash.to_string(), commitment,]),
             )
             .await?
-            .value
-        };
-        Ok(result)
+            .value)
     }
 
-    #[allow(deprecated)]
     pub async fn get_fee_for_message(
         &self,
         message: &impl SerializableMessage,
     ) -> ClientResult<u64> {
-        let serialized_encoded = serialize_and_encode(message, UiTransactionEncoding::Base64)?;
+        let serialized = message.serialize();
+        let serialized_encoded = BASE64_STANDARD.encode(serialized);
         let result = self
             .send::<Response<Option<u64>>>(
                 RpcRequest::GetFeeForMessage,
@@ -5341,7 +4836,7 @@ impl RpcClient {
                     return Ok(new_blockhash);
                 }
             }
-            debug!("Got same blockhash ({:?}), will retry...", blockhash);
+            debug!("Got same blockhash ({blockhash:?}), will retry...");
 
             // Retry ~twice during a slot
             sleep(Duration::from_millis(DEFAULT_MS_PER_SLOT / 2)).await;
@@ -5403,6 +4898,10 @@ pub(crate) fn get_rpc_request_str(rpc_addr: SocketAddr, tls: bool) -> String {
     }
 }
 
+#[deprecated(
+    note = "Parsing accounts whose data is of type `UiAccountData::Json` will yield `None` when \
+            it should not. Do not use this function."
+)]
 pub(crate) fn parse_keyed_accounts(
     accounts: Vec<RpcKeyedAccount>,
     request: RpcRequest,
@@ -5428,9 +4927,26 @@ pub(crate) fn parse_keyed_accounts(
     Ok(pubkey_accounts)
 }
 
+fn pubkey_ui_account_client_result_from_keyed_accounts(
+    accounts: Vec<RpcKeyedAccount>,
+    request: RpcRequest,
+) -> ClientResult<Vec<(Pubkey, UiAccount)>> {
+    let mut pubkey_ui_accounts: Vec<(Pubkey, UiAccount)> = Vec::with_capacity(accounts.len());
+    for RpcKeyedAccount { account, pubkey } in accounts.iter() {
+        let pubkey = pubkey.parse().map_err(|_| {
+            ClientError::new_with_request(
+                RpcError::ParseError("Pubkey".to_string()).into(),
+                request,
+            )
+        })?;
+        pubkey_ui_accounts.push((pubkey, account.clone()));
+    }
+    Ok(pubkey_ui_accounts)
+}
+
 #[doc(hidden)]
 pub fn create_rpc_client_mocks() -> crate::mock_sender::Mocks {
-    let mut mocks = std::collections::HashMap::new();
+    let mut mocks = crate::mock_sender::Mocks::default();
 
     let get_account_request = RpcRequest::GetAccountInfo;
     let get_account_response = serde_json::to_value(Response {
@@ -5440,14 +4956,7 @@ pub fn create_rpc_client_mocks() -> crate::mock_sender::Mocks {
         },
         value: {
             let pubkey = Pubkey::from_str("BgvYtJEfmZYdVKiptmMjxGzv8iQoo4MWjsP3QsTkhhxa").unwrap();
-            let account = Account {
-                lamports: 1_000_000,
-                data: vec![],
-                owner: pubkey,
-                executable: false,
-                rent_epoch: 0,
-            };
-            UiAccount::encode(&pubkey, &account, UiAccountEncoding::Base64, None, None)
+            mock_encoded_account(&pubkey)
         },
     })
     .unwrap();

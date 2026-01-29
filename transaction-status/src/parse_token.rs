@@ -3,25 +3,26 @@ use {
         check_num_accounts, ParsableProgram, ParseInstructionError, ParsedInstructionEnum,
     },
     extension::{
-        confidential_transfer::*, confidential_transfer_fee::*, cpi_guard::*,
-        default_account_state::*, group_member_pointer::*, group_pointer::*,
+        confidential_mint_burn::*, confidential_transfer::*, confidential_transfer_fee::*,
+        cpi_guard::*, default_account_state::*, group_member_pointer::*, group_pointer::*,
         interest_bearing_mint::*, memo_transfer::*, metadata_pointer::*, mint_close_authority::*,
-        permanent_delegate::*, reallocate::*, transfer_fee::*, transfer_hook::*,
+        pausable::*, permanent_delegate::*, reallocate::*, scaled_ui_amount::*, token_group::*,
+        token_metadata::*, transfer_fee::*, transfer_hook::*,
     },
+    serde::{Deserialize, Serialize},
     serde_json::{json, Map, Value},
-    solana_account_decoder::parse_token::{token_amount_to_ui_amount, UiAccountState},
-    solana_sdk::{
-        instruction::{AccountMeta, CompiledInstruction, Instruction},
-        message::AccountKeys,
+    solana_account_decoder::{
+        parse_account_data::SplTokenAdditionalDataV2, parse_token::token_amount_to_ui_amount_v3,
     },
-    spl_token_2022::{
+    solana_message::{compiled_instruction::CompiledInstruction, AccountKeys},
+    solana_program_option::COption,
+    solana_pubkey::Pubkey,
+    spl_token_2022_interface::{
         extension::ExtensionType,
         instruction::{AuthorityType, TokenInstruction},
-        solana_program::{
-            instruction::Instruction as SplTokenInstruction, program_option::COption,
-            pubkey::Pubkey,
-        },
     },
+    spl_token_group_interface::instruction::TokenGroupInstruction,
+    spl_token_metadata_interface::instruction::TokenMetadataInstruction,
 };
 
 mod extension;
@@ -30,8 +31,6 @@ pub fn parse_token(
     instruction: &CompiledInstruction,
     account_keys: &AccountKeys,
 ) -> Result<ParsedInstructionEnum, ParseInstructionError> {
-    let token_instruction = TokenInstruction::unpack(&instruction.data)
-        .map_err(|_| ParseInstructionError::InstructionNotParsable(ParsableProgram::SplToken))?;
     match instruction.accounts.iter().max() {
         Some(index) if (*index as usize) < account_keys.len() => {}
         _ => {
@@ -41,641 +40,688 @@ pub fn parse_token(
             ));
         }
     }
-    match token_instruction {
-        TokenInstruction::InitializeMint {
-            decimals,
-            mint_authority,
-            freeze_authority,
-        } => {
-            check_num_token_accounts(&instruction.accounts, 2)?;
-            let mut value = json!({
-                "mint": account_keys[instruction.accounts[0] as usize].to_string(),
-                "decimals": decimals,
-                "mintAuthority": mint_authority.to_string(),
-                "rentSysvar": account_keys[instruction.accounts[1] as usize].to_string(),
-            });
-            let map = value.as_object_mut().unwrap();
-            if let COption::Some(freeze_authority) = freeze_authority {
-                map.insert(
-                    "freezeAuthority".to_string(),
-                    json!(freeze_authority.to_string()),
-                );
-            }
-            Ok(ParsedInstructionEnum {
-                instruction_type: "initializeMint".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::InitializeMint2 {
-            decimals,
-            mint_authority,
-            freeze_authority,
-        } => {
-            check_num_token_accounts(&instruction.accounts, 1)?;
-            let mut value = json!({
-                "mint": account_keys[instruction.accounts[0] as usize].to_string(),
-                "decimals": decimals,
-                "mintAuthority": mint_authority.to_string(),
-            });
-            let map = value.as_object_mut().unwrap();
-            if let COption::Some(freeze_authority) = freeze_authority {
-                map.insert(
-                    "freezeAuthority".to_string(),
-                    json!(freeze_authority.to_string()),
-                );
-            }
-            Ok(ParsedInstructionEnum {
-                instruction_type: "initializeMint2".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::InitializeAccount => {
-            check_num_token_accounts(&instruction.accounts, 4)?;
-            Ok(ParsedInstructionEnum {
-                instruction_type: "initializeAccount".to_string(),
-                info: json!({
-                    "account": account_keys[instruction.accounts[0] as usize].to_string(),
-                    "mint": account_keys[instruction.accounts[1] as usize].to_string(),
-                    "owner": account_keys[instruction.accounts[2] as usize].to_string(),
-                    "rentSysvar": account_keys[instruction.accounts[3] as usize].to_string(),
-                }),
-            })
-        }
-        TokenInstruction::InitializeAccount2 { owner } => {
-            check_num_token_accounts(&instruction.accounts, 3)?;
-            Ok(ParsedInstructionEnum {
-                instruction_type: "initializeAccount2".to_string(),
-                info: json!({
-                    "account": account_keys[instruction.accounts[0] as usize].to_string(),
-                    "mint": account_keys[instruction.accounts[1] as usize].to_string(),
-                    "owner": owner.to_string(),
-                    "rentSysvar": account_keys[instruction.accounts[2] as usize].to_string(),
-                }),
-            })
-        }
-        TokenInstruction::InitializeAccount3 { owner } => {
-            check_num_token_accounts(&instruction.accounts, 2)?;
-            Ok(ParsedInstructionEnum {
-                instruction_type: "initializeAccount3".to_string(),
-                info: json!({
-                    "account": account_keys[instruction.accounts[0] as usize].to_string(),
-                    "mint": account_keys[instruction.accounts[1] as usize].to_string(),
-                    "owner": owner.to_string(),
-                }),
-            })
-        }
-        TokenInstruction::InitializeMultisig { m } => {
-            check_num_token_accounts(&instruction.accounts, 3)?;
-            let mut signers: Vec<String> = vec![];
-            for i in instruction.accounts[2..].iter() {
-                signers.push(account_keys[*i as usize].to_string());
-            }
-            Ok(ParsedInstructionEnum {
-                instruction_type: "initializeMultisig".to_string(),
-                info: json!({
-                    "multisig": account_keys[instruction.accounts[0] as usize].to_string(),
+    if let Ok(token_instruction) = TokenInstruction::unpack(&instruction.data) {
+        match token_instruction {
+            TokenInstruction::InitializeMint {
+                decimals,
+                mint_authority,
+                freeze_authority,
+            } => {
+                check_num_token_accounts(&instruction.accounts, 2)?;
+                let mut value = json!({
+                    "mint": account_keys[instruction.accounts[0] as usize].to_string(),
+                    "decimals": decimals,
+                    "mintAuthority": mint_authority.to_string(),
                     "rentSysvar": account_keys[instruction.accounts[1] as usize].to_string(),
-                    "signers": signers,
-                    "m": m,
-                }),
-            })
-        }
-        TokenInstruction::InitializeMultisig2 { m } => {
-            check_num_token_accounts(&instruction.accounts, 2)?;
-            let mut signers: Vec<String> = vec![];
-            for i in instruction.accounts[1..].iter() {
-                signers.push(account_keys[*i as usize].to_string());
+                });
+                let map = value.as_object_mut().unwrap();
+                if let COption::Some(freeze_authority) = freeze_authority {
+                    map.insert(
+                        "freezeAuthority".to_string(),
+                        json!(freeze_authority.to_string()),
+                    );
+                }
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "initializeMint".to_string(),
+                    info: value,
+                })
             }
-            Ok(ParsedInstructionEnum {
-                instruction_type: "initializeMultisig2".to_string(),
-                info: json!({
-                    "multisig": account_keys[instruction.accounts[0] as usize].to_string(),
-                    "signers": signers,
-                    "m": m,
-                }),
-            })
-        }
-        #[allow(deprecated)]
-        TokenInstruction::Transfer { amount } => {
-            check_num_token_accounts(&instruction.accounts, 3)?;
-            let mut value = json!({
-                "source": account_keys[instruction.accounts[0] as usize].to_string(),
-                "destination": account_keys[instruction.accounts[1] as usize].to_string(),
-                "amount": amount.to_string(),
-            });
-            let map = value.as_object_mut().unwrap();
-            parse_signers(
-                map,
-                2,
-                account_keys,
-                &instruction.accounts,
-                "authority",
-                "multisigAuthority",
-            );
-            Ok(ParsedInstructionEnum {
-                instruction_type: "transfer".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::Approve { amount } => {
-            check_num_token_accounts(&instruction.accounts, 3)?;
-            let mut value = json!({
-                "source": account_keys[instruction.accounts[0] as usize].to_string(),
-                "delegate": account_keys[instruction.accounts[1] as usize].to_string(),
-                "amount": amount.to_string(),
-            });
-            let map = value.as_object_mut().unwrap();
-            parse_signers(
-                map,
-                2,
-                account_keys,
-                &instruction.accounts,
-                "owner",
-                "multisigOwner",
-            );
-            Ok(ParsedInstructionEnum {
-                instruction_type: "approve".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::Revoke => {
-            check_num_token_accounts(&instruction.accounts, 2)?;
-            let mut value = json!({
-                "source": account_keys[instruction.accounts[0] as usize].to_string(),
-            });
-            let map = value.as_object_mut().unwrap();
-            parse_signers(
-                map,
-                1,
-                account_keys,
-                &instruction.accounts,
-                "owner",
-                "multisigOwner",
-            );
-            Ok(ParsedInstructionEnum {
-                instruction_type: "revoke".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::SetAuthority {
-            authority_type,
-            new_authority,
-        } => {
-            check_num_token_accounts(&instruction.accounts, 2)?;
-            let owned = match authority_type {
-                AuthorityType::MintTokens
-                | AuthorityType::FreezeAccount
-                | AuthorityType::TransferFeeConfig
-                | AuthorityType::WithheldWithdraw
-                | AuthorityType::CloseMint
-                | AuthorityType::InterestRate
-                | AuthorityType::PermanentDelegate
-                | AuthorityType::ConfidentialTransferMint
-                | AuthorityType::TransferHookProgramId
-                | AuthorityType::ConfidentialTransferFeeConfig
-                | AuthorityType::MetadataPointer
-                | AuthorityType::GroupPointer
-                | AuthorityType::GroupMemberPointer => "mint",
-                AuthorityType::AccountOwner | AuthorityType::CloseAccount => "account",
-            };
-            let mut value = json!({
-                owned: account_keys[instruction.accounts[0] as usize].to_string(),
-                "authorityType": Into::<UiAuthorityType>::into(authority_type),
-                "newAuthority": map_coption_pubkey(new_authority),
-            });
-            let map = value.as_object_mut().unwrap();
-            parse_signers(
-                map,
-                1,
-                account_keys,
-                &instruction.accounts,
-                "authority",
-                "multisigAuthority",
-            );
-            Ok(ParsedInstructionEnum {
-                instruction_type: "setAuthority".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::MintTo { amount } => {
-            check_num_token_accounts(&instruction.accounts, 3)?;
-            let mut value = json!({
-                "mint": account_keys[instruction.accounts[0] as usize].to_string(),
-                "account": account_keys[instruction.accounts[1] as usize].to_string(),
-                "amount": amount.to_string(),
-            });
-            let map = value.as_object_mut().unwrap();
-            parse_signers(
-                map,
-                2,
-                account_keys,
-                &instruction.accounts,
-                "mintAuthority",
-                "multisigMintAuthority",
-            );
-            Ok(ParsedInstructionEnum {
-                instruction_type: "mintTo".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::Burn { amount } => {
-            check_num_token_accounts(&instruction.accounts, 3)?;
-            let mut value = json!({
-                "account": account_keys[instruction.accounts[0] as usize].to_string(),
-                "mint": account_keys[instruction.accounts[1] as usize].to_string(),
-                "amount": amount.to_string(),
-            });
-            let map = value.as_object_mut().unwrap();
-            parse_signers(
-                map,
-                2,
-                account_keys,
-                &instruction.accounts,
-                "authority",
-                "multisigAuthority",
-            );
-            Ok(ParsedInstructionEnum {
-                instruction_type: "burn".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::CloseAccount => {
-            check_num_token_accounts(&instruction.accounts, 3)?;
-            let mut value = json!({
-                "account": account_keys[instruction.accounts[0] as usize].to_string(),
-                "destination": account_keys[instruction.accounts[1] as usize].to_string(),
-            });
-            let map = value.as_object_mut().unwrap();
-            parse_signers(
-                map,
-                2,
-                account_keys,
-                &instruction.accounts,
-                "owner",
-                "multisigOwner",
-            );
-            Ok(ParsedInstructionEnum {
-                instruction_type: "closeAccount".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::FreezeAccount => {
-            check_num_token_accounts(&instruction.accounts, 3)?;
-            let mut value = json!({
-                "account": account_keys[instruction.accounts[0] as usize].to_string(),
-                "mint": account_keys[instruction.accounts[1] as usize].to_string(),
-            });
-            let map = value.as_object_mut().unwrap();
-            parse_signers(
-                map,
-                2,
-                account_keys,
-                &instruction.accounts,
-                "freezeAuthority",
-                "multisigFreezeAuthority",
-            );
-            Ok(ParsedInstructionEnum {
-                instruction_type: "freezeAccount".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::ThawAccount => {
-            check_num_token_accounts(&instruction.accounts, 3)?;
-            let mut value = json!({
-                "account": account_keys[instruction.accounts[0] as usize].to_string(),
-                "mint": account_keys[instruction.accounts[1] as usize].to_string(),
-            });
-            let map = value.as_object_mut().unwrap();
-            parse_signers(
-                map,
-                2,
-                account_keys,
-                &instruction.accounts,
-                "freezeAuthority",
-                "multisigFreezeAuthority",
-            );
-            Ok(ParsedInstructionEnum {
-                instruction_type: "thawAccount".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::TransferChecked { amount, decimals } => {
-            check_num_token_accounts(&instruction.accounts, 4)?;
-            let mut value = json!({
-                "source": account_keys[instruction.accounts[0] as usize].to_string(),
-                "mint": account_keys[instruction.accounts[1] as usize].to_string(),
-                "destination": account_keys[instruction.accounts[2] as usize].to_string(),
-                "tokenAmount": token_amount_to_ui_amount(amount, decimals),
-            });
-            let map = value.as_object_mut().unwrap();
-            parse_signers(
-                map,
-                3,
-                account_keys,
-                &instruction.accounts,
-                "authority",
-                "multisigAuthority",
-            );
-            Ok(ParsedInstructionEnum {
-                instruction_type: "transferChecked".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::ApproveChecked { amount, decimals } => {
-            check_num_token_accounts(&instruction.accounts, 4)?;
-            let mut value = json!({
-                "source": account_keys[instruction.accounts[0] as usize].to_string(),
-                "mint": account_keys[instruction.accounts[1] as usize].to_string(),
-                "delegate": account_keys[instruction.accounts[2] as usize].to_string(),
-                "tokenAmount": token_amount_to_ui_amount(amount, decimals),
-            });
-            let map = value.as_object_mut().unwrap();
-            parse_signers(
-                map,
-                3,
-                account_keys,
-                &instruction.accounts,
-                "owner",
-                "multisigOwner",
-            );
-            Ok(ParsedInstructionEnum {
-                instruction_type: "approveChecked".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::MintToChecked { amount, decimals } => {
-            check_num_token_accounts(&instruction.accounts, 3)?;
-            let mut value = json!({
-                "mint": account_keys[instruction.accounts[0] as usize].to_string(),
-                "account": account_keys[instruction.accounts[1] as usize].to_string(),
-                "tokenAmount": token_amount_to_ui_amount(amount, decimals),
-            });
-            let map = value.as_object_mut().unwrap();
-            parse_signers(
-                map,
-                2,
-                account_keys,
-                &instruction.accounts,
-                "mintAuthority",
-                "multisigMintAuthority",
-            );
-            Ok(ParsedInstructionEnum {
-                instruction_type: "mintToChecked".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::BurnChecked { amount, decimals } => {
-            check_num_token_accounts(&instruction.accounts, 3)?;
-            let mut value = json!({
-                "account": account_keys[instruction.accounts[0] as usize].to_string(),
-                "mint": account_keys[instruction.accounts[1] as usize].to_string(),
-                "tokenAmount": token_amount_to_ui_amount(amount, decimals),
-            });
-            let map = value.as_object_mut().unwrap();
-            parse_signers(
-                map,
-                2,
-                account_keys,
-                &instruction.accounts,
-                "authority",
-                "multisigAuthority",
-            );
-            Ok(ParsedInstructionEnum {
-                instruction_type: "burnChecked".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::SyncNative => {
-            check_num_token_accounts(&instruction.accounts, 1)?;
-            Ok(ParsedInstructionEnum {
-                instruction_type: "syncNative".to_string(),
-                info: json!({
-                    "account": account_keys[instruction.accounts[0] as usize].to_string(),
-                }),
-            })
-        }
-        TokenInstruction::GetAccountDataSize { extension_types } => {
-            check_num_token_accounts(&instruction.accounts, 1)?;
-            let mut value = json!({
-                "mint": account_keys[instruction.accounts[0] as usize].to_string(),
-            });
-            let map = value.as_object_mut().unwrap();
-            if !extension_types.is_empty() {
-                map.insert(
-                    "extensionTypes".to_string(),
-                    json!(extension_types
-                        .into_iter()
-                        .map(UiExtensionType::from)
-                        .collect::<Vec<_>>()),
+            TokenInstruction::InitializeMint2 {
+                decimals,
+                mint_authority,
+                freeze_authority,
+            } => {
+                check_num_token_accounts(&instruction.accounts, 1)?;
+                let mut value = json!({
+                    "mint": account_keys[instruction.accounts[0] as usize].to_string(),
+                    "decimals": decimals,
+                    "mintAuthority": mint_authority.to_string(),
+                });
+                let map = value.as_object_mut().unwrap();
+                if let COption::Some(freeze_authority) = freeze_authority {
+                    map.insert(
+                        "freezeAuthority".to_string(),
+                        json!(freeze_authority.to_string()),
+                    );
+                }
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "initializeMint2".to_string(),
+                    info: value,
+                })
+            }
+            TokenInstruction::InitializeAccount => {
+                check_num_token_accounts(&instruction.accounts, 4)?;
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "initializeAccount".to_string(),
+                    info: json!({
+                        "account": account_keys[instruction.accounts[0] as usize].to_string(),
+                        "mint": account_keys[instruction.accounts[1] as usize].to_string(),
+                        "owner": account_keys[instruction.accounts[2] as usize].to_string(),
+                        "rentSysvar": account_keys[instruction.accounts[3] as usize].to_string(),
+                    }),
+                })
+            }
+            TokenInstruction::InitializeAccount2 { owner } => {
+                check_num_token_accounts(&instruction.accounts, 3)?;
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "initializeAccount2".to_string(),
+                    info: json!({
+                        "account": account_keys[instruction.accounts[0] as usize].to_string(),
+                        "mint": account_keys[instruction.accounts[1] as usize].to_string(),
+                        "owner": owner.to_string(),
+                        "rentSysvar": account_keys[instruction.accounts[2] as usize].to_string(),
+                    }),
+                })
+            }
+            TokenInstruction::InitializeAccount3 { owner } => {
+                check_num_token_accounts(&instruction.accounts, 2)?;
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "initializeAccount3".to_string(),
+                    info: json!({
+                        "account": account_keys[instruction.accounts[0] as usize].to_string(),
+                        "mint": account_keys[instruction.accounts[1] as usize].to_string(),
+                        "owner": owner.to_string(),
+                    }),
+                })
+            }
+            TokenInstruction::InitializeMultisig { m } => {
+                check_num_token_accounts(&instruction.accounts, 3)?;
+                let mut signers: Vec<String> = vec![];
+                for i in instruction.accounts[2..].iter() {
+                    signers.push(account_keys[*i as usize].to_string());
+                }
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "initializeMultisig".to_string(),
+                    info: json!({
+                        "multisig": account_keys[instruction.accounts[0] as usize].to_string(),
+                        "rentSysvar": account_keys[instruction.accounts[1] as usize].to_string(),
+                        "signers": signers,
+                        "m": m,
+                    }),
+                })
+            }
+            TokenInstruction::InitializeMultisig2 { m } => {
+                check_num_token_accounts(&instruction.accounts, 2)?;
+                let mut signers: Vec<String> = vec![];
+                for i in instruction.accounts[1..].iter() {
+                    signers.push(account_keys[*i as usize].to_string());
+                }
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "initializeMultisig2".to_string(),
+                    info: json!({
+                        "multisig": account_keys[instruction.accounts[0] as usize].to_string(),
+                        "signers": signers,
+                        "m": m,
+                    }),
+                })
+            }
+            #[allow(deprecated)]
+            TokenInstruction::Transfer { amount } => {
+                check_num_token_accounts(&instruction.accounts, 3)?;
+                let mut value = json!({
+                    "source": account_keys[instruction.accounts[0] as usize].to_string(),
+                    "destination": account_keys[instruction.accounts[1] as usize].to_string(),
+                    "amount": amount.to_string(),
+                });
+                let map = value.as_object_mut().unwrap();
+                parse_signers(
+                    map,
+                    2,
+                    account_keys,
+                    &instruction.accounts,
+                    "authority",
+                    "multisigAuthority",
                 );
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "transfer".to_string(),
+                    info: value,
+                })
             }
-            Ok(ParsedInstructionEnum {
-                instruction_type: "getAccountDataSize".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::InitializeImmutableOwner => {
-            check_num_token_accounts(&instruction.accounts, 1)?;
-            Ok(ParsedInstructionEnum {
-                instruction_type: "initializeImmutableOwner".to_string(),
-                info: json!({
+            TokenInstruction::Approve { amount } => {
+                check_num_token_accounts(&instruction.accounts, 3)?;
+                let mut value = json!({
+                    "source": account_keys[instruction.accounts[0] as usize].to_string(),
+                    "delegate": account_keys[instruction.accounts[1] as usize].to_string(),
+                    "amount": amount.to_string(),
+                });
+                let map = value.as_object_mut().unwrap();
+                parse_signers(
+                    map,
+                    2,
+                    account_keys,
+                    &instruction.accounts,
+                    "owner",
+                    "multisigOwner",
+                );
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "approve".to_string(),
+                    info: value,
+                })
+            }
+            TokenInstruction::Revoke => {
+                check_num_token_accounts(&instruction.accounts, 2)?;
+                let mut value = json!({
+                    "source": account_keys[instruction.accounts[0] as usize].to_string(),
+                });
+                let map = value.as_object_mut().unwrap();
+                parse_signers(
+                    map,
+                    1,
+                    account_keys,
+                    &instruction.accounts,
+                    "owner",
+                    "multisigOwner",
+                );
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "revoke".to_string(),
+                    info: value,
+                })
+            }
+            TokenInstruction::SetAuthority {
+                authority_type,
+                new_authority,
+            } => {
+                check_num_token_accounts(&instruction.accounts, 2)?;
+                let owned = match authority_type {
+                    AuthorityType::MintTokens
+                    | AuthorityType::FreezeAccount
+                    | AuthorityType::TransferFeeConfig
+                    | AuthorityType::WithheldWithdraw
+                    | AuthorityType::CloseMint
+                    | AuthorityType::InterestRate
+                    | AuthorityType::PermanentDelegate
+                    | AuthorityType::ConfidentialTransferMint
+                    | AuthorityType::TransferHookProgramId
+                    | AuthorityType::ConfidentialTransferFeeConfig
+                    | AuthorityType::MetadataPointer
+                    | AuthorityType::GroupPointer
+                    | AuthorityType::GroupMemberPointer
+                    | AuthorityType::ScaledUiAmount
+                    | AuthorityType::Pause => "mint",
+                    AuthorityType::AccountOwner | AuthorityType::CloseAccount => "account",
+                };
+                let mut value = json!({
+                    owned: account_keys[instruction.accounts[0] as usize].to_string(),
+                    "authorityType": Into::<UiAuthorityType>::into(authority_type),
+                    "newAuthority": map_coption_pubkey(new_authority),
+                });
+                let map = value.as_object_mut().unwrap();
+                parse_signers(
+                    map,
+                    1,
+                    account_keys,
+                    &instruction.accounts,
+                    "authority",
+                    "multisigAuthority",
+                );
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "setAuthority".to_string(),
+                    info: value,
+                })
+            }
+            TokenInstruction::MintTo { amount } => {
+                check_num_token_accounts(&instruction.accounts, 3)?;
+                let mut value = json!({
+                    "mint": account_keys[instruction.accounts[0] as usize].to_string(),
+                    "account": account_keys[instruction.accounts[1] as usize].to_string(),
+                    "amount": amount.to_string(),
+                });
+                let map = value.as_object_mut().unwrap();
+                parse_signers(
+                    map,
+                    2,
+                    account_keys,
+                    &instruction.accounts,
+                    "mintAuthority",
+                    "multisigMintAuthority",
+                );
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "mintTo".to_string(),
+                    info: value,
+                })
+            }
+            TokenInstruction::Burn { amount } => {
+                check_num_token_accounts(&instruction.accounts, 3)?;
+                let mut value = json!({
                     "account": account_keys[instruction.accounts[0] as usize].to_string(),
-                }),
-            })
-        }
-        TokenInstruction::AmountToUiAmount { amount } => {
-            check_num_token_accounts(&instruction.accounts, 1)?;
-            Ok(ParsedInstructionEnum {
-                instruction_type: "amountToUiAmount".to_string(),
-                info: json!({
+                    "mint": account_keys[instruction.accounts[1] as usize].to_string(),
+                    "amount": amount.to_string(),
+                });
+                let map = value.as_object_mut().unwrap();
+                parse_signers(
+                    map,
+                    2,
+                    account_keys,
+                    &instruction.accounts,
+                    "authority",
+                    "multisigAuthority",
+                );
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "burn".to_string(),
+                    info: value,
+                })
+            }
+            TokenInstruction::CloseAccount => {
+                check_num_token_accounts(&instruction.accounts, 3)?;
+                let mut value = json!({
+                    "account": account_keys[instruction.accounts[0] as usize].to_string(),
+                    "destination": account_keys[instruction.accounts[1] as usize].to_string(),
+                });
+                let map = value.as_object_mut().unwrap();
+                parse_signers(
+                    map,
+                    2,
+                    account_keys,
+                    &instruction.accounts,
+                    "owner",
+                    "multisigOwner",
+                );
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "closeAccount".to_string(),
+                    info: value,
+                })
+            }
+            TokenInstruction::FreezeAccount => {
+                check_num_token_accounts(&instruction.accounts, 3)?;
+                let mut value = json!({
+                    "account": account_keys[instruction.accounts[0] as usize].to_string(),
+                    "mint": account_keys[instruction.accounts[1] as usize].to_string(),
+                });
+                let map = value.as_object_mut().unwrap();
+                parse_signers(
+                    map,
+                    2,
+                    account_keys,
+                    &instruction.accounts,
+                    "freezeAuthority",
+                    "multisigFreezeAuthority",
+                );
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "freezeAccount".to_string(),
+                    info: value,
+                })
+            }
+            TokenInstruction::ThawAccount => {
+                check_num_token_accounts(&instruction.accounts, 3)?;
+                let mut value = json!({
+                    "account": account_keys[instruction.accounts[0] as usize].to_string(),
+                    "mint": account_keys[instruction.accounts[1] as usize].to_string(),
+                });
+                let map = value.as_object_mut().unwrap();
+                parse_signers(
+                    map,
+                    2,
+                    account_keys,
+                    &instruction.accounts,
+                    "freezeAuthority",
+                    "multisigFreezeAuthority",
+                );
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "thawAccount".to_string(),
+                    info: value,
+                })
+            }
+            TokenInstruction::TransferChecked { amount, decimals } => {
+                check_num_token_accounts(&instruction.accounts, 4)?;
+                let additional_data = SplTokenAdditionalDataV2::with_decimals(decimals);
+                let mut value = json!({
+                    "source": account_keys[instruction.accounts[0] as usize].to_string(),
+                    "mint": account_keys[instruction.accounts[1] as usize].to_string(),
+                    "destination": account_keys[instruction.accounts[2] as usize].to_string(),
+                    "tokenAmount": token_amount_to_ui_amount_v3(amount, &additional_data),
+                });
+                let map = value.as_object_mut().unwrap();
+                parse_signers(
+                    map,
+                    3,
+                    account_keys,
+                    &instruction.accounts,
+                    "authority",
+                    "multisigAuthority",
+                );
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "transferChecked".to_string(),
+                    info: value,
+                })
+            }
+            TokenInstruction::ApproveChecked { amount, decimals } => {
+                check_num_token_accounts(&instruction.accounts, 4)?;
+                let additional_data = SplTokenAdditionalDataV2::with_decimals(decimals);
+                let mut value = json!({
+                    "source": account_keys[instruction.accounts[0] as usize].to_string(),
+                    "mint": account_keys[instruction.accounts[1] as usize].to_string(),
+                    "delegate": account_keys[instruction.accounts[2] as usize].to_string(),
+                    "tokenAmount": token_amount_to_ui_amount_v3(amount, &additional_data),
+                });
+                let map = value.as_object_mut().unwrap();
+                parse_signers(
+                    map,
+                    3,
+                    account_keys,
+                    &instruction.accounts,
+                    "owner",
+                    "multisigOwner",
+                );
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "approveChecked".to_string(),
+                    info: value,
+                })
+            }
+            TokenInstruction::MintToChecked { amount, decimals } => {
+                check_num_token_accounts(&instruction.accounts, 3)?;
+                let additional_data = SplTokenAdditionalDataV2::with_decimals(decimals);
+                let mut value = json!({
                     "mint": account_keys[instruction.accounts[0] as usize].to_string(),
-                    "amount": amount,
-                }),
-            })
-        }
-        TokenInstruction::UiAmountToAmount { ui_amount } => {
-            check_num_token_accounts(&instruction.accounts, 1)?;
-            Ok(ParsedInstructionEnum {
-                instruction_type: "uiAmountToAmount".to_string(),
-                info: json!({
+                    "account": account_keys[instruction.accounts[1] as usize].to_string(),
+                    "tokenAmount": token_amount_to_ui_amount_v3(amount, &additional_data),
+                });
+                let map = value.as_object_mut().unwrap();
+                parse_signers(
+                    map,
+                    2,
+                    account_keys,
+                    &instruction.accounts,
+                    "mintAuthority",
+                    "multisigMintAuthority",
+                );
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "mintToChecked".to_string(),
+                    info: value,
+                })
+            }
+            TokenInstruction::BurnChecked { amount, decimals } => {
+                check_num_token_accounts(&instruction.accounts, 3)?;
+                let additional_data = SplTokenAdditionalDataV2::with_decimals(decimals);
+                let mut value = json!({
+                    "account": account_keys[instruction.accounts[0] as usize].to_string(),
+                    "mint": account_keys[instruction.accounts[1] as usize].to_string(),
+                    "tokenAmount": token_amount_to_ui_amount_v3(amount, &additional_data),
+                });
+                let map = value.as_object_mut().unwrap();
+                parse_signers(
+                    map,
+                    2,
+                    account_keys,
+                    &instruction.accounts,
+                    "authority",
+                    "multisigAuthority",
+                );
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "burnChecked".to_string(),
+                    info: value,
+                })
+            }
+            TokenInstruction::SyncNative => {
+                check_num_token_accounts(&instruction.accounts, 1)?;
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "syncNative".to_string(),
+                    info: json!({
+                        "account": account_keys[instruction.accounts[0] as usize].to_string(),
+                    }),
+                })
+            }
+            TokenInstruction::GetAccountDataSize { extension_types } => {
+                check_num_token_accounts(&instruction.accounts, 1)?;
+                let mut value = json!({
                     "mint": account_keys[instruction.accounts[0] as usize].to_string(),
-                    "uiAmount": ui_amount,
-                }),
-            })
-        }
-        TokenInstruction::InitializeMintCloseAuthority { close_authority } => {
-            parse_initialize_mint_close_authority_instruction(
-                close_authority,
+                });
+                let map = value.as_object_mut().unwrap();
+                if !extension_types.is_empty() {
+                    map.insert(
+                        "extensionTypes".to_string(),
+                        json!(extension_types
+                            .into_iter()
+                            .map(UiExtensionType::from)
+                            .collect::<Vec<_>>()),
+                    );
+                }
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "getAccountDataSize".to_string(),
+                    info: value,
+                })
+            }
+            TokenInstruction::InitializeImmutableOwner => {
+                check_num_token_accounts(&instruction.accounts, 1)?;
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "initializeImmutableOwner".to_string(),
+                    info: json!({
+                        "account": account_keys[instruction.accounts[0] as usize].to_string(),
+                    }),
+                })
+            }
+            TokenInstruction::AmountToUiAmount { amount } => {
+                check_num_token_accounts(&instruction.accounts, 1)?;
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "amountToUiAmount".to_string(),
+                    info: json!({
+                        "mint": account_keys[instruction.accounts[0] as usize].to_string(),
+                        "amount": amount.to_string(),
+                    }),
+                })
+            }
+            TokenInstruction::UiAmountToAmount { ui_amount } => {
+                check_num_token_accounts(&instruction.accounts, 1)?;
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "uiAmountToAmount".to_string(),
+                    info: json!({
+                        "mint": account_keys[instruction.accounts[0] as usize].to_string(),
+                        "uiAmount": ui_amount,
+                    }),
+                })
+            }
+            TokenInstruction::InitializeMintCloseAuthority { close_authority } => {
+                parse_initialize_mint_close_authority_instruction(
+                    close_authority,
+                    &instruction.accounts,
+                    account_keys,
+                )
+            }
+            TokenInstruction::TransferFeeExtension => parse_transfer_fee_instruction(
+                &instruction.data[1..],
                 &instruction.accounts,
                 account_keys,
-            )
-        }
-        TokenInstruction::TransferFeeExtension(transfer_fee_instruction) => {
-            parse_transfer_fee_instruction(
-                transfer_fee_instruction,
+            ),
+            TokenInstruction::ConfidentialTransferExtension => {
+                parse_confidential_transfer_instruction(
+                    &instruction.data[1..],
+                    &instruction.accounts,
+                    account_keys,
+                )
+            }
+            TokenInstruction::DefaultAccountStateExtension => {
+                if instruction.data.len() <= 2 {
+                    return Err(ParseInstructionError::InstructionNotParsable(
+                        ParsableProgram::SplToken,
+                    ));
+                }
+                parse_default_account_state_instruction(
+                    &instruction.data[1..],
+                    &instruction.accounts,
+                    account_keys,
+                )
+            }
+            TokenInstruction::Reallocate { extension_types } => {
+                parse_reallocate_instruction(extension_types, &instruction.accounts, account_keys)
+            }
+            TokenInstruction::MemoTransferExtension => {
+                if instruction.data.len() < 2 {
+                    return Err(ParseInstructionError::InstructionNotParsable(
+                        ParsableProgram::SplToken,
+                    ));
+                }
+                parse_memo_transfer_instruction(
+                    &instruction.data[1..],
+                    &instruction.accounts,
+                    account_keys,
+                )
+            }
+            TokenInstruction::CreateNativeMint => {
+                check_num_token_accounts(&instruction.accounts, 3)?;
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "createNativeMint".to_string(),
+                    info: json!({
+                        "payer": account_keys[instruction.accounts[0] as usize].to_string(),
+                        "nativeMint": account_keys[instruction.accounts[1] as usize].to_string(),
+                        "systemProgram": account_keys[instruction.accounts[2] as usize].to_string(),
+                    }),
+                })
+            }
+            TokenInstruction::InitializeNonTransferableMint => {
+                check_num_token_accounts(&instruction.accounts, 1)?;
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "initializeNonTransferableMint".to_string(),
+                    info: json!({
+                        "mint": account_keys[instruction.accounts[0] as usize].to_string(),
+                    }),
+                })
+            }
+            TokenInstruction::InterestBearingMintExtension => {
+                if instruction.data.len() < 2 {
+                    return Err(ParseInstructionError::InstructionNotParsable(
+                        ParsableProgram::SplToken,
+                    ));
+                }
+                parse_interest_bearing_mint_instruction(
+                    &instruction.data[1..],
+                    &instruction.accounts,
+                    account_keys,
+                )
+            }
+            TokenInstruction::CpiGuardExtension => {
+                if instruction.data.len() < 2 {
+                    return Err(ParseInstructionError::InstructionNotParsable(
+                        ParsableProgram::SplToken,
+                    ));
+                }
+                parse_cpi_guard_instruction(
+                    &instruction.data[1..],
+                    &instruction.accounts,
+                    account_keys,
+                )
+            }
+            TokenInstruction::InitializePermanentDelegate { delegate } => {
+                parse_initialize_permanent_delegate_instruction(
+                    delegate,
+                    &instruction.accounts,
+                    account_keys,
+                )
+            }
+            TokenInstruction::TransferHookExtension => {
+                if instruction.data.len() < 2 {
+                    return Err(ParseInstructionError::InstructionNotParsable(
+                        ParsableProgram::SplToken,
+                    ));
+                }
+                parse_transfer_hook_instruction(
+                    &instruction.data[1..],
+                    &instruction.accounts,
+                    account_keys,
+                )
+            }
+            TokenInstruction::ConfidentialTransferFeeExtension => {
+                if instruction.data.len() < 2 {
+                    return Err(ParseInstructionError::InstructionNotParsable(
+                        ParsableProgram::SplToken,
+                    ));
+                }
+                parse_confidential_transfer_fee_instruction(
+                    &instruction.data[1..],
+                    &instruction.accounts,
+                    account_keys,
+                )
+            }
+            TokenInstruction::WithdrawExcessLamports => {
+                check_num_token_accounts(&instruction.accounts, 3)?;
+                let mut value = json!({
+                    "source": account_keys[instruction.accounts[0] as usize].to_string(),
+                    "destination": account_keys[instruction.accounts[1] as usize].to_string(),
+                });
+                let map = value.as_object_mut().unwrap();
+                parse_signers(
+                    map,
+                    2,
+                    account_keys,
+                    &instruction.accounts,
+                    "authority",
+                    "multisigAuthority",
+                );
+                Ok(ParsedInstructionEnum {
+                    instruction_type: "withdrawExcessLamports".to_string(),
+                    info: value,
+                })
+            }
+            TokenInstruction::MetadataPointerExtension => {
+                if instruction.data.len() < 2 {
+                    return Err(ParseInstructionError::InstructionNotParsable(
+                        ParsableProgram::SplToken,
+                    ));
+                }
+                parse_metadata_pointer_instruction(
+                    &instruction.data[1..],
+                    &instruction.accounts,
+                    account_keys,
+                )
+            }
+            TokenInstruction::GroupPointerExtension => {
+                if instruction.data.len() < 2 {
+                    return Err(ParseInstructionError::InstructionNotParsable(
+                        ParsableProgram::SplToken,
+                    ));
+                }
+                parse_group_pointer_instruction(
+                    &instruction.data[1..],
+                    &instruction.accounts,
+                    account_keys,
+                )
+            }
+            TokenInstruction::GroupMemberPointerExtension => {
+                if instruction.data.len() < 2 {
+                    return Err(ParseInstructionError::InstructionNotParsable(
+                        ParsableProgram::SplToken,
+                    ));
+                }
+                parse_group_member_pointer_instruction(
+                    &instruction.data[1..],
+                    &instruction.accounts,
+                    account_keys,
+                )
+            }
+            TokenInstruction::ConfidentialMintBurnExtension => {
+                parse_confidential_mint_burn_instruction(
+                    &instruction.data[1..],
+                    &instruction.accounts,
+                    account_keys,
+                )
+            }
+            TokenInstruction::ScaledUiAmountExtension => parse_scaled_ui_amount_instruction(
+                &instruction.data[1..],
                 &instruction.accounts,
                 account_keys,
-            )
+            ),
+            TokenInstruction::PausableExtension => parse_pausable_instruction(
+                &instruction.data[1..],
+                &instruction.accounts,
+                account_keys,
+            ),
         }
-        TokenInstruction::ConfidentialTransferExtension => parse_confidential_transfer_instruction(
-            &instruction.data[1..],
+    } else if let Ok(token_group_instruction) = TokenGroupInstruction::unpack(&instruction.data) {
+        parse_token_group_instruction(
+            &token_group_instruction,
             &instruction.accounts,
             account_keys,
-        ),
-        TokenInstruction::DefaultAccountStateExtension => {
-            if instruction.data.len() <= 2 {
-                return Err(ParseInstructionError::InstructionNotParsable(
-                    ParsableProgram::SplToken,
-                ));
-            }
-            parse_default_account_state_instruction(
-                &instruction.data[1..],
-                &instruction.accounts,
-                account_keys,
-            )
-        }
-        TokenInstruction::Reallocate { extension_types } => {
-            parse_reallocate_instruction(extension_types, &instruction.accounts, account_keys)
-        }
-        TokenInstruction::MemoTransferExtension => {
-            if instruction.data.len() < 2 {
-                return Err(ParseInstructionError::InstructionNotParsable(
-                    ParsableProgram::SplToken,
-                ));
-            }
-            parse_memo_transfer_instruction(
-                &instruction.data[1..],
-                &instruction.accounts,
-                account_keys,
-            )
-        }
-        TokenInstruction::CreateNativeMint => {
-            check_num_token_accounts(&instruction.accounts, 3)?;
-            Ok(ParsedInstructionEnum {
-                instruction_type: "createNativeMint".to_string(),
-                info: json!({
-                    "payer": account_keys[instruction.accounts[0] as usize].to_string(),
-                    "nativeMint": account_keys[instruction.accounts[1] as usize].to_string(),
-                    "systemProgram": account_keys[instruction.accounts[2] as usize].to_string(),
-                }),
-            })
-        }
-        TokenInstruction::InitializeNonTransferableMint => {
-            check_num_token_accounts(&instruction.accounts, 1)?;
-            Ok(ParsedInstructionEnum {
-                instruction_type: "initializeNonTransferableMint".to_string(),
-                info: json!({
-                    "mint": account_keys[instruction.accounts[0] as usize].to_string(),
-                }),
-            })
-        }
-        TokenInstruction::InterestBearingMintExtension => {
-            if instruction.data.len() < 2 {
-                return Err(ParseInstructionError::InstructionNotParsable(
-                    ParsableProgram::SplToken,
-                ));
-            }
-            parse_interest_bearing_mint_instruction(
-                &instruction.data[1..],
-                &instruction.accounts,
-                account_keys,
-            )
-        }
-        TokenInstruction::CpiGuardExtension => {
-            if instruction.data.len() < 2 {
-                return Err(ParseInstructionError::InstructionNotParsable(
-                    ParsableProgram::SplToken,
-                ));
-            }
-            parse_cpi_guard_instruction(&instruction.data[1..], &instruction.accounts, account_keys)
-        }
-        TokenInstruction::InitializePermanentDelegate { delegate } => {
-            parse_initialize_permanent_delegate_instruction(
-                delegate,
-                &instruction.accounts,
-                account_keys,
-            )
-        }
-        TokenInstruction::TransferHookExtension => {
-            if instruction.data.len() < 2 {
-                return Err(ParseInstructionError::InstructionNotParsable(
-                    ParsableProgram::SplToken,
-                ));
-            }
-            parse_transfer_hook_instruction(
-                &instruction.data[1..],
-                &instruction.accounts,
-                account_keys,
-            )
-        }
-        TokenInstruction::ConfidentialTransferFeeExtension => {
-            if instruction.data.len() < 2 {
-                return Err(ParseInstructionError::InstructionNotParsable(
-                    ParsableProgram::SplToken,
-                ));
-            }
-            parse_confidential_transfer_fee_instruction(
-                &instruction.data[1..],
-                &instruction.accounts,
-                account_keys,
-            )
-        }
-        TokenInstruction::WithdrawExcessLamports => {
-            check_num_token_accounts(&instruction.accounts, 3)?;
-            let mut value = json!({
-                "source": account_keys[instruction.accounts[0] as usize].to_string(),
-                "destination": account_keys[instruction.accounts[1] as usize].to_string(),
-            });
-            let map = value.as_object_mut().unwrap();
-            parse_signers(
-                map,
-                2,
-                account_keys,
-                &instruction.accounts,
-                "authority",
-                "multisigAuthority",
-            );
-            Ok(ParsedInstructionEnum {
-                instruction_type: "withdrawExcessLamports".to_string(),
-                info: value,
-            })
-        }
-        TokenInstruction::MetadataPointerExtension => {
-            if instruction.data.len() < 2 {
-                return Err(ParseInstructionError::InstructionNotParsable(
-                    ParsableProgram::SplToken,
-                ));
-            }
-            parse_metadata_pointer_instruction(
-                &instruction.data[1..],
-                &instruction.accounts,
-                account_keys,
-            )
-        }
-        TokenInstruction::GroupPointerExtension => {
-            if instruction.data.len() < 2 {
-                return Err(ParseInstructionError::InstructionNotParsable(
-                    ParsableProgram::SplToken,
-                ));
-            }
-            parse_group_pointer_instruction(
-                &instruction.data[1..],
-                &instruction.accounts,
-                account_keys,
-            )
-        }
-        TokenInstruction::GroupMemberPointerExtension => {
-            if instruction.data.len() < 2 {
-                return Err(ParseInstructionError::InstructionNotParsable(
-                    ParsableProgram::SplToken,
-                ));
-            }
-            parse_group_member_pointer_instruction(
-                &instruction.data[1..],
-                &instruction.accounts,
-                account_keys,
-            )
-        }
+        )
+    } else if let Ok(token_metadata_instruction) =
+        TokenMetadataInstruction::unpack(&instruction.data)
+    {
+        parse_token_metadata_instruction(
+            &token_metadata_instruction,
+            &instruction.accounts,
+            account_keys,
+        )
+    } else {
+        Err(ParseInstructionError::InstructionNotParsable(
+            ParsableProgram::SplToken,
+        ))
     }
 }
 
@@ -697,6 +743,8 @@ pub enum UiAuthorityType {
     MetadataPointer,
     GroupPointer,
     GroupMemberPointer,
+    ScaledUiAmount,
+    Pause,
 }
 
 impl From<AuthorityType> for UiAuthorityType {
@@ -719,6 +767,8 @@ impl From<AuthorityType> for UiAuthorityType {
             AuthorityType::MetadataPointer => UiAuthorityType::MetadataPointer,
             AuthorityType::GroupPointer => UiAuthorityType::GroupPointer,
             AuthorityType::GroupMemberPointer => UiAuthorityType::GroupMemberPointer,
+            AuthorityType::ScaledUiAmount => UiAuthorityType::ScaledUiAmount,
+            AuthorityType::Pause => UiAuthorityType::Pause,
         }
     }
 }
@@ -750,6 +800,10 @@ pub enum UiExtensionType {
     GroupMemberPointer,
     TokenGroup,
     TokenGroupMember,
+    ConfidentialMintBurn,
+    ScaledUiAmount,
+    Pausable,
+    PausableAccount,
 }
 
 impl From<ExtensionType> for UiExtensionType {
@@ -785,6 +839,10 @@ impl From<ExtensionType> for UiExtensionType {
             ExtensionType::GroupMemberPointer => UiExtensionType::GroupMemberPointer,
             ExtensionType::TokenGroup => UiExtensionType::TokenGroup,
             ExtensionType::TokenGroupMember => UiExtensionType::TokenGroupMember,
+            ExtensionType::ConfidentialMintBurn => UiExtensionType::ConfidentialMintBurn,
+            ExtensionType::ScaledUiAmount => UiExtensionType::ScaledUiAmount,
+            ExtensionType::Pausable => UiExtensionType::Pausable,
+            ExtensionType::PausableAccount => UiExtensionType::PausableAccount,
         }
     }
 }
@@ -819,23 +877,6 @@ fn check_num_token_accounts(accounts: &[u8], num: usize) -> Result<(), ParseInst
     check_num_accounts(accounts, num, ParsableProgram::SplToken)
 }
 
-#[deprecated(since = "1.16.0", note = "Instruction conversions no longer needed")]
-pub fn spl_token_instruction(instruction: SplTokenInstruction) -> Instruction {
-    Instruction {
-        program_id: instruction.program_id,
-        accounts: instruction
-            .accounts
-            .iter()
-            .map(|meta| AccountMeta {
-                pubkey: meta.pubkey,
-                is_signer: meta.is_signer,
-                is_writable: meta.is_writable,
-            })
-            .collect(),
-        data: instruction.data,
-    }
-}
-
 fn map_coption_pubkey(pubkey: COption<Pubkey>) -> Option<String> {
     match pubkey {
         COption::Some(pubkey) => Some(pubkey.to_string()),
@@ -846,17 +887,15 @@ fn map_coption_pubkey(pubkey: COption<Pubkey>) -> Option<String> {
 #[cfg(test)]
 mod test {
     use {
-        super::*,
-        solana_sdk::{message::Message, pubkey::Pubkey},
-        spl_token_2022::instruction::*,
-        std::iter::repeat_with,
+        super::*, solana_message::Message, solana_pubkey::Pubkey,
+        spl_token_2022_interface::instruction::*, std::iter::repeat_with,
     };
 
     fn test_parse_token(program_id: &Pubkey) {
         let mint_pubkey = Pubkey::new_unique();
         let mint_authority = Pubkey::new_unique();
         let freeze_authority = Pubkey::new_unique();
-        let rent_sysvar = solana_sdk::sysvar::rent::id();
+        let rent_sysvar = solana_sdk_ids::sysvar::rent::id();
 
         // Test InitializeMint variations
         let initialize_mint_ix = initialize_mint(
@@ -1646,7 +1685,7 @@ mod test {
         let get_account_data_size_ix = get_account_data_size(
             program_id,
             &mint_pubkey,
-            &[], // This emulates the packed data of spl_token::instruction::get_account_data_size
+            &[], // This emulates the packed data of spl_token_interface::instruction::get_account_data_size
         )
         .unwrap();
         let message = Message::new(&[get_account_data_size_ix], None);
@@ -1705,7 +1744,7 @@ mod test {
                 instruction_type: "amountToUiAmount".to_string(),
                 info: json!({
                    "mint": mint_pubkey.to_string(),
-                   "amount": 4242,
+                   "amount": "4242",
                 })
             }
         );
@@ -1733,18 +1772,19 @@ mod test {
 
     #[test]
     fn test_parse_token_v3() {
-        test_parse_token(&spl_token::id());
+        test_parse_token(&spl_token_interface::id());
     }
 
     #[test]
     fn test_parse_token_2022() {
-        test_parse_token(&spl_token_2022::id());
+        test_parse_token(&spl_token_2022_interface::id());
     }
 
     #[test]
     fn test_create_native_mint() {
         let payer = Pubkey::new_unique();
-        let create_native_mint_ix = create_native_mint(&spl_token_2022::id(), &payer).unwrap();
+        let create_native_mint_ix =
+            create_native_mint(&spl_token_2022_interface::id(), &payer).unwrap();
         let message = Message::new(&[create_native_mint_ix], None);
         let compiled_instruction = &message.instructions[0];
         assert_eq!(
@@ -1757,15 +1797,15 @@ mod test {
                 instruction_type: "createNativeMint".to_string(),
                 info: json!({
                    "payer": payer.to_string(),
-                   "nativeMint": spl_token_2022::native_mint::id().to_string(),
-                   "systemProgram": solana_sdk::system_program::id().to_string(),
+                   "nativeMint": spl_token_2022_interface::native_mint::id().to_string(),
+                   "systemProgram": solana_sdk_ids::system_program::id().to_string(),
                 })
             }
         );
     }
 
     fn test_token_ix_not_enough_keys(program_id: &Pubkey) {
-        let keys: Vec<Pubkey> = repeat_with(solana_sdk::pubkey::new_rand).take(10).collect();
+        let keys: Vec<Pubkey> = repeat_with(solana_pubkey::new_rand).take(10).collect();
 
         // Test InitializeMint variations
         let initialize_mint_ix =
@@ -2111,11 +2151,11 @@ mod test {
 
     #[test]
     fn test_not_enough_keys_token_v3() {
-        test_token_ix_not_enough_keys(&spl_token::id());
+        test_token_ix_not_enough_keys(&spl_token_interface::id());
     }
 
     #[test]
     fn test_not_enough_keys_token_2022() {
-        test_token_ix_not_enough_keys(&spl_token_2022::id());
+        test_token_ix_not_enough_keys(&spl_token_2022_interface::id());
     }
 }

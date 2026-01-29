@@ -4,10 +4,9 @@ use {
         StringAmount,
     },
     bincode::deserialize,
-    solana_sdk::{
-        clock::{Epoch, UnixTimestamp},
-        stake::state::{Authorized, Delegation, Lockup, Meta, Stake, StakeStateV2},
-    },
+    serde::{Deserialize, Serialize},
+    solana_clock::{Epoch, UnixTimestamp},
+    solana_stake_interface::state::{Authorized, Delegation, Lockup, Meta, Stake, StakeStateV2},
 };
 
 pub fn parse_stake(data: &[u8]) -> Result<StakeAccountType, ParseAccountError> {
@@ -121,7 +120,7 @@ pub struct UiDelegation {
     pub deactivation_epoch: StringAmount,
     #[deprecated(
         since = "1.16.7",
-        note = "Please use `solana_sdk::stake::stake::warmup_cooldown_rate()` instead"
+        note = "Please use `solana_stake_interface::state::warmup_cooldown_rate()` instead"
     )]
     pub warmup_cooldown_rate: f64,
 }
@@ -141,7 +140,7 @@ impl From<Delegation> for UiDelegation {
 
 #[cfg(test)]
 mod test {
-    use {super::*, bincode::serialize, solana_sdk::stake::stake_flags::StakeFlags};
+    use {super::*, bincode::serialize, solana_stake_interface::stake_flags::StakeFlags};
 
     #[test]
     #[allow(deprecated)]
@@ -153,8 +152,8 @@ mod test {
             StakeAccountType::Uninitialized
         );
 
-        let pubkey = solana_sdk::pubkey::new_rand();
-        let custodian = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
+        let custodian = solana_pubkey::new_rand();
         let authorized = Authorized::auto(&pubkey);
         let lockup = Lockup {
             unix_timestamp: 0,
@@ -188,13 +187,13 @@ mod test {
             })
         );
 
-        let voter_pubkey = solana_sdk::pubkey::new_rand();
+        let voter_pubkey = solana_pubkey::new_rand();
         let stake = Stake {
             delegation: Delegation {
                 voter_pubkey,
                 stake: 20,
                 activation_epoch: 2,
-                deactivation_epoch: std::u64::MAX,
+                deactivation_epoch: u64::MAX,
                 warmup_cooldown_rate: 0.25,
             },
             credits_observed: 10,
@@ -222,7 +221,7 @@ mod test {
                         voter: voter_pubkey.to_string(),
                         stake: 20.to_string(),
                         activation_epoch: 2.to_string(),
-                        deactivation_epoch: std::u64::MAX.to_string(),
+                        deactivation_epoch: u64::MAX.to_string(),
                         warmup_cooldown_rate: 0.25,
                     },
                     credits_observed: 10,

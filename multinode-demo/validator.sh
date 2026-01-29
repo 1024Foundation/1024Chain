@@ -64,7 +64,7 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --no-airdrop ]]; then
       airdrops_enabled=0
       shift
-    # solana-validator options
+    # agave-validator options
     elif [[ $1 = --expected-genesis-hash ]]; then
       args+=("$1" "$2")
       shift 2
@@ -137,9 +137,6 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --enable-rpc-transaction-history ]]; then
       args+=("$1")
       shift
-    elif [[ $1 = --enable-cpi-and-log-storage ]]; then
-      args+=("$1")
-      shift
     elif [[ $1 = --enable-extended-tx-metadata-storage ]]; then
       args+=("$1")
       shift
@@ -164,9 +161,6 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --known-validator ]]; then
       args+=("$1" "$2")
       shift 2
-    elif [[ $1 = --halt-on-known-validators-accounts-hash-mismatch ]]; then
-      args+=("$1")
-      shift
     elif [[ $1 = --max-genesis-archive-unpacked-size ]]; then
       args+=("$1" "$2")
       shift 2
@@ -183,6 +177,15 @@ while [[ -n $1 ]]; do
       maybeRequireTower=false
       shift
     elif [[ $1 == --block-production-method ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --transaction-structure ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --wen-restart ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --wen-restart-coordinator ]]; then
       args+=("$1" "$2")
       shift 2
     elif [[ $1 = -h ]]; then
@@ -270,9 +273,9 @@ if [[ $maybeRequireTower = true ]]; then
 fi
 
 if [[ -n $SOLANA_CUDA ]]; then
-  program=$solana_validator_cuda
+  program=$agave_validator_cuda
 else
-  program=$solana_validator
+  program=$agave_validator
 fi
 
 set -e

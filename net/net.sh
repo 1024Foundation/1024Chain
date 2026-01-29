@@ -87,6 +87,9 @@ Operate a configured testnet
                                         in genesis config for external nodes
    --no-snapshot-fetch
                                       - If set, disables booting validators from a snapshot
+   --copy-program URL_OR_MONIKER PUBKEY
+                                      - Copies a program PUBKEY from URL_OR_MONIKER.
+                                      For example, --copy-program t recr1L3PCGKLbckBqMNcJhuuyU1zgo8nBhfLVsJNwr5
    --skip-poh-verify
                                       - If set, validators will skip verifying
                                         the ledger they already have saved to disk at
@@ -122,7 +125,7 @@ Operate a configured testnet
 
  sanity/start-specific options:
    -F                   - Discard validator nodes that didn't bootup successfully
-   -o noInstallCheck    - Skip solana-install sanity
+   -o noInstallCheck    - Skip agave-install sanity
    -o rejectExtraNodes  - Require the exact number of nodes
 
  stop-specific options:
@@ -131,19 +134,16 @@ Operate a configured testnet
  logs-specific options:
    none
 
- netem-specific options:
-   --config            - Netem configuration (as a double quoted string)
-   --parition          - Percentage of network that should be configured with netem
-   --config-file       - Configuration file for partition and netem configuration
-   --netem-cmd         - Optional command argument to netem. Default is "add". Use "cleanup" to remove rules.
-
  update-specific options:
-   --platform linux|osx|windows       - Deploy the tarball using 'solana-install deploy ...' for the
+   --platform linux|osx|windows       - Deploy the tarball using 'agave-install deploy ...' for the
                                         given platform (multiple platforms may be specified)
                                         (-t option must be supplied as well)
 
  startnode/stopnode-specific options:
    -i [ip address]                    - IP Address of the node to start or stop
+
+ startnode specific option:
+   --wen-restart [coordinator_pubkey]      - Use given coordinator pubkey and apply wen_restat
 
  startclients-specific options:
    $CLIENT_OPTIONS
@@ -186,12 +186,11 @@ annotateBlockexplorerUrl() {
 }
 
 build() {
-  supported=("20.04")
   declare MAYBE_DOCKER=
-  if [[ $(uname) != Linux || ! " ${supported[*]} " =~ $(lsb_release -sr) ]]; then
-    # shellcheck source=ci/rust-version.sh
-    source "$SOLANA_ROOT"/ci/rust-version.sh
-    MAYBE_DOCKER="ci/docker-run.sh ${ci_docker_image:?}"
+  if [[ $(uname) != Linux ]]; then
+    # shellcheck source=ci/docker/env.sh
+    source "$SOLANA_ROOT"/ci/docker/env.sh
+    MAYBE_DOCKER="ci/docker-run.sh ${CI_DOCKER_IMAGE:?}"
   fi
   SECONDS=0
   (
@@ -212,7 +211,7 @@ build() {
 
     $MAYBE_DOCKER bash -c "
       set -ex
-      $profilerFlags scripts/cargo-install-all.sh farf $buildVariant --validator-only
+      $profilerFlags scripts/cargo-install-all.sh farf $buildVariant --validator-only --no-spl-token
     "
   )
 
@@ -279,7 +278,7 @@ syncScripts() {
   local remoteSolanaHome="${remoteHome}/solana"
   rsync -vPrc -e "ssh ${sshOptions[*]}" \
     --exclude 'net/log*' \
-    "$SOLANA_ROOT"/{fetch-perf-libs.sh,fetch-spl.sh,scripts,net,multinode-demo} \
+    "$SOLANA_ROOT"/{fetch-perf-libs.sh,fetch-programs.sh,fetch-core-bpf.sh,fetch-spl.sh,scripts,net,multinode-demo} \
     "$ipAddress":"$remoteSolanaHome"/ > /dev/null
 }
 
@@ -350,6 +349,7 @@ startBootstrapLeader() {
          \"$TMPFS_ACCOUNTS\" \
          \"$disableQuic\" \
          \"$enableUdp\" \
+         \"$maybeWenRestart\" \
       "
 
   ) >> "$logFile" 2>&1 || {
@@ -424,6 +424,7 @@ startNode() {
          \"$TMPFS_ACCOUNTS\" \
          \"$disableQuic\" \
          \"$enableUdp\" \
+         \"$maybeWenRestart\" \
       "
   ) >> "$logFile" 2>&1 &
   declare pid=$!
@@ -514,11 +515,11 @@ deployUpdate() {
   declare bootstrapLeader=${validatorIpList[0]}
 
   for updatePlatform in $updatePlatforms; do
-    echo "--- Deploying solana-install update: $updatePlatform"
+    echo "--- Deploying agave-install update: $updatePlatform"
     (
       set -x
 
-      scripts/solana-install-update-manifest-keypair.sh "$updatePlatform"
+      scripts/agave-install-update-manifest-keypair.sh "$updatePlatform"
 
       timeout 30s scp "${sshOptions[@]}" \
         update_manifest_keypair.json "$bootstrapLeader:solana/update_manifest_keypair.json"
@@ -563,7 +564,7 @@ prepareDeploy() {
     if [[ -n $releaseChannel ]]; then
       echo "Downloading release from channel: $releaseChannel"
       rm -f "$SOLANA_ROOT"/solana-release.tar.bz2
-      declare updateDownloadUrl=https://release.solana.com/"$releaseChannel"/solana-release-x86_64-unknown-linux-gnu.tar.bz2
+      declare updateDownloadUrl=https://release.anza.xyz/"$releaseChannel"/solana-release-x86_64-unknown-linux-gnu.tar.bz2
       (
         set -x
         curl -L -I "$updateDownloadUrl"
@@ -619,6 +620,13 @@ deploy() {
 
   echo "Deployment started at $(date)"
   $metricsWriteDatapoint "testnet-deploy net-start-begin=1"
+
+  if [[ -n "$copyProgramPubkey" ]]; then
+      echo "Copying program from ${copyProgramUrl}"
+      solana -u "${copyProgramUrl}" program dump "${copyProgramPubkey}" "${copyProgramPubkey}".so || exit 1
+
+      genesisOptions="${genesisOptions} --bpf-program ${copyProgramPubkey} BPFLoader2111111111111111111111111111111111 /home/solana/solana/net/${copyProgramPubkey}.so"
+  fi
 
   declare bootstrapLeader=true
   for nodeAddress in "${validatorIpList[@]}" "${blockstreamerIpList[@]}"; do
@@ -811,6 +819,8 @@ externalPrimordialAccountsFile=
 remoteExternalPrimordialAccountsFile=
 internalNodesStakeLamports=
 internalNodesLamports=
+copyProgramUrl=""
+copyProgramPubkey=""
 maybeNoSnapshot=""
 maybeLimitLedgerSize=""
 maybeSkipLedgerVerify=""
@@ -822,10 +832,6 @@ debugBuild=false
 profileBuild=false
 doBuild=true
 gpuMode=auto
-netemPartition=""
-netemConfig=""
-netemConfigFile=""
-netemCommand="add"
 clientDelayStart=0
 netLogDir=
 maybeWarpSlot=
@@ -836,6 +842,7 @@ disableQuic=false
 enableUdp=false
 clientType=tpu-client
 maybeUseUnstakedConnection=""
+maybeWenRestart=""
 
 command=$1
 [[ -n $command ]] || usage
@@ -900,6 +907,10 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --internal-nodes-lamports ]]; then
       internalNodesLamports="$2"
       shift 2
+    elif [[ $1 = --copy-program ]]; then
+      copyProgramUrl="$2"
+      copyProgramPubkey="$3"
+      shift 3
     elif [[ $1 = --external-accounts-file ]]; then
       externalPrimordialAccountsFile="$2"
       remoteExternalPrimordialAccountsFile=/tmp/external-primordial-accounts.yml
@@ -913,18 +924,6 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --profile ]]; then
       profileBuild=true
       shift 1
-    elif [[ $1 = --partition ]]; then
-      netemPartition=$2
-      shift 2
-    elif [[ $1 = --config ]]; then
-      netemConfig=$2
-      shift 2
-    elif [[ $1 == --config-file ]]; then
-      netemConfigFile=$2
-      shift 2
-    elif [[ $1 == --netem-cmd ]]; then
-      netemCommand=$2
-      shift 2
     elif [[ $1 = --gpu-mode ]]; then
       gpuMode=$2
       case "$gpuMode" in
@@ -983,6 +982,12 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --use-unstaked-connection ]]; then
       maybeUseUnstakedConnection="$1"
       shift 1
+    elif [[ $1 = --wen-restart ]]; then
+      # wen_restart needs tower storage to be there, so set skipSetup to true
+      # to avoid erasing the tower storage on disk.
+      skipSetup=true
+      maybeWenRestart="$2"
+      shift 2
     else
       usage "Unknown long option: $1"
     fi
@@ -1195,40 +1200,6 @@ logs)
   for ipAddress in "${blockstreamerIpList[@]}"; do
     fetchRemoteLog "$ipAddress" validator
   done
-  ;;
-netem)
-  if [[ -n $netemConfigFile ]]; then
-    remoteNetemConfigFile="$(basename "$netemConfigFile")"
-    if [[ $netemCommand = "add" ]]; then
-      for ipAddress in "${validatorIpList[@]}"; do
-        remoteHome=$(remoteHomeDir "$ipAddress")
-        remoteSolanaHome="${remoteHome}/solana"
-        "$here"/scp.sh "$netemConfigFile" solana@"$ipAddress":"$remoteSolanaHome"
-      done
-    fi
-    for i in "${!validatorIpList[@]}"; do
-      "$here"/ssh.sh solana@"${validatorIpList[$i]}" 'solana/scripts/net-shaper.sh' \
-      "$netemCommand" ~solana/solana/"$remoteNetemConfigFile" "${#validatorIpList[@]}" "$i"
-    done
-  else
-    num_nodes=$((${#validatorIpList[@]}*netemPartition/100))
-    if [[ $((${#validatorIpList[@]}*netemPartition%100)) -gt 0 ]]; then
-      num_nodes=$((num_nodes+1))
-    fi
-    if [[ "$num_nodes" -gt "${#validatorIpList[@]}" ]]; then
-      num_nodes=${#validatorIpList[@]}
-    fi
-
-    # Stop netem on all nodes
-    for ipAddress in "${validatorIpList[@]}"; do
-      "$here"/ssh.sh solana@"$ipAddress" 'solana/scripts/netem.sh delete < solana/netem.cfg || true'
-    done
-
-    # Start netem on required nodes
-    for ((i=0; i<num_nodes; i++ )); do :
-      "$here"/ssh.sh solana@"${validatorIpList[$i]}" "echo $netemConfig > solana/netem.cfg; solana/scripts/netem.sh add \"$netemConfig\""
-    done
-  fi
   ;;
 *)
   echo "Internal error: Unknown command: $command"

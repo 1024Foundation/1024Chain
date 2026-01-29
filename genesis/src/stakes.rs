@@ -4,19 +4,14 @@ use {
         address_generator::AddressGenerator,
         unlocks::{UnlockInfo, Unlocks},
     },
-    solana_sdk::{
-        account::Account,
-        clock::Slot,
-        genesis_config::GenesisConfig,
-        pubkey::Pubkey,
-        stake::{
-            self,
-            state::{Authorized, Lockup, StakeStateV2},
-        },
-        system_program,
-        timing::years_as_slots,
-    },
-    solana_stake_program::stake_state::create_lockup_stake_account,
+    solana_account::Account,
+    solana_clock::Slot,
+    solana_genesis_config::GenesisConfig,
+    solana_pubkey::Pubkey,
+    solana_runtime::genesis_utils::create_lockup_stake_account,
+    solana_sdk_ids::{stake as stake_program, system_program},
+    solana_stake_interface::state::{Authorized, Lockup, StakeStateV2},
+    solana_time_utils::years_as_slots,
 };
 
 #[derive(Debug)]
@@ -51,7 +46,7 @@ pub fn create_and_add_stakes(
     // the largest each stake account should be, in lamports
     granularity: Option<u64>,
 ) -> u64 {
-    let granularity = granularity.unwrap_or(std::u64::MAX);
+    let granularity = granularity.unwrap_or(u64::MAX);
     let staker = &staker_info
         .staker
         .parse::<Pubkey>()
@@ -105,7 +100,7 @@ pub fn create_and_add_stakes(
         genesis_config.ticks_per_slot,
     );
 
-    let mut address_generator = AddressGenerator::new(&authorized.staker, &stake::program::id());
+    let mut address_generator = AddressGenerator::new(&authorized.staker, &stake_program::id());
 
     let stake_rent_reserve = genesis_config.rent.minimum_balance(StakeStateV2::size_of());
 
@@ -165,7 +160,7 @@ pub fn create_and_add_stakes(
 
 #[cfg(test)]
 mod tests {
-    use {super::*, solana_sdk::rent::Rent};
+    use {super::*, solana_rent::Rent};
 
     fn create_and_check_stakes(
         genesis_config: &mut GenesisConfig,
@@ -268,7 +263,7 @@ mod tests {
         );
 
         // huge granularity doesn't blow up
-        let granularity = std::u64::MAX;
+        let granularity = u64::MAX;
         let total_lamports = staker_reserve + reserve * 2 + 1;
         create_and_check_stakes(
             &mut GenesisConfig {

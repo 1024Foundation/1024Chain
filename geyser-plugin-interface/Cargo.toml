@@ -1,7 +1,7 @@
 [package]
-name = "solana-geyser-plugin-interface"
+name = "agave-geyser-plugin-interface"
 description = "The Solana Geyser plugin interface."
-documentation = "https://docs.rs/solana-geyser-plugin-interface"
+documentation = "https://docs.rs/agave-geyser-plugin-interface"
 version = { workspace = true }
 authors = { workspace = true }
 repository = { workspace = true }
@@ -9,11 +9,17 @@ homepage = { workspace = true }
 license = { workspace = true }
 edition = { workspace = true }
 
-[dependencies]
-log = { workspace = true }
-solana-sdk = { workspace = true }
-solana-transaction-status = { workspace = true }
-thiserror = { workspace = true }
-
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
+
+[features]
+agave-unstable-api = []
+
+[dependencies]
+log = { workspace = true, features = ["std"] }
+solana-clock = { workspace = true }
+solana-hash = { workspace = true }
+solana-signature = { workspace = true }
+solana-transaction = { workspace = true }
+solana-transaction-status = { workspace = true }
+thiserror = { workspace = true }

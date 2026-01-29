@@ -24,20 +24,20 @@ implementation for the PostgreSQL database.
 
 ### Important Crates:
 
-- [`solana-geyser-plugin-interface`] &mdash; This crate defines the plugin
+- [`agave-geyser-plugin-interface`] &mdash; This crate defines the plugin
 interfaces.
 
 - [`solana-accountsdb-plugin-postgres`] &mdash; The crate for the referential
 plugin implementation for the PostgreSQL database.
 
-[`solana-geyser-plugin-interface`]: https://docs.rs/solana-geyser-plugin-interface
+[`agave-geyser-plugin-interface`]: https://docs.rs/agave-geyser-plugin-interface
 [`solana-accountsdb-plugin-postgres`]: https://docs.rs/solana-accountsdb-plugin-postgres
 [`solana-sdk`]: https://docs.rs/solana-sdk
 [`solana-transaction-status`]: https://docs.rs/solana-transaction-status
 
 ## The Plugin Interface
 
-The Plugin interface is declared in [`solana-geyser-plugin-interface`]. It
+The Plugin interface is declared in [`agave-geyser-plugin-interface`]. It
 is defined by the trait `GeyserPlugin`. The plugin should implement the
 trait and expose a "C" function `_create_plugin` to return the pointer to this
 trait. For example, in the referential implementation, the following code
@@ -166,7 +166,92 @@ please refer to [`solana-sdk`] and [`solana-transaction-status`]
 
 The `slot` points to the slot the transaction is executed at.
 For more details, please refer to the Rust documentation in
-[`solana-geyser-plugin-interface`].
+[`agave-geyser-plugin-interface`].
+
+# Timing Relationships of Various Plugin Callbacks.
+
+Account update via update_account: As mentioned previously when is_startup is
+false, the account is updated during transaction processing. The account update
+has information about the transaction causing the update in the `txn` field.
+Note, when account update is sent during start up, the txn field is None as
+there is no transaction.
+
+```
+pub struct ReplicaAccountInfoV3<'a> {
+    /// The Pubkey for the account
+    pub pubkey: &'a [u8],
+
+    /// The lamports for the account
+    pub lamports: u64,
+
+    /// The Pubkey of the owner program account
+    pub owner: &'a [u8],
+
+    /// This account's data contains a loaded program (and is now read-only)
+    pub executable: bool,
+
+    /// The epoch at which this account will next owe rent
+    pub rent_epoch: u64,
+
+    /// The data held in this account.
+    pub data: &'a [u8],
+
+    /// A global monotonically increasing atomic number, which can be used
+    /// to tell the order of the account update. For example, when an
+    /// account is updated in the same slot multiple times, the update
+    /// with higher write_version should supersede the one with lower
+    /// write_version.
+    pub write_version: u64,
+
+    /// Reference to transaction causing this account modification
+    pub txn: Option<&'a SanitizedTransaction>,
+}
+```
+
+The updates are sent serially for different accounts via update_slot_status
+in the transaction for a slot. After the accounts notifications are sent, the
+SlotStatus::Processed event is sent.
+
+Starting with Agave 3.0, transaction notifications are sent before
+SlotStatus::Processed. In prior Agave version, even though SlotStatus::Processed
+is sent logically after the transaction events, because there are intermediate
+threads emitting the notitications to the plugin, the plugin can see the
+transaction notifications and the SlotStatus::Processed for a slot in either
+order.
+
+Within a block, transactions are ordered with transaction index. Transactions
+within a block are processed and notified in parallel. A plugin should use the
+transaction index to determine their relative order.
+
+A plugin can use the notify_block_metadata to know the
+executed_transaction_count for a given slot in the following structure:
+
+```
+/// Extending ReplicaBlockInfo by sending RewardsAndNumPartitions.
+#[derive(Clone, Debug)]
+#[repr(C)]
+pub struct ReplicaBlockInfoV4<'a> {
+    pub parent_slot: Slot,
+    pub parent_blockhash: &'a str,
+    pub slot: Slot,
+    pub blockhash: &'a str,
+    pub rewards: &'a RewardsAndNumPartitions,
+    pub block_time: Option<UnixTimestamp>,
+    pub block_height: Option<u64>,
+    pub executed_transaction_count: u64,
+    pub entry_count: u64,
+}
+```
+
+The plugin can associate accounts with transactions via the txn field in the
+ReplicaAccountInfoV3 structure. It can also use ReplicaTransactionInfoV2 in
+the notify_transaction callback to get the account addresses.
+
+The SlotStatus::Confirmed and SlotStatus::Processed events can reach the plugin
+in any order as they are sent asynchronous to each other. A plugin should wait
+for both events to confirm they are processed and confirmed.
+
+The SlotStatus::Rooted is sent after SlotStatus::Processed.
 
 ## Example PostgreSQL Plugin
 

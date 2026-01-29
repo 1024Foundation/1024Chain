@@ -27,7 +27,7 @@ use {
 };
 
 pub struct HttpSender {
-    client: Arc<reqwest::Client>,
+    client: Arc<reqwest_middleware::ClientWithMiddleware>,
     url: String,
     request_id: AtomicU64,
     stats: RwLock<RpcTransportStats>,
@@ -62,6 +62,21 @@ impl HttpSender {
     ///
     /// Most flexible way to create a sender. Pass a created `reqwest::Client`.
     pub fn new_with_client<U: ToString>(url: U, client: reqwest::Client) -> Self {
+        Self {
+            client: Arc::new(reqwest_middleware::ClientBuilder::new(client).build()),
+            url: url.to_string(),
+            request_id: AtomicU64::new(0),
+            stats: RwLock::new(RpcTransportStats::default()),
+        }
+    }
+
+    /// Create an HTTP RPC sender.
+    ///
+    /// Most flexible way to create a sender with middleware. Pass a created `reqwest_middleware::ClientWithMiddleware`.
+    pub fn new_with_client_with_middleware<U: ToString>(
+        url: U,
+        client: reqwest_middleware::ClientWithMiddleware,
+    ) -> Self {
         Self {
             client: Arc::new(client),
             url: url.to_string(),
@@ -104,7 +119,7 @@ impl<'a> StatsUpdater<'a> {
     }
 }
 
-impl<'a> Drop for StatsUpdater<'a> {
+impl Drop for StatsUpdater<'_> {
     fn drop(&mut self) {
         let mut stats = self.stats.write().unwrap();
         stats.request_count += 1;
@@ -159,9 +174,9 @@ impl RpcSender for HttpSender {
 
                     too_many_requests_retries -= 1;
                     debug!(
-                                "Too many requests: server responded with {:?}, {} retries left, pausing for {:?}",
-                                response, too_many_requests_retries, duration
-                            );
+                        "Too many requests: server responded with {response:?}, \
+                         {too_many_requests_retries} retries left, pausing for {duration:?}"
+                    );
 
                     sleep(duration).await;
                     stats_updater.add_rate_limited_time(duration);
@@ -179,7 +194,7 @@ impl RpcSender for HttpSender {
                                         match serde_json::from_value::<RpcSimulateTransactionResult>(json["error"]["data"].clone()) {
                                             Ok(data) => RpcResponseErrorData::SendTransactionPreflightFailure(data),
                                             Err(err) => {
-                                                debug!("Failed to deserialize RpcSimulateTransactionResult: {:?}", err);
+                                                debug!("Failed to deserialize RpcSimulateTransactionResult: {err:?}");
                                                 RpcResponseErrorData::Empty
                                             }
                                         }

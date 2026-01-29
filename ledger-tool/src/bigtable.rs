@@ -1,34 +1,45 @@
 //! The `bigtable` subcommand
 use {
     crate::{
+        args::{load_genesis_arg, snapshot_args},
         ledger_path::canonicalize_ledger_path,
-        output::{CliBlockWithEntries, CliEntries, EncodedConfirmedBlockWithEntries},
+        load_and_process_ledger_or_exit, open_genesis_config_by,
+        output::{
+            encode_confirmed_block, CliBlockWithEntries, CliEntries,
+            EncodedConfirmedBlockWithEntries,
+        },
+        parse_process_options, LoadAndProcessLedgerOutput,
     },
     clap::{
         value_t, value_t_or_exit, values_t_or_exit, App, AppSettings, Arg, ArgMatches, SubCommand,
     },
     crossbeam_channel::unbounded,
     futures::stream::FuturesUnordered,
-    log::{debug, error, info},
+    log::{debug, error, info, warn},
     serde_json::json,
     solana_clap_utils::{
         input_parsers::pubkey_of,
-        input_validators::{is_slot, is_valid_pubkey},
+        input_validators::{is_parsable, is_slot, is_valid_pubkey},
     },
     solana_cli_output::{
         display::println_transaction, CliBlock, CliTransaction, CliTransactionConfirmation,
         OutputFormat,
     },
+    solana_clock::Slot,
+    solana_entry::entry::{create_ticks, Entry},
+    solana_hash::Hash,
+    solana_keypair::keypair_from_seed,
     solana_ledger::{
-        bigtable_upload::ConfirmedBlockUploadConfig, blockstore::Blockstore,
+        bigtable_upload::ConfirmedBlockUploadConfig,
+        blockstore::Blockstore,
         blockstore_options::AccessType,
+        shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
     },
-    solana_sdk::{clock::Slot, pubkey::Pubkey, signature::Signature},
+    solana_pubkey::Pubkey,
+    solana_shred_version::compute_shred_version,
+    solana_signature::Signature,
     solana_storage_bigtable::CredentialType,
-    solana_transaction_status::{
-        BlockEncodingOptions, ConfirmedBlock, EncodeError, EncodedConfirmedBlock,
-        TransactionDetails, UiTransactionEncoding, VersionedConfirmedBlock,
-    },
+    solana_transaction_status::{ConfirmedBlock, UiTransactionEncoding, VersionedConfirmedBlock},
     std::{
         cmp::min,
         collections::HashSet,
@@ -82,7 +93,7 @@ async fn upload(
             Arc::new(AtomicBool::new(false)),
         )
         .await?;
-        info!("last slot checked: {}", last_slot_checked);
+        info!("last slot checked: {last_slot_checked}");
         starting_slot = last_slot_checked.saturating_add(1);
     }
     info!("No more blocks to upload.");
@@ -124,21 +135,7 @@ async fn block(
         .map_err(|err| format!("Failed to connect to storage: {err:?}"))?;
 
     let confirmed_block = bigtable.get_confirmed_block(slot).await?;
-    let encoded_block = confirmed_block
-        .encode_with_options(
-            UiTransactionEncoding::Base64,
-            BlockEncodingOptions {
-                transaction_details: TransactionDetails::Full,
-                show_rewards: true,
-                max_supported_transaction_version: Some(0),
-            },
-        )
-        .map_err(|err| match err {
-            EncodeError::UnsupportedTransactionVersion(version) => {
-                format!("Failed to process unsupported transaction version ({version}) in block")
-            }
-        })?;
-    let encoded_block: EncodedConfirmedBlock = encoded_block.into();
+    let encoded_block = encode_confirmed_block(confirmed_block)?;
 
     if show_entries {
         let entries = bigtable.get_entries(slot).await?;
@@ -175,6 +172,238 @@ async fn entries(
         slot,
     };
     println!("{}", output_format.formatted_string(&cli_entries));
+    Ok(())
+}
+
+enum ShredPohGenerationMode {
+    AllowMockPoh(MockPohConfig),
+    RequireEntryData,
+}
+
+struct MockPohConfig {
+    num_hashes_per_tick: u64,
+    num_ticks_per_slot: u64,
+}
+
+struct ShredConfig {
+    shred_version: u16,
+    poh_generation_mode: ShredPohGenerationMode,
+}
+
+fn get_shred_config_from_ledger(
+    arg_matches: &ArgMatches,
+    ledger_path: &Path,
+    blockstore: Arc<Blockstore>,
+    allow_mock_poh: bool,
+    starting_slot: Slot,
+    ending_slot: Slot,
+) -> ShredConfig {
+    let process_options = parse_process_options(ledger_path, arg_matches);
+    let genesis_config = open_genesis_config_by(ledger_path, arg_matches);
+    let LoadAndProcessLedgerOutput { bank_forks, .. } = load_and_process_ledger_or_exit(
+        arg_matches,
+        &genesis_config,
+        blockstore.clone(),
+        process_options,
+        None,
+    );
+
+    let bank = bank_forks.read().unwrap().working_bank();
+    let shred_version = compute_shred_version(&genesis_config.hash(), Some(&bank.hard_forks()));
+    // If mock PoH is allowed, ensure that the requested slots are in
+    // the same epoch as the working bank. This will ensure the values
+    // extracted from the Bank are accurate for the slot range
+    if allow_mock_poh {
+        let working_bank_epoch = bank.epoch();
+        let epoch_schedule = bank.epoch_schedule();
+        let starting_epoch = epoch_schedule.get_epoch(starting_slot);
+        let ending_epoch = epoch_schedule.get_epoch(ending_slot);
+        if starting_epoch != ending_epoch {
+            eprintln!(
+                "The specified --starting-slot and --ending-slot must be in the same epoch. \
+                 --starting-slot {starting_slot} is in epoch {starting_epoch}, but --ending-slot \
+                 {ending_slot} is in epoch {ending_epoch}."
+            );
+            exit(1);
+        }
+        if starting_epoch != working_bank_epoch {
+            eprintln!(
+                "The range of slots between --starting-slot and --ending-slot are in a different \
+                 epoch than the working bank. The specified range is in epoch {starting_epoch}, \
+                 but the working bank is in {working_bank_epoch}."
+            );
+            exit(1);
+        }
+
+        let mock_poh_config = MockPohConfig {
+            num_hashes_per_tick: bank.hashes_per_tick().unwrap_or(0),
+            num_ticks_per_slot: bank.ticks_per_slot(),
+        };
+        ShredConfig {
+            shred_version,
+            poh_generation_mode: ShredPohGenerationMode::AllowMockPoh(mock_poh_config),
+        }
+    } else {
+        ShredConfig {
+            shred_version,
+            poh_generation_mode: ShredPohGenerationMode::RequireEntryData,
+        }
+    }
+}
+
+async fn shreds(
+    blockstore: Arc<Blockstore>,
+    starting_slot: Slot,
+    ending_slot: Slot,
+    shred_config: ShredConfig,
+    config: solana_storage_bigtable::LedgerStorageConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bigtable = solana_storage_bigtable::LedgerStorage::new_with_config(config)
+        .await
+        .map_err(|err| format!("Failed to connect to storage: {err:?}"))?;
+
+    // Make the range inclusive of both starting and ending slot
+    let limit = ending_slot.saturating_sub(starting_slot).saturating_add(1) as usize;
+    let mut slots = bigtable.get_confirmed_blocks(starting_slot, limit).await?;
+    slots.retain(|&slot| slot <= ending_slot);
+
+    // Create a "dummy" keypair to sign the shreds that will later be created.
+    //
+    // The validator shred ingestion path sigverifies shreds from the network
+    // using the known leader for any given slot. It is unlikely that a user of
+    // this tool will have access to these leader identity keypairs. However,
+    // shred sigverify occurs prior to Blockstore::insert_shreds(). Thus, the
+    // shreds being signed with the "dummy" keyapir can still be inserted and
+    // later read/replayed/etc
+    let keypair = keypair_from_seed(&[0; 64])?;
+
+    for slot in slots.iter() {
+        let block = bigtable.get_confirmed_block(*slot).await?;
+        let entry_summaries = bigtable.get_entries(*slot).await;
+
+        let entries = match entry_summaries {
+            Ok(entry_summaries) => entry_summaries
+                .enumerate()
+                .map(|(i, entry_summary)| {
+                    let num_hashes = entry_summary.num_hashes;
+                    let hash = entry_summary.hash;
+                    let starting_transaction_index = entry_summary.starting_transaction_index;
+                    let num_transactions = entry_summary.num_transactions as usize;
+
+                    let Some(transactions) = block.transactions.get(
+                        starting_transaction_index..starting_transaction_index + num_transactions,
+                    ) else {
+                        let num_block_transactions = block.transactions.len();
+                        return Err(format!(
+                            "Entry summary {i} for slot {slot} with starting_transaction_index \
+                             {starting_transaction_index} and num_transactions {num_transactions} \
+                             is in conflict with the block, which has {num_block_transactions} \
+                             transactions"
+                        ));
+                    };
+                    let transactions = transactions
+                        .iter()
+                        .map(|tx_with_meta| tx_with_meta.get_transaction())
+                        .collect();
+
+                    Ok(Entry {
+                        num_hashes,
+                        hash,
+                        transactions,
+                    })
+                })
+                .collect::<Result<Vec<Entry>, std::string::String>>()?,
+            Err(err) => {
+                let err_msg = format!("Failed to get PoH entries for {slot}: {err}");
+                let (num_hashes_per_tick, num_ticks_per_slot) =
+                    match shred_config.poh_generation_mode {
+                        ShredPohGenerationMode::RequireEntryData => {
+                            return Err(format!(
+                                "{err_msg}. Try passing --allow-mock-poh to allow creation of \
+                                 shreds with mocked PoH entries"
+                            ))?;
+                        }
+                        ShredPohGenerationMode::AllowMockPoh(ref mock_poh_config) => {
+                            warn!("{err_msg}. Will create mock PoH entries instead.");
+                            (
+                                mock_poh_config.num_hashes_per_tick,
+                                mock_poh_config.num_ticks_per_slot,
+                            )
+                        }
+                    };
+
+                let num_total_ticks = ((slot - block.parent_slot) * num_ticks_per_slot) as usize;
+                let num_total_entries = num_total_ticks + block.transactions.len();
+                let mut entries = Vec::with_capacity(num_total_entries);
+
+                // Create virtual tick entries for any skipped slots
+                //
+                // These ticks are necessary so that the tick height is
+                // advanced to the proper value when this block is processed.
+                //
+                // Additionally, a blockhash will still be inserted into the
+                // recent blockhashes sysvar for skipped slots. So, these
+                // virtual ticks will have the proper PoH
+                let num_skipped_slots = slot - block.parent_slot - 1;
+                if num_skipped_slots > 0 {
+                    let num_virtual_ticks = num_skipped_slots * num_ticks_per_slot;
+                    let parent_blockhash = Hash::from_str(&block.previous_blockhash)?;
+                    let virtual_ticks_entries =
+                        create_ticks(num_virtual_ticks, num_hashes_per_tick, parent_blockhash);
+                    entries.extend(virtual_ticks_entries.into_iter());
+                }
+
+                // Create transaction entries
+                //
+                // Keep it simple and just do one transaction per Entry
+                let transaction_entries = block.transactions.iter().map(|tx_with_meta| Entry {
+                    num_hashes: 0,
+                    hash: Hash::default(),
+                    transactions: vec![tx_with_meta.get_transaction()],
+                });
+                entries.extend(transaction_entries.into_iter());
+
+                // Create the tick entries for this slot
+                //
+                // We do not know the intermediate hashes, so just use default
+                // hash for all ticks. The exception is the final tick; the
+                // final tick determines the blockhash so set it the known
+                // blockhash from the bigtable block
+                let blockhash = Hash::from_str(&block.blockhash)?;
+                let tick_entries = (0..num_ticks_per_slot).map(|idx| {
+                    let hash = if idx == num_ticks_per_slot - 1 {
+                        blockhash
+                    } else {
+                        Hash::default()
+                    };
+                    Entry {
+                        num_hashes: 0,
+                        hash,
+                        transactions: vec![],
+                    }
+                });
+                entries.extend(tick_entries.into_iter());
+
+                entries
+            }
+        };
+
+        let shredder = Shredder::new(*slot, block.parent_slot, 0, shred_config.shred_version)?;
+        let data_shreds: Vec<_> = shredder
+            .make_merkle_shreds_from_entries(
+                &keypair,
+                &entries,
+                true,            // last_in_slot
+                Hash::default(), // chained_merkle_root
+                0,               // next_shred_index
+                0,               // next_code_index
+                &ReedSolomonCache::default(),
+                &mut ProcessShredsStats::default(),
+            )
+            .filter(Shred::is_data)
+            .collect();
+        blockstore.insert_shreds(data_shreds, None, false)?;
+    }
     Ok(())
 }
 
@@ -292,7 +521,7 @@ async fn confirm(
         confirmation_status: Some(transaction_status.confirmation_status()),
         transaction,
         get_transaction_error,
-        err: transaction_status.err.clone(),
+        err: transaction_status.err.clone().map(Into::into),
     };
     println!("{}", output_format.formatted_string(&cli_transaction));
     Ok(())
@@ -449,7 +678,7 @@ impl CopyArgs {
 async fn copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
     let from_slot = args.from_slot;
     let to_slot = args.to_slot.unwrap_or(from_slot);
-    debug!("from_slot: {}, to_slot: {}", from_slot, to_slot);
+    debug!("from_slot: {from_slot}, to_slot: {to_slot}");
 
     if from_slot > to_slot {
         return Err("starting slot should be less than or equal to ending slot")?;
@@ -481,7 +710,7 @@ async fn copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let workers = min(to_slot - from_slot + 1, num_cpus::get().try_into().unwrap());
-    debug!("worker num: {}", workers);
+    debug!("worker num: {workers}");
 
     let success_slots = Arc::new(Mutex::new(vec![]));
     let skip_slots = Arc::new(Mutex::new(vec![]));
@@ -500,7 +729,7 @@ async fn copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
             let failed_slots_clone = Arc::clone(&failed_slots);
             tokio::spawn(async move {
                 while let Ok(slot) = r.try_recv() {
-                    debug!("worker {}: received slot {}", i, slot);
+                    debug!("worker {i}: received slot {slot}");
 
                     if !args.force {
                         match destination_bigtable_clone
@@ -516,8 +745,7 @@ async fn copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
                             Err(err) => {
                                 error!(
                                     "confirmed_block_exists() failed from the destination \
-                                     Bigtable, slot: {}, err: {}",
-                                    slot, err
+                                     Bigtable, slot: {slot}, err: {err}"
                                 );
                                 failed_slots_clone.lock().unwrap().push(slot);
                                 continue;
@@ -529,10 +757,10 @@ async fn copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
                         match source_bigtable_clone.confirmed_block_exists(slot).await {
                             Ok(exist) => {
                                 if exist {
-                                    debug!("will write block: {}", slot);
+                                    debug!("will write block: {slot}");
                                     success_slots_clone.lock().unwrap().push(slot);
                                 } else {
-                                    debug!("block not found, slot: {}", slot);
+                                    debug!("block not found, slot: {slot}");
                                     block_not_found_slots_clone.lock().unwrap().push(slot);
                                     continue;
                                 }
@@ -540,53 +768,50 @@ async fn copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
                             Err(err) => {
                                 error!(
                                     "failed to get a confirmed block from the source Bigtable, \
-                                     slot: {}, err: {}",
-                                    slot, err
+                                     slot: {slot}, err: {err}"
                                 );
                                 failed_slots_clone.lock().unwrap().push(slot);
                                 continue;
                             }
                         };
                     } else {
-                        let confirmed_block =
-                            match source_bigtable_clone.get_confirmed_block(slot).await {
-                                Ok(block) => match VersionedConfirmedBlock::try_from(block) {
-                                    Ok(block) => block,
-                                    Err(err) => {
-                                        error!(
-                                            "failed to convert confirmed block to versioned \
-                                             confirmed block, slot: {}, err: {}",
-                                            slot, err
-                                        );
-                                        failed_slots_clone.lock().unwrap().push(slot);
-                                        continue;
-                                    }
-                                },
-                                Err(solana_storage_bigtable::Error::BlockNotFound(slot)) => {
-                                    debug!("block not found, slot: {}", slot);
-                                    block_not_found_slots_clone.lock().unwrap().push(slot);
-                                    continue;
-                                }
+                        let confirmed_block = match source_bigtable_clone
+                            .get_confirmed_block(slot)
+                            .await
+                        {
+                            Ok(block) => match VersionedConfirmedBlock::try_from(block) {
+                                Ok(block) => block,
                                 Err(err) => {
                                     error!(
-                                        "failed to get confirmed block, slot: {}, err: {}",
-                                        slot, err
+                                        "failed to convert confirmed block to versioned confirmed \
+                                         block, slot: {slot}, err: {err}"
                                     );
                                     failed_slots_clone.lock().unwrap().push(slot);
                                     continue;
                                 }
-                            };
+                            },
+                            Err(solana_storage_bigtable::Error::BlockNotFound(slot)) => {
+                                debug!("block not found, slot: {slot}");
+                                block_not_found_slots_clone.lock().unwrap().push(slot);
+                                continue;
+                            }
+                            Err(err) => {
+                                error!("failed to get confirmed block, slot: {slot}, err: {err}");
+                                failed_slots_clone.lock().unwrap().push(slot);
+                                continue;
+                            }
+                        };
 
                         match destination_bigtable_clone
                             .upload_confirmed_block(slot, confirmed_block)
                             .await
                         {
                             Ok(()) => {
-                                debug!("wrote block: {}", slot);
+                                debug!("wrote block: {slot}");
                                 success_slots_clone.lock().unwrap().push(slot);
                             }
                             Err(err) => {
-                                error!("write failed, slot: {}, err: {}", slot, err);
+                                error!("write failed, slot: {slot}, err: {err}");
                                 failed_slots_clone.lock().unwrap().push(slot);
                                 continue;
                             }
@@ -594,7 +819,7 @@ async fn copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                debug!("worker {}: exit", i);
+                debug!("worker {i}: exit");
             })
         })
         .collect::<FuturesUnordered<_>>();
@@ -610,10 +835,10 @@ async fn copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut failed_slots = failed_slots.lock().unwrap();
     failed_slots.sort();
 
-    debug!("success slots: {:?}", success_slots);
-    debug!("skip slots: {:?}", skip_slots);
-    debug!("blocks not found slots: {:?}", block_not_found_slots);
-    debug!("failed slots: {:?}", failed_slots);
+    debug!("success slots: {success_slots:?}");
+    debug!("skip slots: {skip_slots:?}");
+    debug!("blocks not found slots: {block_not_found_slots:?}");
+    debug!("failed slots: {failed_slots:?}");
 
     println!(
         "success: {}, skip: {}, block not found: {}, failed: {}",
@@ -863,6 +1088,56 @@ impl BigTableSubCommand for App<'_, '_> {
                         ),
                 )
                 .subcommand(
+                    SubCommand::with_name("shreds")
+                        .about(
+                            "Get confirmed blocks from BigTable, reassemble the transactions and \
+                             entries, shred the block and then insert the shredded blocks into \
+                             the local Blockstore",
+                        )
+                        .arg(load_genesis_arg())
+                        .args(&snapshot_args())
+                        .arg(
+                            Arg::with_name("starting_slot")
+                                .long("starting-slot")
+                                .validator(is_slot)
+                                .value_name("SLOT")
+                                .takes_value(true)
+                                .required(true)
+                                .help("Start shred creation at this slot (inclusive)"),
+                        )
+                        .arg(
+                            Arg::with_name("ending_slot")
+                                .long("ending-slot")
+                                .validator(is_slot)
+                                .value_name("SLOT")
+                                .takes_value(true)
+                                .required(true)
+                                .help("Stop shred creation at this slot (inclusive)"),
+                        )
+                        .arg(
+                            Arg::with_name("allow_mock_poh")
+                                .long("allow-mock-poh")
+                                .takes_value(false)
+                                .help(
+                                    "For slots where PoH entries are unavailable, allow the \
+                                     generation of mock PoH entries. The mock PoH entries enable \
+                                     the shredded block(s) to be replayable if PoH verification \
+                                     is disabled.",
+                                ),
+                        )
+                        .arg(
+                            Arg::with_name("shred_version")
+                                .long("shred-version")
+                                .validator(is_parsable::<u16>)
+                                .takes_value(true)
+                                .conflicts_with("allow_mock_poh")
+                                .help(
+                                    "The version to encode in created shreds. Specifying this \
+                                     value will avoid determining the value from a rebuilt Bank.",
+                                ),
+                        ),
+                )
+                .subcommand(
                     SubCommand::with_name("confirm")
                         .about("Confirm transaction by signature")
                         .arg(
@@ -907,9 +1182,9 @@ impl BigTableSubCommand for App<'_, '_> {
                                 .validator(is_slot)
                                 .default_value("1000")
                                 .help(
-                                    "Number of transaction signatures to query at once. \
-                                     Smaller: more responsive/lower throughput. \
-                                     Larger: less responsive/higher throughput",
+                                    "Number of transaction signatures to query at once. Smaller: \
+                                     more responsive/lower throughput. Larger: less \
+                                     responsive/higher throughput",
                                 ),
                         )
                         .arg(
@@ -1155,6 +1430,57 @@ pub fn bigtable_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) {
                 ..solana_storage_bigtable::LedgerStorageConfig::default()
             };
             runtime.block_on(entries(slot, output_format, config))
+        }
+        ("shreds", Some(arg_matches)) => {
+            let starting_slot = value_t_or_exit!(arg_matches, "starting_slot", Slot);
+            let ending_slot = value_t_or_exit!(arg_matches, "ending_slot", Slot);
+            if starting_slot > ending_slot {
+                eprintln!(
+                    "The specified --starting-slot {starting_slot} must be less than or equal to \
+                     the specified --ending-slot {ending_slot}."
+                );
+                exit(1);
+            }
+            let allow_mock_poh = arg_matches.is_present("allow_mock_poh");
+            let shred_version = value_t!(arg_matches, "shred_version", u16).ok();
+
+            let ledger_path = canonicalize_ledger_path(ledger_path);
+            let blockstore = Arc::new(crate::open_blockstore(
+                &ledger_path,
+                arg_matches,
+                AccessType::PrimaryForMaintenance,
+            ));
+
+            let shred_config = if let Some(shred_version) = shred_version {
+                ShredConfig {
+                    shred_version,
+                    poh_generation_mode: ShredPohGenerationMode::RequireEntryData,
+                }
+            } else {
+                get_shred_config_from_ledger(
+                    arg_matches,
+                    &ledger_path,
+                    blockstore.clone(),
+                    allow_mock_poh,
+                    starting_slot,
+                    ending_slot,
+                )
+            };
+
+            let config = solana_storage_bigtable::LedgerStorageConfig {
+                read_only: true,
+                instance_name,
+                app_profile_id,
+                ..solana_storage_bigtable::LedgerStorageConfig::default()
+            };
+
+            runtime.block_on(shreds(
+                blockstore,
+                starting_slot,
+                ending_slot,
+                shred_config,
+                config,
+            ))
         }
         ("blocks", Some(arg_matches)) => {
             let starting_slot = value_t_or_exit!(arg_matches, "starting_slot", Slot);

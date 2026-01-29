@@ -7,12 +7,13 @@ use {
         keypair::*,
     },
     solana_cli_output::{
-        CliEpochRewardshMetadata, CliInflation, CliKeyedEpochReward, CliKeyedEpochRewards,
+        CliEpochRewardsMetadata, CliInflation, CliKeyedEpochReward, CliKeyedEpochRewards,
     },
+    solana_clock::{Epoch, Slot, UnixTimestamp},
+    solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{clock::Epoch, pubkey::Pubkey},
-    std::rc::Rc,
+    std::{collections::HashMap, rc::Rc},
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -66,10 +67,9 @@ pub fn parse_inflation_subcommand(
         }
         _ => InflationCliCommand::Show,
     };
-    Ok(CliCommandInfo {
-        command: CliCommand::Inflation(command),
-        signers: vec![],
-    })
+    Ok(CliCommandInfo::without_signers(CliCommand::Inflation(
+        command,
+    )))
 }
 
 pub fn process_inflation_subcommand(
@@ -115,23 +115,31 @@ fn process_rewards(
     let epoch_schedule = rpc_client.get_epoch_schedule()?;
 
     let mut epoch_rewards: Vec<CliKeyedEpochReward> = vec![];
+    let mut block_times: HashMap<Slot, UnixTimestamp> = HashMap::new();
     let epoch_metadata = if let Some(Some(first_reward)) = rewards.iter().find(|&v| v.is_some()) {
         let (epoch_start_time, epoch_end_time) =
             crate::stake::get_epoch_boundary_timestamps(rpc_client, first_reward, &epoch_schedule)?;
         for (reward, address) in rewards.iter().zip(addresses) {
-            let cli_reward = reward.as_ref().and_then(|reward| {
-                crate::stake::make_cli_reward(reward, epoch_start_time, epoch_end_time)
-            });
+            let cli_reward = if let Some(reward) = reward {
+                let block_time = if let Some(block_time) = block_times.get(&reward.effective_slot) {
+                    *block_time
+                } else {
+                    let block_time = rpc_client.get_block_time(reward.effective_slot)?;
+                    block_times.insert(reward.effective_slot, block_time);
+                    block_time
+                };
+                crate::stake::make_cli_reward(reward, block_time, epoch_start_time, epoch_end_time)
+            } else {
+                None
+            };
             epoch_rewards.push(CliKeyedEpochReward {
                 address: address.to_string(),
                 reward: cli_reward,
             });
         }
-        let block_time = rpc_client.get_block_time(first_reward.effective_slot)?;
-        Some(CliEpochRewardshMetadata {
+        Some(CliEpochRewardsMetadata {
             epoch: first_reward.epoch,
-            effective_slot: first_reward.effective_slot,
-            block_time,
+            ..CliEpochRewardsMetadata::default()
         })
     } else {
         None

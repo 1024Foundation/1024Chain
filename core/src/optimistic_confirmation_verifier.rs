@@ -1,8 +1,10 @@
 use {
     crate::cluster_info_vote_listener::VoteTracker,
+    solana_clock::Slot,
+    solana_hash::Hash,
     solana_ledger::blockstore::Blockstore,
     solana_runtime::bank::Bank,
-    solana_sdk::{clock::Slot, hash::Hash, timing::timestamp},
+    solana_time_utils::timestamp,
     std::{collections::BTreeSet, time::Instant},
 };
 
@@ -61,15 +63,6 @@ impl OptimisticConfirmationVerifier {
             return;
         }
 
-        datapoint_info!(
-            "optimistic_slot_elapsed",
-            (
-                "average_elapsed_ms",
-                self.last_optimistic_slot_ts.elapsed().as_millis() as i64,
-                i64
-            ),
-        );
-
         // We don't have any information about ancestors before the snapshot root,
         // so ignore those slots
         for (new_optimistic_slot, hash) in new_optimistic_slots {
@@ -116,26 +109,15 @@ impl OptimisticConfirmationVerifier {
                     .unwrap_or(0);
 
                 error!(
-                    "{},
-                    hash: {},
-                    epoch: {},
-                    voted keys: {:?},
-                    root: {},
-                    root bank hash: {},
-                    voted stake: {},
-                    total epoch stake: {},
-                    pct: {}",
+                    "{}, hash: {hash}, epoch: {epoch}, voted keys: {:?}, root: {root}, root bank \
+                     hash: {}, voted stake: {voted_stake}, total epoch stake: \
+                     {total_epoch_stake}, pct: {}",
                     Self::format_optimistic_confirmed_slot_violation_log(*optimistic_slot),
-                    hash,
-                    epoch,
                     r_slot_tracker
                         .as_ref()
                         .and_then(|s| s.optimistic_votes_tracker(hash))
                         .map(|s| s.voted()),
-                    root,
                     root_bank.hash(),
-                    voted_stake,
-                    total_epoch_stake,
                     voted_stake as f64 / total_epoch_stake as f64,
                 );
                 voted_stake
@@ -157,8 +139,8 @@ impl OptimisticConfirmationVerifier {
 mod test {
     use {
         super::*, crate::vote_simulator::VoteSimulator,
-        solana_ledger::get_tmp_ledger_path_auto_delete, solana_runtime::bank::Bank,
-        solana_sdk::pubkey::Pubkey, std::collections::HashMap, trees::tr,
+        solana_ledger::get_tmp_ledger_path_auto_delete, solana_pubkey::Pubkey,
+        solana_runtime::bank::Bank, std::collections::HashMap, trees::tr,
     };
 
     #[test]
@@ -195,7 +177,7 @@ mod test {
         let snapshot_start_slot = 0;
         let mut optimistic_confirmation_verifier =
             OptimisticConfirmationVerifier::new(snapshot_start_slot);
-        let bad_bank_hash = Hash::new(&[42u8; 32]);
+        let bad_bank_hash = Hash::new_from_array([42u8; 32]);
         let blockstore_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(blockstore_path.path()).unwrap();
         let optimistic_slots = vec![(1, bad_bank_hash), (3, Hash::default())];

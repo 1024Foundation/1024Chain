@@ -1,34 +1,38 @@
 use {
     crate::{
         cli::{
-            log_instruction_custom_error, CliCommand, CliCommandInfo, CliConfig, CliError,
-            ProcessResult,
+            log_instruction_custom_error, log_instruction_custom_error_to_str, CliCommand,
+            CliCommandInfo, CliConfig, CliError, ProcessResult,
         },
         spend_utils::{resolve_spend_tx_and_check_account_balance, SpendAmount},
     },
+    agave_feature_set::FEATURE_NAMES,
     clap::{value_t_or_exit, App, AppSettings, Arg, ArgMatches, SubCommand},
     console::style,
     serde::{Deserialize, Serialize},
+    solana_account::Account,
     solana_clap_utils::{
-        fee_payer::*, hidden_unless_forced, input_parsers::*, input_validators::*, keypair::*,
+        compute_budget::ComputeUnitLimit, fee_payer::*, hidden_unless_forced, input_parsers::*,
+        input_validators::*, keypair::*,
     },
     solana_cli_output::{cli_version::CliVersion, QuietDisplay, VerboseDisplay},
+    solana_clock::{Epoch, Slot},
+    solana_cluster_type::ClusterType,
+    solana_epoch_schedule::EpochSchedule,
+    solana_feature_gate_interface::{
+        activate_with_lamports, error::FeatureGateError, from_account,
+        instruction::revoke_pending_activation, Feature,
+    },
+    solana_message::Message,
+    solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_rpc_client_api::{client_error::Error as ClientError, request::MAX_MULTIPLE_ACCOUNTS},
-    solana_sdk::{
-        account::Account,
-        clock::Slot,
-        epoch_schedule::EpochSchedule,
-        feature::{self, Feature},
-        feature_set::FEATURE_NAMES,
-        genesis_config::ClusterType,
-        message::Message,
-        pubkey::Pubkey,
-        stake_history::Epoch,
-        system_instruction::SystemError,
-        transaction::Transaction,
+    solana_rpc_client_api::{
+        client_error::Error as ClientError, request::MAX_MULTIPLE_ACCOUNTS,
+        response::RpcVoteAccountInfo,
     },
+    solana_system_interface::error::SystemError,
+    solana_transaction::Transaction,
     std::{cmp::Ordering, collections::HashMap, fmt, rc::Rc, str::FromStr},
 };
 
@@ -51,6 +55,11 @@ pub enum FeatureCliCommand {
         feature: Pubkey,
         cluster: ClusterType,
         force: ForceActivation,
+        fee_payer: SignerIndex,
+    },
+    Revoke {
+        feature: Pubkey,
+        cluster: ClusterType,
         fee_payer: SignerIndex,
     },
 }
@@ -145,7 +154,11 @@ impl fmt::Display for CliFeatures {
                     CliFeatureStatus::Inactive => style("inactive".to_string()).red(),
                     CliFeatureStatus::Pending => {
                         let current_epoch = self.epoch_schedule.get_epoch(self.current_slot);
-                        style(format!("pending until epoch {}", current_epoch + 1)).yellow()
+                        style(format!(
+                            "pending until epoch {}",
+                            current_epoch.saturating_add(1)
+                        ))
+                        .yellow()
                     }
                     CliFeatureStatus::Active(activation_slot) => {
                         let activation_epoch = self.epoch_schedule.get_epoch(activation_slot);
@@ -473,6 +486,26 @@ impl FeatureSubCommands for App<'_, '_> {
                                 .help("Override activation sanity checks. Don't use this flag"),
                         )
                         .arg(fee_payer_arg()),
+                )
+                .subcommand(
+                    SubCommand::with_name("revoke")
+                        .about("Revoke a pending runtime feature")
+                        .arg(
+                            Arg::with_name("feature")
+                                .value_name("FEATURE_KEYPAIR")
+                                .validator(is_valid_signer)
+                                .index(1)
+                                .required(true)
+                                .help("The signer for the feature to revoke"),
+                        )
+                        .arg(
+                            Arg::with_name("cluster")
+                                .value_name("CLUSTER")
+                                .possible_values(&ClusterType::STRINGS)
+                                .required(true)
+                                .help("The cluster to revoke the feature on"),
+                        )
+                        .arg(fee_payer_arg()),
                 ),
         )
     }
@@ -526,6 +559,31 @@ pub fn parse_feature_subcommand(
                 signers: signer_info.signers,
             }
         }
+        ("revoke", Some(matches)) => {
+            let cluster = value_t_or_exit!(matches, "cluster", ClusterType);
+            let (feature_signer, feature) = signer_of(matches, "feature", wallet_manager)?;
+            let (fee_payer, fee_payer_pubkey) =
+                signer_of(matches, FEE_PAYER_ARG.name, wallet_manager)?;
+
+            let signer_info = default_signer.generate_unique_signers(
+                vec![fee_payer, feature_signer],
+                matches,
+                wallet_manager,
+            )?;
+
+            let feature = feature.unwrap();
+
+            known_feature(&feature)?;
+
+            CliCommandInfo {
+                command: CliCommand::Feature(FeatureCliCommand::Revoke {
+                    feature,
+                    cluster,
+                    fee_payer: signer_info.index_of(fee_payer_pubkey).unwrap(),
+                }),
+                signers: signer_info.signers,
+            }
+        }
         ("status", Some(matches)) => {
             let mut features = if let Some(features) = pubkeys_of(matches, "features") {
                 for feature in &features {
@@ -538,13 +596,10 @@ pub fn parse_feature_subcommand(
             let display_all =
                 matches.is_present("display_all") || features.len() < FEATURE_NAMES.len();
             features.sort();
-            CliCommandInfo {
-                command: CliCommand::Feature(FeatureCliCommand::Status {
-                    features,
-                    display_all,
-                }),
-                signers: vec![],
-            }
+            CliCommandInfo::without_signers(CliCommand::Feature(FeatureCliCommand::Status {
+                features,
+                display_all,
+            }))
         }
         _ => unreachable!(),
     };
@@ -567,6 +622,11 @@ pub fn process_feature_subcommand(
             force,
             fee_payer,
         } => process_activate(rpc_client, config, *feature, *cluster, *force, *fee_payer),
+        FeatureCliCommand::Revoke {
+            feature,
+            cluster,
+            fee_payer,
+        } => process_revoke(rpc_client, config, *feature, *cluster, *fee_payer),
     }
 }
 
@@ -651,27 +711,36 @@ fn cluster_info_stats(rpc_client: &RpcClient) -> Result<ClusterInfoStats, Client
     let vote_stakes = vote_accounts
         .current
         .into_iter()
-        .map(|vote_account| {
-            total_active_stake += vote_account.activated_stake;
-            (vote_account.node_pubkey, vote_account.activated_stake)
-        })
+        .map(
+            |RpcVoteAccountInfo {
+                 node_pubkey,
+                 activated_stake,
+                 ..
+             }| {
+                total_active_stake = total_active_stake.saturating_add(activated_stake);
+                (node_pubkey.clone(), activated_stake)
+            },
+        )
         .collect::<HashMap<_, _>>();
 
     let mut cluster_info_stats: HashMap<(u32, CliVersion), StatsEntry> = HashMap::new();
-    let mut total_rpc_nodes = 0;
+    let mut total_rpc_nodes: u64 = 0;
     for (node_id, feature_set, is_rpc, version) in cluster_info_list {
         let feature_set = feature_set.unwrap_or(0);
-        let stats_entry = cluster_info_stats
+        let StatsEntry {
+            stake_lamports,
+            rpc_nodes_count,
+        } = cluster_info_stats
             .entry((feature_set, version))
             .or_default();
 
         if let Some(vote_stake) = vote_stakes.get(&node_id) {
-            stats_entry.stake_lamports += *vote_stake;
+            *stake_lamports = stake_lamports.saturating_add(*vote_stake);
         }
 
         if is_rpc {
-            stats_entry.rpc_nodes_count += 1;
-            total_rpc_nodes += 1;
+            *rpc_nodes_count = rpc_nodes_count.saturating_add(1);
+            total_rpc_nodes = total_rpc_nodes.saturating_add(1);
         }
     }
 
@@ -806,8 +875,8 @@ fn feature_activation_allowed(
     ))
 }
 
-fn status_from_account(account: Account) -> Option<CliFeatureStatus> {
-    feature::from_account(&account).map(|feature| match feature.activated_at {
+pub(super) fn status_from_account(account: Account) -> Option<CliFeatureStatus> {
+    from_account(&account).map(|feature| match feature.activated_at {
         None => CliFeatureStatus::Pending,
         Some(activation_slot) => CliFeatureStatus::Active(activation_slot),
     })
@@ -929,7 +998,7 @@ fn process_activate(
         .unwrap();
 
     if let Some(account) = account {
-        if feature::from_account(&account).is_some() {
+        if from_account(&account).is_some() {
             return Err(format!("{feature_id} has already been activated").into());
         }
     }
@@ -959,9 +1028,10 @@ fn process_activate(
         SpendAmount::Some(rent),
         &blockhash,
         &fee_payer.pubkey(),
+        ComputeUnitLimit::Default,
         |lamports| {
             Message::new(
-                &feature::activate_with_lamports(&feature_id, &fee_payer.pubkey(), lamports),
+                &activate_with_lamports(&feature_id, &fee_payer.pubkey(), lamports),
                 Some(&fee_payer.pubkey()),
             )
         },
@@ -975,6 +1045,64 @@ fn process_activate(
         FEATURE_NAMES.get(&feature_id).unwrap(),
         feature_id
     );
-    let result = rpc_client.send_and_confirm_transaction_with_spinner(&transaction);
+    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+        &transaction,
+        config.commitment,
+        config.send_transaction_config,
+    );
     log_instruction_custom_error::<SystemError>(result, config)
+}
+
+fn process_revoke(
+    rpc_client: &RpcClient,
+    config: &CliConfig,
+    feature_id: Pubkey,
+    cluster: ClusterType,
+    fee_payer: SignerIndex,
+) -> ProcessResult {
+    check_rpc_genesis_hash(&cluster, rpc_client)?;
+
+    let fee_payer = config.signers[fee_payer];
+    let account = rpc_client.get_account(&feature_id).ok();
+
+    match account.and_then(status_from_account) {
+        Some(CliFeatureStatus::Pending) => (),
+        Some(CliFeatureStatus::Active(..)) => {
+            return Err(format!("{feature_id} has already been fully activated").into());
+        }
+        Some(CliFeatureStatus::Inactive) | None => {
+            return Err(format!("{feature_id} has not been submitted for activation").into());
+        }
+    }
+
+    let blockhash = rpc_client.get_latest_blockhash()?;
+    let (message, _) = resolve_spend_tx_and_check_account_balance(
+        rpc_client,
+        false,
+        SpendAmount::Some(0),
+        &blockhash,
+        &fee_payer.pubkey(),
+        ComputeUnitLimit::Default,
+        |_lamports| {
+            Message::new(
+                &[revoke_pending_activation(&feature_id)],
+                Some(&fee_payer.pubkey()),
+            )
+        },
+        config.commitment,
+    )?;
+    let mut transaction = Transaction::new_unsigned(message);
+    transaction.try_sign(&config.signers, blockhash)?;
+
+    println!(
+        "Revoking {} ({})",
+        FEATURE_NAMES.get(&feature_id).unwrap(),
+        feature_id
+    );
+    let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+        &transaction,
+        config.commitment,
+        config.send_transaction_config,
+    );
+    log_instruction_custom_error_to_str::<FeatureGateError>(result, config)
 }

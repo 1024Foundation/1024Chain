@@ -9,32 +9,56 @@ homepage = { workspace = true }
 license = { workspace = true }
 edition = { workspace = true }
 
-[dependencies]
-bincode = { workspace = true }
-crossbeam-channel = { workspace = true }
-dlopen2 = { workspace = true }
-lazy_static = { workspace = true }
-log = { workspace = true }
-rand = { workspace = true }
-rayon = { workspace = true }
-serde = { workspace = true }
-solana-measure = { workspace = true }
-solana-merkle-tree = { workspace = true }
-solana-metrics = { workspace = true }
-solana-perf = { workspace = true }
-solana-rayon-threadlimit = { workspace = true }
-solana-sdk = { workspace = true }
-
-[dev-dependencies]
-assert_matches = { workspace = true }
-solana-logger = { workspace = true }
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lib]
 crate-type = ["lib"]
 name = "solana_entry"
 
+[features]
+agave-unstable-api = []
+dev-context-only-utils = []
+
+[dependencies]
+bincode = { workspace = true }
+crossbeam-channel = { workspace = true }
+dlopen2 = { workspace = true }
+log = { workspace = true }
+num_cpus = { workspace = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+solana-address = { workspace = true }
+solana-hash = { workspace = true }
+solana-measure = { workspace = true }
+solana-merkle-tree = { workspace = true }
+solana-message = { workspace = true }
+solana-metrics = { workspace = true }
+solana-packet = { workspace = true }
+solana-perf = { workspace = true }
+solana-runtime-transaction = { workspace = true }
+solana-sha256-hasher = { workspace = true }
+solana-short-vec = { workspace = true }
+solana-signature = { workspace = true }
+solana-transaction = { workspace = true }
+solana-transaction-error = { workspace = true }
+wincode = { workspace = true }
+
+[dev-dependencies]
+agave-logger = { workspace = true }
+agave-reserved-account-keys = { workspace = true }
+assert_matches = { workspace = true }
+proptest = { workspace = true }
+solana-entry = { path = ".", features = ["agave-unstable-api", "dev-context-only-utils"] }
+solana-keypair = { workspace = true }
+solana-message = { workspace = true }
+solana-perf = { workspace = true, features = ["dev-context-only-utils"] }
+solana-pubkey = { workspace = true }
+solana-signature = { workspace = true }
+solana-signer = { workspace = true }
+solana-system-transaction = { workspace = true }
+solana-transaction = { workspace = true, features = ["verify"] }
+
 [[bench]]
 name = "entry_sigverify"
-
-[package.metadata.docs.rs]
-targets = ["x86_64-unknown-linux-gnu"]

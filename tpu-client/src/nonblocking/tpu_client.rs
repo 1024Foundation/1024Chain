@@ -2,11 +2,10 @@ pub use crate::tpu_client::Result;
 use {
     crate::tpu_client::{RecentLeaderSlots, TpuClientConfig, MAX_FANOUT_SLOTS},
     bincode::serialize,
-    futures_util::{
-        future::{join_all, FutureExt, TryFutureExt},
-        stream::StreamExt,
-    },
+    futures_util::{future::join_all, stream::StreamExt},
     log::*,
+    solana_clock::{Slot, DEFAULT_MS_PER_SLOT, NUM_CONSECUTIVE_LEADER_SLOTS},
+    solana_commitment_config::CommitmentConfig,
     solana_connection_cache::{
         connection_cache::{
             ConnectionCache, ConnectionManager, ConnectionPool, NewConnectionConfig, Protocol,
@@ -14,26 +13,21 @@ use {
         },
         nonblocking::client_connection::ClientConnection,
     },
+    solana_epoch_schedule::EpochSchedule,
+    solana_pubkey::Pubkey,
     solana_pubsub_client::nonblocking::pubsub_client::{PubsubClient, PubsubClientError},
+    solana_quic_definitions::QUIC_PORT_OFFSET,
     solana_rpc_client::nonblocking::rpc_client::RpcClient,
     solana_rpc_client_api::{
-        client_error::{Error as ClientError, Result as ClientResult},
+        client_error::{Error as ClientError, ErrorKind, Result as ClientResult},
+        request::RpcError,
         response::{RpcContactInfo, SlotUpdate},
     },
-    solana_sdk::{
-        clock::Slot,
-        commitment_config::CommitmentConfig,
-        epoch_info::EpochInfo,
-        pubkey::Pubkey,
-        quic::QUIC_PORT_OFFSET,
-        signature::SignerError,
-        transaction::Transaction,
-        transport::{Result as TransportResult, TransportError},
-    },
+    solana_signer::SignerError,
+    solana_transaction::Transaction,
+    solana_transaction_error::{TransportError, TransportResult},
     std::{
         collections::{HashMap, HashSet},
-        future::Future,
-        iter,
         net::SocketAddr,
         str::FromStr,
         sync::{
@@ -50,10 +44,14 @@ use {
 #[cfg(feature = "spinner")]
 use {
     crate::tpu_client::{SEND_TRANSACTION_INTERVAL, TRANSACTION_RESEND_INTERVAL},
+    futures_util::FutureExt,
     indicatif::ProgressBar,
+    solana_message::Message,
     solana_rpc_client::spinner::{self, SendTransactionProgress},
     solana_rpc_client_api::request::MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS,
-    solana_sdk::{message::Message, signers::Signers, transaction::TransactionError},
+    solana_signer::signers::Signers,
+    solana_transaction_error::TransactionError,
+    std::{future::Future, iter},
 };
 
 #[derive(Error, Debug)]
@@ -72,13 +70,14 @@ pub enum TpuSenderError {
 
 struct LeaderTpuCacheUpdateInfo {
     pub(super) maybe_cluster_nodes: Option<ClientResult<Vec<RpcContactInfo>>>,
-    pub(super) maybe_epoch_info: Option<ClientResult<EpochInfo>>,
+    pub(super) maybe_epoch_schedule: Option<ClientResult<EpochSchedule>>,
     pub(super) maybe_slot_leaders: Option<ClientResult<Vec<Pubkey>>>,
+    pub(super) first_slot: Slot,
 }
 impl LeaderTpuCacheUpdateInfo {
     pub fn has_some(&self) -> bool {
         self.maybe_cluster_nodes.is_some()
-            || self.maybe_epoch_info.is_some()
+            || self.maybe_epoch_schedule.is_some()
             || self.maybe_slot_leaders.is_some()
     }
 }
@@ -89,13 +88,14 @@ struct LeaderTpuCache {
     leaders: Vec<Pubkey>,
     leader_tpu_map: HashMap<Pubkey, SocketAddr>,
     slots_in_epoch: Slot,
-    last_epoch_info_slot: Slot,
+    last_slot_in_epoch: Slot,
 }
 
 impl LeaderTpuCache {
     pub fn new(
         first_slot: Slot,
         slots_in_epoch: Slot,
+        last_slot_in_epoch: Slot,
         leaders: Vec<Pubkey>,
         cluster_nodes: Vec<RpcContactInfo>,
         protocol: Protocol,
@@ -107,7 +107,7 @@ impl LeaderTpuCache {
             leaders,
             leader_tpu_map,
             slots_in_epoch,
-            last_epoch_info_slot: first_slot,
+            last_slot_in_epoch,
         }
     }
 
@@ -119,32 +119,51 @@ impl LeaderTpuCache {
     pub fn slot_info(&self) -> (Slot, Slot, Slot) {
         (
             self.last_slot(),
-            self.last_epoch_info_slot,
+            self.last_slot_in_epoch,
             self.slots_in_epoch,
         )
     }
 
-    // Get the TPU sockets for the current leader and upcoming leaders according to fanout size
+    // Get the TPU sockets for the current leader and upcoming *unique* leaders according to fanout size.
+    fn get_unique_leader_sockets(
+        &self,
+        estimated_current_slot: Slot,
+        fanout_slots: u64,
+    ) -> Vec<SocketAddr> {
+        let all_leader_sockets = self.get_leader_sockets(estimated_current_slot, fanout_slots);
+
+        let mut unique_sockets = Vec::new();
+        let mut seen = HashSet::new();
+
+        for socket in all_leader_sockets {
+            if seen.insert(socket) {
+                unique_sockets.push(socket);
+            }
+        }
+
+        unique_sockets
+    }
+
+    // Get the TPU sockets for the current leader and upcoming leaders according to fanout size.
     fn get_leader_sockets(
         &self,
         estimated_current_slot: Slot,
         fanout_slots: u64,
     ) -> Vec<SocketAddr> {
-        let mut leader_set = HashSet::new();
         let mut leader_sockets = Vec::new();
         // `first_slot` might have been advanced since caller last read the `estimated_current_slot`
         // value. Take the greater of the two values to ensure we are reading from the latest
         // leader schedule.
         let current_slot = std::cmp::max(estimated_current_slot, self.first_slot);
-        for leader_slot in current_slot..current_slot + fanout_slots {
+        for leader_slot in (current_slot..current_slot + fanout_slots)
+            .step_by(NUM_CONSECUTIVE_LEADER_SLOTS as usize)
+        {
             if let Some(leader) = self.get_slot_leader(leader_slot) {
                 if let Some(tpu_socket) = self.leader_tpu_map.get(leader) {
-                    if leader_set.insert(*leader) {
-                        leader_sockets.push(*tpu_socket);
-                    }
+                    leader_sockets.push(*tpu_socket);
                 } else {
                     // The leader is probably delinquent
-                    trace!("TPU not available for leader {}", leader);
+                    trace!("TPU not available for leader {leader}");
                 }
             } else {
                 // Overran the local leader schedule cache
@@ -194,11 +213,7 @@ impl LeaderTpuCache {
         (2 * MAX_FANOUT_SLOTS).min(slots_in_epoch)
     }
 
-    pub fn update_all(
-        &mut self,
-        estimated_current_slot: Slot,
-        cache_update_info: LeaderTpuCacheUpdateInfo,
-    ) -> (bool, bool) {
+    pub fn update_all(&mut self, cache_update_info: LeaderTpuCacheUpdateInfo) -> (bool, bool) {
         let mut has_error = false;
         let mut cluster_refreshed = false;
         if let Some(cluster_nodes) = cache_update_info.maybe_cluster_nodes {
@@ -209,27 +224,28 @@ impl LeaderTpuCache {
                     cluster_refreshed = true;
                 }
                 Err(err) => {
-                    warn!("Failed to fetch cluster tpu sockets: {}", err);
+                    warn!("Failed to fetch cluster tpu sockets: {err}");
                     has_error = true;
                 }
             }
         }
 
-        if let Some(Ok(epoch_info)) = cache_update_info.maybe_epoch_info {
-            self.slots_in_epoch = epoch_info.slots_in_epoch;
-            self.last_epoch_info_slot = estimated_current_slot;
+        if let Some(Ok(epoch_schedule)) = cache_update_info.maybe_epoch_schedule {
+            let epoch = epoch_schedule.get_epoch(cache_update_info.first_slot);
+            self.slots_in_epoch = epoch_schedule.get_slots_in_epoch(epoch);
+            self.last_slot_in_epoch = epoch_schedule.get_last_slot_in_epoch(epoch);
         }
 
         if let Some(slot_leaders) = cache_update_info.maybe_slot_leaders {
             match slot_leaders {
                 Ok(slot_leaders) => {
-                    self.first_slot = estimated_current_slot;
+                    self.first_slot = cache_update_info.first_slot;
                     self.leaders = slot_leaders;
                 }
                 Err(err) => {
                     warn!(
-                        "Failed to fetch slot leaders (current estimated slot: {}): {}",
-                        estimated_current_slot, err
+                        "Failed to fetch slot leaders (first_slot: {}): {err}",
+                        cache_update_info.first_slot
                     );
                     has_error = true;
                 }
@@ -307,11 +323,13 @@ where
 //
 // Useful for end-users who don't need a persistent connection to each validator,
 // and want to abort more quickly.
-fn timeout_future<'a, Fut: Future<Output = TransportResult<()>> + 'a>(
+#[cfg(feature = "spinner")]
+async fn timeout_future<Fut: Future<Output = TransportResult<()>>>(
     timeout_duration: Duration,
     future: Fut,
-) -> impl Future<Output = TransportResult<()>> + 'a {
+) -> TransportResult<()> {
     timeout(timeout_duration, future)
+        .await
         .unwrap_or_else(|_| Err(TransportError::Custom("Timed out".to_string())))
 }
 
@@ -331,6 +349,7 @@ async fn sleep_and_set_message(
     Ok(())
 }
 
+#[cfg(feature = "spinner")]
 async fn sleep_and_send_wire_transaction_to_addr<P, M, C>(
     sleep_duration: Duration,
     connection_cache: &ConnectionCache<P, M, C>,
@@ -410,7 +429,7 @@ where
     ) -> TransportResult<()> {
         let leaders = self
             .leader_tpu_service
-            .leader_tpu_sockets(self.fanout_slots);
+            .unique_leader_tpu_sockets(self.fanout_slots);
         let futures = leaders
             .iter()
             .map(|addr| {
@@ -438,7 +457,7 @@ where
             Err(if let Some(err) = last_error {
                 err
             } else {
-                std::io::Error::new(std::io::ErrorKind::Other, "No sends attempted").into()
+                std::io::Error::other("No sends attempted").into()
             })
         } else {
             Ok(())
@@ -454,7 +473,7 @@ where
     ) -> TransportResult<()> {
         let leaders = self
             .leader_tpu_service
-            .leader_tpu_sockets(self.fanout_slots);
+            .unique_leader_tpu_sockets(self.fanout_slots);
         let futures = leaders
             .iter()
             .map(|addr| {
@@ -482,7 +501,7 @@ where
             Err(if let Some(err) = last_error {
                 err
             } else {
-                std::io::Error::new(std::io::ErrorKind::Other, "No sends attempted").into()
+                std::io::Error::other("No sends attempted").into()
             })
         } else {
             Ok(())
@@ -567,7 +586,7 @@ where
                         let wire_transaction = serialize(transaction).unwrap();
                         let leaders = self
                             .leader_tpu_service
-                            .leader_tpu_sockets(self.fanout_slots);
+                            .unique_leader_tpu_sockets(self.fanout_slots);
                         futures.extend(send_wire_transaction_futures(
                             &progress_bar,
                             &progress,
@@ -676,6 +695,23 @@ where
         self.exit.store(true, Ordering::Relaxed);
         self.leader_tpu_service.join().await;
     }
+
+    pub fn get_connection_cache(&self) -> &Arc<ConnectionCache<P, M, C>>
+    where
+        P: ConnectionPool<NewConnectionConfig = C>,
+        M: ConnectionManager<ConnectionPool = P, NewConnectionConfig = C>,
+        C: NewConnectionConfig,
+    {
+        &self.connection_cache
+    }
+
+    pub fn get_leader_tpu_service(&self) -> &LeaderTpuService {
+        &self.leader_tpu_service
+    }
+
+    pub fn get_fanout_slots(&self) -> u64 {
+        self.fanout_slots
+    }
 }
 
 impl<P, M, C> Drop for TpuClient<P, M, C> {
@@ -699,19 +735,76 @@ impl LeaderTpuService {
         protocol: Protocol,
         exit: Arc<AtomicBool>,
     ) -> Result<Self> {
+        let epoch_schedule = rpc_client.get_epoch_schedule().await?;
         let start_slot = rpc_client
             .get_slot_with_commitment(CommitmentConfig::processed())
             .await?;
 
         let recent_slots = RecentLeaderSlots::new(start_slot);
-        let slots_in_epoch = rpc_client.get_epoch_info().await?.slots_in_epoch;
-        let leaders = rpc_client
-            .get_slot_leaders(start_slot, LeaderTpuCache::fanout(slots_in_epoch))
-            .await?;
-        let cluster_nodes = rpc_client.get_cluster_nodes().await?;
+        let epoch = epoch_schedule.get_epoch(start_slot);
+        let slots_in_epoch = epoch_schedule.get_slots_in_epoch(epoch);
+        let last_slot_in_epoch = epoch_schedule.get_last_slot_in_epoch(epoch);
+
+        // When a cluster is starting, we observe an invalid slot range failure that goes away after a
+        // retry. It seems as if the leader schedule is not available, but it should be. The logic
+        // below retries the RPC call in case of an invalid slot range error.
+        let tpu_leader_service_creation_timeout = Duration::from_secs(20);
+        let retry_interval = Duration::from_secs(1);
+        let leaders = timeout(tpu_leader_service_creation_timeout, async {
+            loop {
+                // TODO: The root cause appears to lie within the `rpc_client.get_slot_leaders()`.
+                // It might be worth debugging further and trying to understand why the RPC
+                // call fails. There may be a bug in the `get_slot_leaders()` logic or in the
+                // RPC implementation
+                match rpc_client
+                    .get_slot_leaders(start_slot, LeaderTpuCache::fanout(slots_in_epoch))
+                    .await
+                {
+                    Ok(leaders) => return Ok(leaders),
+                    Err(client_error) => {
+                        if is_invalid_slot_range_error(&client_error) {
+                            sleep(retry_interval).await;
+                            continue;
+                        } else {
+                            return Err(client_error);
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            TpuSenderError::Custom(format!(
+                "Failed to get slot leaders connecting to: {websocket_url}, timeout: \
+                 {tpu_leader_service_creation_timeout:?}. Invalid slot range"
+            ))
+        })??;
+
+        let cluster_nodes = timeout(tpu_leader_service_creation_timeout, async {
+            loop {
+                let cluster_nodes = rpc_client.get_cluster_nodes().await?;
+                // Stop once we find at least one leader's contact info
+                if cluster_nodes.iter().any(|rpc_contact_info| {
+                    Pubkey::from_str(&rpc_contact_info.pubkey)
+                        .map(|pubkey| leaders.contains(&pubkey))
+                        .unwrap_or(false)
+                }) {
+                    return Ok::<_, ClientError>(cluster_nodes);
+                }
+                sleep(retry_interval).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            TpuSenderError::Custom(format!(
+                "Failed find any cluster node info for upcoming leaders, timeout: \
+                 {tpu_leader_service_creation_timeout:?}."
+            ))
+        })??;
         let leader_tpu_cache = Arc::new(RwLock::new(LeaderTpuCache::new(
             start_slot,
             slots_in_epoch,
+            last_slot_in_epoch,
             leaders,
             cluster_nodes,
             protocol,
@@ -752,7 +845,15 @@ impl LeaderTpuService {
         self.recent_slots.estimated_current_slot()
     }
 
-    fn leader_tpu_sockets(&self, fanout_slots: u64) -> Vec<SocketAddr> {
+    pub fn unique_leader_tpu_sockets(&self, fanout_slots: u64) -> Vec<SocketAddr> {
+        let current_slot = self.recent_slots.estimated_current_slot();
+        self.leader_tpu_cache
+            .read()
+            .unwrap()
+            .get_unique_leader_sockets(current_slot, fanout_slots)
+    }
+
+    pub fn leader_tpu_sockets(&self, fanout_slots: u64) -> Vec<SocketAddr> {
         let current_slot = self.recent_slots.estimated_current_slot();
         self.leader_tpu_cache
             .read()
@@ -767,48 +868,27 @@ impl LeaderTpuService {
         pubsub_client: Option<PubsubClient>,
         exit: Arc<AtomicBool>,
     ) -> Result<()> {
-        let (mut notifications, unsubscribe) = if let Some(pubsub_client) = &pubsub_client {
-            let (notifications, unsubscribe) = pubsub_client.slot_updates_subscribe().await?;
-            (Some(notifications), Some(unsubscribe))
-        } else {
-            (None, None)
-        };
-        let mut last_cluster_refresh = Instant::now();
-        let mut sleep_ms = 1000;
-        loop {
-            if exit.load(Ordering::Relaxed) {
-                if let Some(unsubscribe) = unsubscribe {
-                    (unsubscribe)().await;
-                }
-                // `notifications` requires a valid reference to `pubsub_client`
-                // so `notifications` must be dropped before moving `pubsub_client`
-                drop(notifications);
-                if let Some(pubsub_client) = pubsub_client {
-                    pubsub_client.shutdown().await.unwrap();
-                };
-                break;
-            }
+        tokio::try_join!(
+            Self::run_slot_watcher(recent_slots.clone(), pubsub_client, exit.clone()),
+            Self::run_cache_refresher(rpc_client, recent_slots, leader_tpu_cache, exit),
+        )?;
 
+        Ok(())
+    }
+
+    async fn run_cache_refresher(
+        rpc_client: Arc<RpcClient>,
+        recent_slots: RecentLeaderSlots,
+        leader_tpu_cache: Arc<RwLock<LeaderTpuCache>>,
+        exit: Arc<AtomicBool>,
+    ) -> Result<()> {
+        let mut last_cluster_refresh = Instant::now();
+        let mut sleep_ms = DEFAULT_MS_PER_SLOT;
+
+        while !exit.load(Ordering::Relaxed) {
             // Sleep a slot before checking if leader cache needs to be refreshed again
             sleep(Duration::from_millis(sleep_ms)).await;
-            sleep_ms = 1000;
-
-            if let Some(notifications) = &mut notifications {
-                while let Ok(Some(update)) =
-                    timeout(Duration::from_millis(10), notifications.next()).await
-                {
-                    let current_slot = match update {
-                        // This update indicates that a full slot was received by the connected
-                        // node so we can stop sending transactions to the leader for that slot
-                        SlotUpdate::Completed { slot, .. } => slot.saturating_add(1),
-                        // This update indicates that we have just received the first shred from
-                        // the leader for this slot and they are probably still accepting transactions.
-                        SlotUpdate::FirstShredReceived { slot, .. } => slot,
-                        _ => continue,
-                    };
-                    recent_slots.record_slot(current_slot);
-                }
-            }
+            sleep_ms = DEFAULT_MS_PER_SLOT;
 
             let cache_update_info = maybe_fetch_cache_info(
                 &leader_tpu_cache,
@@ -820,8 +900,7 @@ impl LeaderTpuService {
 
             if cache_update_info.has_some() {
                 let mut leader_tpu_cache = leader_tpu_cache.write().unwrap();
-                let (has_error, cluster_refreshed) = leader_tpu_cache
-                    .update_all(recent_slots.estimated_current_slot(), cache_update_info);
+                let (has_error, cluster_refreshed) = leader_tpu_cache.update_all(cache_update_info);
                 if has_error {
                     sleep_ms = 100;
                 }
@@ -830,6 +909,53 @@ impl LeaderTpuService {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    async fn run_slot_watcher(
+        recent_slots: RecentLeaderSlots,
+        pubsub_client: Option<PubsubClient>,
+        exit: Arc<AtomicBool>,
+    ) -> Result<()> {
+        let Some(pubsub_client) = pubsub_client else {
+            return Ok(());
+        };
+
+        let (mut notifications, unsubscribe) = pubsub_client.slot_updates_subscribe().await?;
+        // Time out slot update notification polling at 10ms.
+        //
+        // Rationale is two-fold:
+        // 1. Notifications are an unbounded stream -- polling them will block indefinitely if not
+        //    interrupted, and the exit condition will never be checked. 10ms ensures negligible
+        //    CPU overhead while keeping notification checking timely.
+        // 2. The timeout must be strictly less than the slot time (DEFAULT_MS_PER_SLOT: 400) to
+        //    avoid timeout never being reached. For example, if notifications are received every
+        //    400ms and the timeout is >= 400ms, notifications may theoretically always be available
+        //    before the timeout is reached, resulting in the exit condition never being checked.
+        const SLOT_UPDATE_TIMEOUT: Duration = Duration::from_millis(10);
+
+        while !exit.load(Ordering::Relaxed) {
+            while let Ok(Some(update)) = timeout(SLOT_UPDATE_TIMEOUT, notifications.next()).await {
+                let current_slot = match update {
+                    // This update indicates that a full slot was received by the connected
+                    // node so we can stop sending transactions to the leader for that slot
+                    SlotUpdate::Completed { slot, .. } => slot.saturating_add(1),
+                    // This update indicates that we have just received the first shred from
+                    // the leader for this slot and they are probably still accepting transactions.
+                    SlotUpdate::FirstShredReceived { slot, .. } => slot,
+                    _ => continue,
+                };
+                recent_slots.record_slot(current_slot);
+            }
+        }
+
+        // `notifications` requires a valid reference to `pubsub_client`, so `notifications` must be
+        // dropped before moving `pubsub_client` via `shutdown()`.
+        drop(notifications);
+        unsubscribe().await;
+        pubsub_client.shutdown().await?;
+
         Ok(())
     }
 }
@@ -848,18 +974,24 @@ async fn maybe_fetch_cache_info(
         None
     };
 
+    // Grab information about the slot leaders currently in the cache.
     let estimated_current_slot = recent_slots.estimated_current_slot();
-    let (last_slot, last_epoch_info_slot, slots_in_epoch) = {
+    let (last_slot, last_slot_in_epoch, slots_in_epoch) = {
         let leader_tpu_cache = leader_tpu_cache.read().unwrap();
         leader_tpu_cache.slot_info()
     };
-    let maybe_epoch_info =
-        if estimated_current_slot >= last_epoch_info_slot.saturating_sub(slots_in_epoch) {
-            Some(rpc_client.get_epoch_info().await)
-        } else {
-            None
-        };
 
+    // If we're crossing into a new epoch, fetch the updated epoch schedule.
+    let maybe_epoch_schedule = if estimated_current_slot > last_slot_in_epoch {
+        Some(rpc_client.get_epoch_schedule().await)
+    } else {
+        None
+    };
+
+    // If we are within the fanout range of the last slot in the cache, fetch
+    // more slot leaders. We pull down a big batch at at time to amortize the
+    // cost of the RPC call. We don't want to stall transactions on pulling this
+    // down so we fetch it proactively.
     let maybe_slot_leaders = if estimated_current_slot >= last_slot.saturating_sub(MAX_FANOUT_SLOTS)
     {
         Some(
@@ -875,7 +1007,18 @@ async fn maybe_fetch_cache_info(
     };
     LeaderTpuCacheUpdateInfo {
         maybe_cluster_nodes,
-        maybe_epoch_info,
+        maybe_epoch_schedule,
         maybe_slot_leaders,
+        first_slot: estimated_current_slot,
     }
+}
+
+fn is_invalid_slot_range_error(client_error: &ClientError) -> bool {
+    if let ErrorKind::RpcError(RpcError::RpcResponseError { code, message, .. }) =
+        client_error.kind()
+    {
+        return *code == -32602
+            && message.contains("Invalid slot range: leader schedule for epoch");
+    }
+    false
 }

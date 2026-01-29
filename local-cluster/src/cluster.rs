@@ -1,12 +1,17 @@
 use {
-    solana_client::{thin_client::ThinClient, tpu_client::QuicTpuClient},
+    solana_commitment_config::CommitmentConfig,
     solana_core::validator::{Validator, ValidatorConfig},
-    solana_gossip::{cluster_info::Node, contact_info::ContactInfo},
+    solana_gossip::{contact_info::ContactInfo, node::Node},
+    solana_keypair::Keypair,
     solana_ledger::shred::Shred,
-    solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Keypair},
+    solana_pubkey::Pubkey,
+    solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool},
     solana_streamer::socket::SocketAddrSpace,
+    solana_tpu_client::tpu_client::TpuClient,
     std::{io::Result, path::PathBuf, sync::Arc},
 };
+
+pub type QuicTpuClient = TpuClient<QuicPool, QuicConnectionManager, QuicConfig>;
 
 pub struct ValidatorInfo {
     pub keypair: Arc<Keypair>,
@@ -37,10 +42,10 @@ impl ClusterValidatorInfo {
 
 pub trait Cluster {
     fn get_node_pubkeys(&self) -> Vec<Pubkey>;
-    fn get_validator_client(&self, pubkey: &Pubkey) -> Option<ThinClient>;
-    fn build_tpu_quic_client(&self) -> Result<QuicTpuClient>;
-    fn build_tpu_quic_client_with_commitment(
+    fn build_validator_tpu_quic_client(&self, pubkey: &Pubkey) -> Result<QuicTpuClient>;
+    fn build_validator_tpu_quic_client_with_commitment(
         &self,
+        pubkey: &Pubkey,
         commitment_config: CommitmentConfig,
     ) -> Result<QuicTpuClient>;
     fn get_contact_info(&self, pubkey: &Pubkey) -> Option<&ContactInfo>;
@@ -55,10 +60,10 @@ pub trait Cluster {
         &mut self,
         pubkey: &Pubkey,
         cluster_validator_info: &mut ClusterValidatorInfo,
-    ) -> (Node, Option<ContactInfo>);
+    ) -> (Node, Vec<ContactInfo>);
     fn restart_node_with_context(
         cluster_validator_info: ClusterValidatorInfo,
-        restart_context: (Node, Option<ContactInfo>),
+        restart_context: (Node, Vec<ContactInfo>),
         socket_addr_space: SocketAddrSpace,
     ) -> ClusterValidatorInfo;
     fn add_node(&mut self, pubkey: &Pubkey, cluster_validator_info: ClusterValidatorInfo);

@@ -171,7 +171,12 @@ impl<O: BucketOccupied> BucketStorage<O> {
             let full_page_bytes = bytes / PAGE_SIZE * PAGE_SIZE / cell_size * cell_size;
             if full_page_bytes < bytes {
                 let bytes_new = ((bytes / PAGE_SIZE) + 1) * PAGE_SIZE / cell_size * cell_size;
-                assert!(bytes_new >= bytes, "allocating less than requested, capacity: {}, bytes: {}, bytes_new: {}, full_page_bytes: {}", capacity.capacity(), bytes, bytes_new, full_page_bytes);
+                assert!(
+                    bytes_new >= bytes,
+                    "allocating less than requested, capacity: {}, bytes: {bytes}, bytes_new: \
+                     {bytes_new}, full_page_bytes: {full_page_bytes}",
+                    capacity.capacity()
+                );
                 assert_eq!(bytes_new % cell_size, 0);
                 bytes = bytes_new;
                 *capacity = Capacity::Actual(bytes / cell_size);
@@ -283,15 +288,15 @@ impl<O: BucketOccupied> BucketStorage<O> {
     /// 'is_resizing' false if caller is adding an item to the index (so increment count)
     pub fn occupy(&mut self, ix: u64, is_resizing: bool) -> Result<(), BucketStorageError> {
         debug_assert!(ix < self.capacity(), "occupy: bad index size");
-        let mut e = Err(BucketStorageError::AlreadyOccupied);
         //debug!("ALLOC {} {}", ix, uid);
         if self.try_lock(ix) {
-            e = Ok(());
             if !is_resizing {
                 self.count.fetch_add(1, Ordering::Relaxed);
             }
+            Ok(())
+        } else {
+            Err(BucketStorageError::AlreadyOccupied)
         }
-        e
     }
 
     pub fn free(&mut self, ix: u64) {
@@ -351,7 +356,7 @@ impl<O: BucketOccupied> BucketStorage<O> {
             &slice[..size]
         };
         let ptr = {
-            let ptr = slice.as_ptr() as *const T;
+            let ptr = slice.as_ptr().cast();
             debug_assert!(ptr as usize % std::mem::align_of::<T>() == 0);
             ptr
         };
@@ -376,7 +381,7 @@ impl<O: BucketOccupied> BucketStorage<O> {
             &mut slice[..size]
         };
         let ptr = {
-            let ptr = slice.as_mut_ptr() as *mut T;
+            let ptr = slice.as_mut_ptr().cast();
             debug_assert!(ptr as usize % std::mem::align_of::<T>() == 0);
             ptr
         };
@@ -396,17 +401,16 @@ impl<O: BucketOccupied> BucketStorage<O> {
             .read(true)
             .write(true)
             .create(create)
-            .open(path.clone());
-        if let Err(e) = data {
+            .open(&path);
+        if let Err(err) = data {
             if !create {
                 // we can't load this file, so bail without error
                 return None;
             }
             panic!(
-                "Unable to create data file {:?} in current dir({:?}): {:?}",
-                path,
+                "Unable to create data file '{}' in current dir ({:?}): {err}",
+                path.as_ref().display(),
                 std::env::current_dir(),
-                e
             );
         }
         let mut data = data.unwrap();
@@ -427,15 +431,17 @@ impl<O: BucketOccupied> BucketStorage<O> {
                 .fetch_add(measure_flush.end_as_us(), Ordering::Relaxed);
         }
         let mut measure_mmap = Measure::start("measure_mmap");
-        let res = unsafe { MmapMut::map_mut(&data) };
-        if let Err(e) = res {
+        let mmap = unsafe { MmapMut::map_mut(&data) }.unwrap_or_else(|err| {
             panic!(
-                "Unable to mmap file {:?} in current dir({:?}): {:?}",
-                path,
+                "Unable to mmap file '{}' in current dir ({:?}): {err}",
+                path.as_ref().display(),
                 std::env::current_dir(),
-                e
             );
-        }
+        });
+        // Access to the disk bucket files are random (excluding the linear search on collisions),
+        // so advise the kernel to treat the mmaps as such.
+        #[cfg(unix)]
+        mmap.advise(memmap2::Advice::Random).unwrap();
         measure_mmap.stop();
         stats
             .new_file_us
@@ -443,7 +449,7 @@ impl<O: BucketOccupied> BucketStorage<O> {
         stats
             .mmap_us
             .fetch_add(measure_mmap.as_us(), Ordering::Relaxed);
-        res.ok()
+        Some(mmap)
     }
 
     /// allocate a new memory mapped file of size `bytes` on one of `drives`
@@ -451,7 +457,7 @@ impl<O: BucketOccupied> BucketStorage<O> {
         let r = thread_rng().gen_range(0..drives.len());
         let drive = &drives[r];
         let file_random = thread_rng().gen_range(0..u128::MAX);
-        let pos = format!("{}", file_random,);
+        let pos = format!("{file_random}");
         let file = drive.join(pos);
         let res = Self::map_open_file(file.clone(), true, bytes, stats).unwrap();
 
@@ -484,7 +490,7 @@ impl<O: BucketOccupied> BucketStorage<O> {
                 let src_slice: &[u8] = &old_map[old_ix..old_ix + old_bucket.cell_size as usize];
 
                 unsafe {
-                    let dst = dst_slice.as_ptr() as *mut u8;
+                    let dst = dst_slice.as_ptr() as *mut _;
                     let src = src_slice.as_ptr();
                     std::ptr::copy_nonoverlapping(src, dst, old_bucket.cell_size as usize);
                 };
@@ -517,6 +523,7 @@ impl<O: BucketOccupied> BucketStorage<O> {
             capacity,
             max_search,
             Arc::clone(stats),
+            #[allow(clippy::map_clone)] // https://github.com/rust-lang/rust-clippy/issues/12560
             bucket
                 .map(|bucket| Arc::clone(&bucket.count))
                 .unwrap_or_default(),
@@ -543,12 +550,15 @@ impl<O: BucketOccupied> BucketStorage<O> {
 mod test {
     use {
         super::*,
-        crate::{bucket_storage::BucketOccupied, index_entry::IndexBucket},
+        crate::{
+            bucket_storage::BucketOccupied,
+            index_entry::{BucketWithHeader, IndexBucket},
+        },
         tempfile::tempdir,
     };
 
     #[test]
-    fn test_bucket_storage() {
+    fn test_bucket_storage_index_bucket() {
         let tmpdir = tempdir().unwrap();
         let paths: Vec<PathBuf> = vec![tmpdir.path().to_path_buf()];
         assert!(!paths.is_empty());
@@ -559,7 +569,29 @@ mod test {
         let max_search = 1;
         let stats = Arc::default();
         let count = Arc::default();
+        // this uses `IndexBucket`. `IndexBucket` doesn't change state on `occupy()`
         let mut storage = BucketStorage::<IndexBucket<u64>>::new(
+            drives, num_elems, elem_size, max_search, stats, count,
+        )
+        .0;
+        let ix = 0;
+        assert!(storage.is_free(ix));
+        assert!(storage.occupy(ix, false).is_ok());
+    }
+
+    #[test]
+    fn test_bucket_storage_using_header() {
+        let tmpdir = tempdir().unwrap();
+        let paths: Vec<PathBuf> = vec![tmpdir.path().to_path_buf()];
+        assert!(!paths.is_empty());
+
+        let drives = Arc::new(paths);
+        let num_elems = 1;
+        let elem_size = std::mem::size_of::<crate::index_entry::IndexEntry<u64>>() as u64;
+        let max_search = 1;
+        let stats = Arc::default();
+        let count = Arc::default();
+        let mut storage = BucketStorage::<BucketWithHeader>::new(
             drives, num_elems, elem_size, max_search, stats, count,
         )
         .0;
@@ -596,7 +628,7 @@ mod test {
             count.clone(),
         )
         .is_none());
-        solana_logger::setup();
+        agave_logger::setup();
         for len in [0, 1, 47, 48, 49, 4097] {
             // create a zero len file. That will fail to load since it is too small.
             let path = tmpdir.path().join("small");
@@ -604,6 +636,7 @@ mod test {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(true)
                 .open(path.clone())
                 .unwrap();
             _ = file.write_all(&vec![1u8; len]);

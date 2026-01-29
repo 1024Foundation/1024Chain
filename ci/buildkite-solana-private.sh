@@ -109,7 +109,7 @@ command_step() {
     timeout_in_minutes: $3
     artifact_paths: "log-*.txt"
     agents:
-      queue: "sol-private"
+      queue: "default"
 EOF
 }
 
@@ -138,7 +138,7 @@ all_test_steps() {
   wait_step
 
   # Full test suite
-  .buildkite/scripts/build-stable.sh sol-private >> "$output_file"
+  .buildkite/scripts/build-stable.sh default >> "$output_file"
 
   # Docs tests
   if affects \
@@ -164,69 +164,19 @@ all_test_steps() {
              ^ci/test-local-cluster.sh \
              ^core/build.rs \
              ^fetch-perf-libs.sh \
+             ^platform-tools-sdk/ \
              ^programs/ \
-             ^sdk/ \
       ; then
     cat >> "$output_file" <<"EOF"
   - command: "ci/docker-run-default-image.sh ci/test-stable-sbf.sh"
     name: "stable-sbf"
     timeout_in_minutes: 35
-    artifact_paths: "sbf-dumps.tar.bz2"
     agents:
-      queue: "sol-private"
+      queue: "default"
 EOF
   else
     annotate --style info \
       "Stable-SBF skipped as no relevant files were modified"
-  fi
-
-  # Downstream backwards compatibility
-  if affects \
-             .rs$ \
-             Cargo.lock$ \
-             Cargo.toml$ \
-             ^ci/rust-version.sh \
-             ^ci/test-stable-perf.sh \
-             ^ci/test-stable.sh \
-             ^ci/test-local-cluster.sh \
-             ^core/build.rs \
-             ^fetch-perf-libs.sh \
-             ^programs/ \
-             ^sdk/ \
-             ^ci/downstream-projects \
-             .buildkite/scripts/build-downstream-projects.sh \
-      ; then
-    .buildkite/scripts/build-downstream-projects.sh sol-private >> "$output_file"
-  else
-    annotate --style info \
-      "downstream-projects skipped as no relevant files were modified"
-  fi
-
-  # Wasm support
-  if affects \
-             ^ci/test-wasm.sh \
-             ^ci/test-stable.sh \
-             ^sdk/ \
-      ; then
-    command_step wasm "ci/docker-run-default-image.sh ci/test-wasm.sh" 20
-  else
-    annotate --style info \
-      "wasm skipped as no relevant files were modified"
-  fi
-
-  # Benches...
-  if affects \
-             .rs$ \
-             Cargo.lock$ \
-             Cargo.toml$ \
-             ^ci/rust-version.sh \
-             ^ci/test-coverage.sh \
-             ^ci/test-bench.sh \
-      ; then
-    .buildkite/scripts/build-bench.sh sol-private >> "$output_file"
-  else
-    annotate --style info --context test-bench \
-      "Bench skipped as no .rs files were modified"
   fi
 
   # Coverage...
@@ -261,7 +211,7 @@ pull_or_push_steps() {
     all_test_steps
   fi
 
-  # docs changes run on Travis or Github actions...
+  # docs changes run on Github actions...
 }
 
 
@@ -287,12 +237,8 @@ if [[ $BUILDKITE_BRANCH =~ ^pull ]]; then
 
   # Add helpful link back to the corresponding Github Pull Request
   annotate --style info --context pr-backlink \
-    "Github Pull Request: https://github.com/solana-labs/solana/$BUILDKITE_BRANCH"
+    "Github Pull Request: https://github.com/anza-xyz/agave/$BUILDKITE_BRANCH"
 
-  if [[ $GITHUB_USER = "dependabot[bot]" ]]; then
-    command_step dependabot "ci/dependabot-pr.sh" 5
-    wait_step
-  fi
   pull_or_push_steps
   exit 0
 fi

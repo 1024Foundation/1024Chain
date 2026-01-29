@@ -1,8 +1,12 @@
 #![cfg(target_os = "solana")]
 
-use solana_program::{
-    account_info::AccountInfo, entrypoint::ProgramResult, msg, program::invoke,
-    program_error::ProgramError, pubkey::Pubkey, syscalls::sol_invoke_signed_c, system_instruction,
+use {
+    solana_account_info::AccountInfo,
+    solana_msg::msg,
+    solana_program::{program::invoke, syscalls::sol_invoke_signed_c},
+    solana_program_error::{ProgramError, ProgramResult},
+    solana_pubkey::Pubkey,
+    solana_system_interface::instruction as system_instruction,
 };
 
 #[derive(Debug)]
@@ -37,22 +41,6 @@ struct SolAccountInfo {
     is_signer: bool,
     is_writable: bool,
     executable: bool,
-}
-
-/// Rust representation of C's SolSignerSeed
-#[derive(Debug)]
-#[repr(C)]
-struct SolSignerSeedC {
-    addr: u64,
-    len: u64,
-}
-
-/// Rust representation of C's SolSignerSeeds
-#[derive(Debug)]
-#[repr(C)]
-struct SolSignerSeedsC {
-    addr: u64,
-    len: u64,
 }
 
 const READONLY_ACCOUNTS: &[SolAccountInfo] = &[
@@ -108,7 +96,7 @@ fn check_preconditions(
     Ok(())
 }
 
-solana_program::entrypoint!(process_instruction);
+solana_program_entrypoint::entrypoint_no_alloc!(process_instruction);
 fn process_instruction(
     program_id: &Pubkey,
     accounts: &[AccountInfo],

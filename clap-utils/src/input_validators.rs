@@ -1,12 +1,14 @@
 use {
-    crate::keypair::{parse_signer_source, SignerSourceKind, ASK_KEYWORD},
-    chrono::DateTime,
-    solana_sdk::{
-        clock::{Epoch, Slot},
-        hash::Hash,
-        pubkey::{Pubkey, MAX_SEED_LEN},
-        signature::{read_keypair_file, Signature},
+    crate::{
+        input_parsers::parse_cpu_ranges,
+        keypair::{parse_signer_source, SignerSourceKind, ASK_KEYWORD},
     },
+    chrono::DateTime,
+    solana_clock::{Epoch, Slot},
+    solana_hash::Hash,
+    solana_keypair::read_keypair_file,
+    solana_pubkey::{Pubkey, MAX_SEED_LEN},
+    solana_signature::Signature,
     std::{fmt::Display, ops::RangeBounds, str::FromStr},
 };
 
@@ -303,6 +305,23 @@ where
     }
 }
 
+pub fn is_amount_or_all_or_available<T>(amount: T) -> Result<(), String>
+where
+    T: AsRef<str> + Display,
+{
+    if amount.as_ref().parse::<u64>().is_ok()
+        || amount.as_ref().parse::<f64>().is_ok()
+        || amount.as_ref() == "ALL"
+        || amount.as_ref() == "AVAILABLE"
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Unable to parse input amount as integer or float, provided: {amount}"
+        ))
+    }
+}
+
 pub fn is_rfc3339_datetime<T>(value: T) -> Result<(), String>
 where
     T: AsRef<str> + Display,
@@ -416,6 +435,24 @@ where
         Err(String::from(
             "--maximum-incremental-snapshot-archives-to-retain cannot be zero",
         ))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn validate_cpu_ranges<T>(value: T, err_prefix: &str) -> Result<(), String>
+where
+    T: AsRef<str> + Display,
+{
+    parse_cpu_ranges(value.as_ref())
+        .map(|_| ())
+        .map_err(|e| format!("{err_prefix} {e}"))
+}
+
+pub fn is_non_zero(value: impl AsRef<str>) -> Result<(), String> {
+    let value = value.as_ref();
+    if value.eq("0") {
+        Err(String::from("cannot be zero"))
     } else {
         Ok(())
     }

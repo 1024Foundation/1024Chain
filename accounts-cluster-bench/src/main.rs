@@ -4,40 +4,71 @@ use {
     log::*,
     rand::{thread_rng, Rng},
     rayon::prelude::*,
-    solana_accounts_db::inline_spl_token,
     solana_clap_utils::{
         hidden_unless_forced, input_parsers::pubkey_of, input_validators::is_url_or_moniker,
     },
     solana_cli_config::{ConfigInput, CONFIG_FILE},
-    solana_client::{rpc_request::TokenAccountsFilter, transaction_executor::TransactionExecutor},
-    solana_gossip::gossip_service::discover,
-    solana_measure::measure::Measure,
-    solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{
-        commitment_config::CommitmentConfig,
-        hash::Hash,
-        instruction::{AccountMeta, Instruction},
-        message::Message,
-        pubkey::Pubkey,
-        signature::{read_keypair_file, Keypair, Signer},
-        system_instruction, system_program,
-        transaction::Transaction,
+    solana_client::{
+        rpc_client::SerializableTransaction, rpc_config::RpcBlockConfig,
+        rpc_request::MAX_GET_CONFIRMED_BLOCKS_RANGE, transaction_executor::TransactionExecutor,
     },
+    solana_clock::Slot,
+    solana_commitment_config::CommitmentConfig,
+    solana_gossip::gossip_service::discover,
+    solana_hash::Hash,
+    solana_instruction::{AccountMeta, Instruction},
+    solana_keypair::{read_keypair_file, Keypair},
+    solana_measure::measure::Measure,
+    solana_message::Message,
+    solana_program_pack::Pack,
+    solana_pubkey::Pubkey,
+    solana_rpc_client::rpc_client::RpcClient,
+    solana_rpc_client_api::request::TokenAccountsFilter,
+    solana_signature::Signature,
+    solana_signer::Signer,
     solana_streamer::socket::SocketAddrSpace,
+    solana_system_interface::{instruction as system_instruction, program as system_program},
+    solana_transaction::Transaction,
+    solana_transaction_status::UiTransactionEncoding,
+    spl_generic_token::token,
+    spl_token_interface::state::Account,
     std::{
         cmp::min,
+        collections::VecDeque,
+        ops::Deref,
         process::exit,
         str::FromStr,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc,
+            Arc, Barrier, RwLock,
         },
         thread::{sleep, Builder, JoinHandle},
         time::{Duration, Instant},
     },
 };
 
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 pub const MAX_RPC_CALL_RETRIES: usize = 5;
+
+pub fn poll_slot_height(client: &RpcClient) -> Slot {
+    let mut num_retries = MAX_RPC_CALL_RETRIES;
+    loop {
+        let response = client.get_slot_with_commitment(CommitmentConfig::confirmed());
+        if let Ok(slot) = response {
+            return slot;
+        } else {
+            num_retries -= 1;
+            warn!("get_slot_height failure: {response:?}. remaining retries {num_retries}");
+        }
+        if num_retries == 0 {
+            panic!("failed to get_slot_height(), rpc node down?")
+        }
+        sleep(Duration::from_millis(100));
+    }
+}
 
 pub fn poll_get_latest_blockhash(client: &RpcClient) -> Option<Hash> {
     let mut num_retries = MAX_RPC_CALL_RETRIES;
@@ -47,10 +78,7 @@ pub fn poll_get_latest_blockhash(client: &RpcClient) -> Option<Hash> {
             return Some(blockhash);
         } else {
             num_retries -= 1;
-            warn!(
-                "get_latest_blockhash failure: {:?}. remaining retries {}",
-                response, num_retries
-            );
+            warn!("get_latest_blockhash failure: {response:?}. remaining retries {num_retries}");
         }
         if num_retries == 0 {
             panic!("failed to get_latest_blockhash(), rpc node down?")
@@ -68,10 +96,7 @@ pub fn poll_get_fee_for_message(client: &RpcClient, message: &mut Message) -> (O
             return (Some(fee), message.recent_blockhash);
         } else {
             num_retries -= 1;
-            warn!(
-                "get_fee_for_message failure: {:?}. remaining retries {}",
-                response, num_retries
-            );
+            warn!("get_fee_for_message failure: {response:?}. remaining retries {num_retries}");
 
             let blockhash = poll_get_latest_blockhash(client).expect("blockhash");
             message.recent_blockhash = blockhash;
@@ -85,7 +110,7 @@ pub fn poll_get_fee_for_message(client: &RpcClient, message: &mut Message) -> (O
 
 fn airdrop_lamports(client: &RpcClient, id: &Keypair, desired_balance: u64) -> bool {
     let starting_balance = client.get_balance(&id.pubkey()).unwrap_or(0);
-    info!("starting balance {}", starting_balance);
+    info!("starting balance {starting_balance}");
 
     if starting_balance < desired_balance {
         let airdrop_amount = desired_balance - starting_balance;
@@ -109,7 +134,7 @@ fn airdrop_lamports(client: &RpcClient, id: &Keypair, desired_balance: u64) -> b
         let current_balance = client.get_balance(&id.pubkey()).unwrap_or_else(|e| {
             panic!("airdrop error {e}");
         });
-        info!("current balance {}...", current_balance);
+        info!("current balance {current_balance}...");
 
         if current_balance - starting_balance != airdrop_amount {
             info!(
@@ -129,6 +154,35 @@ struct SeedTracker {
     max_closed: Arc<AtomicU64>,
 }
 
+#[derive(Clone)]
+struct TransactionSignatureTracker(Arc<RwLock<VecDeque<Signature>>>);
+
+impl TransactionSignatureTracker {
+    fn get_random(&self) -> Option<Signature> {
+        let signatures = self.read().unwrap();
+        if signatures.is_empty() {
+            None
+        } else {
+            let random_index = thread_rng().gen_range(0..signatures.len());
+            let random_signature = signatures.get(random_index);
+            random_signature.cloned()
+        }
+    }
+    fn track_transactions(&self, transactions: &[Transaction]) {
+        let mut lock = self.write().unwrap();
+        for signature in transactions.iter().map(Transaction::get_signature) {
+            lock.push_back(*signature);
+        }
+    }
+}
+
+impl Deref for TransactionSignatureTracker {
+    type Target = Arc<RwLock<VecDeque<Signature>>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 fn make_create_message(
     keypair: &Keypair,
     base_keypair: &Keypair,
@@ -138,12 +192,16 @@ fn make_create_message(
     maybe_space: Option<u64>,
     mint: Option<Pubkey>,
 ) -> Message {
-    let space = maybe_space.unwrap_or_else(|| thread_rng().gen_range(0..1000));
+    let space = if mint.is_some() {
+        Account::get_packed_len() as u64
+    } else {
+        maybe_space.unwrap_or_else(|| thread_rng().gen_range(0..1000))
+    };
 
     let instructions: Vec<_> = (0..num_instructions)
         .flat_map(|_| {
             let program_id = if mint.is_some() {
-                inline_spl_token::id()
+                token::id()
             } else {
                 system_program::id()
             };
@@ -161,11 +219,22 @@ fn make_create_message(
             )];
             if let Some(mint_address) = mint {
                 instructions.push(
-                    spl_token::instruction::initialize_account(
-                        &spl_token::id(),
+                    spl_token_interface::instruction::initialize_account(
+                        &spl_token_interface::id(),
                         &to_pubkey,
                         &mint_address,
                         &base_keypair.pubkey(),
+                    )
+                    .unwrap(),
+                );
+                instructions.push(
+                    spl_token_interface::instruction::approve(
+                        &spl_token_interface::id(),
+                        &to_pubkey,
+                        &base_keypair.pubkey(),
+                        &base_keypair.pubkey(),
+                        &[&base_keypair.pubkey()],
+                        1,
                     )
                     .unwrap(),
                 );
@@ -190,7 +259,7 @@ fn make_close_message(
     let instructions: Vec<_> = (0..num_instructions)
         .filter_map(|_| {
             let program_id = if spl_token {
-                inline_spl_token::id()
+                token::id()
             } else {
                 system_program::id()
             };
@@ -204,8 +273,8 @@ fn make_close_message(
                 Pubkey::create_with_seed(&base_keypair.pubkey(), &seed, &program_id).unwrap();
             if spl_token {
                 Some(
-                    spl_token::instruction::close_account(
-                        &spl_token::id(),
+                    spl_token_interface::instruction::close_account(
+                        &spl_token_interface::id(),
                         &address,
                         &keypair.pubkey(),
                         &base_keypair.pubkey(),
@@ -236,6 +305,15 @@ pub enum RpcBench {
     MultipleAccounts,
     ProgramAccounts,
     TokenAccountsByOwner,
+    Supply,
+    TokenAccountsByDelegate,
+    Block,
+    Blocks,
+    AccountInfo,
+    Transaction,
+    TransactionParsed,
+    FirstAvailableBlock,
+    TokenSupply,
 }
 
 #[derive(Debug)]
@@ -248,9 +326,18 @@ impl FromStr for RpcBench {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "account-info" => Ok(RpcBench::AccountInfo),
+            "block" => Ok(RpcBench::Block),
+            "blocks" => Ok(RpcBench::Blocks),
+            "first-available-block" => Ok(RpcBench::FirstAvailableBlock),
             "slot" => Ok(RpcBench::Slot),
+            "supply" => Ok(RpcBench::Supply),
             "multiple-accounts" => Ok(RpcBench::MultipleAccounts),
+            "token-accounts-by-delegate" => Ok(RpcBench::TokenAccountsByDelegate),
             "token-accounts-by-owner" => Ok(RpcBench::TokenAccountsByOwner),
+            "token-supply" => Ok(RpcBench::TokenSupply),
+            "transaction" => Ok(RpcBench::Transaction),
+            "transaction-parsed" => Ok(RpcBench::TransactionParsed),
             "version" => Ok(RpcBench::Version),
             _ => Err(RpcParseError::InvalidOption),
         }
@@ -302,13 +389,44 @@ fn process_get_multiple_accounts(
                 stats.total_errors_time_us += rpc_time.as_us();
                 stats.errors += 1;
                 if last_error.elapsed().as_secs() > 2 {
-                    info!("error: {:?}", e);
+                    info!("error: {e:?}");
                     *last_error = Instant::now();
                 }
-                debug!("error: {:?}", e);
+                debug!("error: {e:?}");
             }
         }
     }
+}
+
+fn process_get_transaction(
+    test_name: &'static str,
+    transaction_signature_tracker: &TransactionSignatureTracker,
+    client: &RpcClient,
+    stats: &mut RpcBenchStats,
+    last_error: &mut Instant,
+    encoding: UiTransactionEncoding,
+) {
+    let Some(signature) = transaction_signature_tracker.get_random() else {
+        info!("transaction: No transactions have yet been made; skipping");
+        return;
+    };
+    let mut measure = Measure::start(test_name);
+    match client.get_transaction(&signature, encoding) {
+        Ok(_tx) => {
+            measure.stop();
+            stats.success += 1;
+            stats.total_success_time_us += measure.as_us();
+        }
+        Err(e) => {
+            measure.stop();
+            stats.errors += 1;
+            stats.total_errors_time_us += measure.as_us();
+            if last_error.elapsed().as_secs() > 2 {
+                info!("get_transaction error: {:?}", &e);
+                *last_error = Instant::now();
+            }
+        }
+    };
 }
 
 #[derive(Default)]
@@ -319,6 +437,7 @@ struct RpcBenchStats {
     total_success_time_us: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_rpc_bench_loop(
     rpc_bench: RpcBench,
     thread: usize,
@@ -328,17 +447,146 @@ fn run_rpc_bench_loop(
     program_id: &Pubkey,
     max_closed: &AtomicU64,
     max_created: &AtomicU64,
+    slot_height: &AtomicU64,
     mint: &Option<Pubkey>,
+    transaction_signature_tracker: &TransactionSignatureTracker,
 ) {
     let mut stats = RpcBenchStats::default();
     let mut iters = 0;
     let mut last_error = Instant::now();
     let mut last_print = Instant::now();
+    fn flush_stats(
+        iters: &i32,
+        last_print: &mut Instant,
+        rpc_bench: &RpcBench,
+        stats: &mut RpcBenchStats,
+        thread: &usize,
+    ) {
+        info!(
+            "t({}) rpc({:?}) iters: {} success: {} errors: {}",
+            thread, rpc_bench, iters, stats.success, stats.errors
+        );
+        if stats.success > 0 {
+            info!(
+                " t({}) rpc({:?} average success_time: {} us",
+                thread,
+                rpc_bench,
+                stats.total_success_time_us / stats.success
+            );
+        }
+        if stats.errors > 0 {
+            info!(
+                " rpc average average errors time: {} us",
+                stats.total_errors_time_us / stats.errors
+            );
+        }
+        *last_print = Instant::now();
+        *stats = RpcBenchStats::default();
+    }
     loop {
         if exit.load(Ordering::Relaxed) {
+            flush_stats(&iters, &mut last_print, &rpc_bench, &mut stats, &thread);
             break;
         }
         match rpc_bench {
+            RpcBench::AccountInfo => {
+                let start: u64 = max_closed.load(Ordering::Relaxed);
+                let end: u64 = max_created.load(Ordering::Relaxed);
+                let seed_range = start..end;
+                if seed_range.is_empty() {
+                    info!("get_account_info: No accounts have yet been created; skipping");
+                    continue;
+                }
+                let seed = thread_rng().gen_range(seed_range).to_string();
+                let account_pubkey =
+                    Pubkey::create_with_seed(base_keypair_pubkey, &seed, program_id).unwrap();
+                let mut rpc_time = Measure::start("rpc-get-account-info");
+                match client.get_account(&account_pubkey) {
+                    Ok(_account) => {
+                        rpc_time.stop();
+                        stats.success += 1;
+                        stats.total_success_time_us += rpc_time.as_us();
+                    }
+                    Err(e) => {
+                        rpc_time.stop();
+                        stats.total_errors_time_us += rpc_time.as_us();
+                        stats.errors += 1;
+                        if last_error.elapsed().as_secs() > 2 {
+                            info!("get_account_info error: {e:?}");
+                            last_error = Instant::now();
+                        }
+                    }
+                }
+            }
+            RpcBench::Block => {
+                let slot_height = slot_height.load(Ordering::Relaxed);
+                let mut rpc_time = Measure::start("rpc-get-block");
+                match client.get_block_with_config(
+                    slot_height,
+                    RpcBlockConfig {
+                        commitment: Some(CommitmentConfig::confirmed()),
+                        ..Default::default()
+                    },
+                ) {
+                    Ok(_block) => {
+                        rpc_time.stop();
+                        stats.success += 1;
+                        stats.total_success_time_us += rpc_time.as_us();
+                    }
+                    Err(e) => {
+                        rpc_time.stop();
+                        stats.total_errors_time_us += rpc_time.as_us();
+                        stats.errors += 1;
+                        if last_error.elapsed().as_secs() > 2 {
+                            info!("get_block error: {e:?}");
+                            last_error = Instant::now();
+                        }
+                    }
+                }
+            }
+            RpcBench::Blocks => {
+                let slot_height = slot_height.load(Ordering::Relaxed);
+                let mut rpc_time = Measure::start("rpc-get-blocks");
+                match client.get_blocks_with_commitment(
+                    slot_height.saturating_sub(MAX_GET_CONFIRMED_BLOCKS_RANGE),
+                    Some(slot_height),
+                    CommitmentConfig::confirmed(),
+                ) {
+                    Ok(_slots) => {
+                        rpc_time.stop();
+                        stats.success += 1;
+                        stats.total_success_time_us += rpc_time.as_us();
+                    }
+                    Err(e) => {
+                        rpc_time.stop();
+                        stats.total_errors_time_us += rpc_time.as_us();
+                        stats.errors += 1;
+                        if last_error.elapsed().as_secs() > 2 {
+                            info!("get_blocks error: {e:?}");
+                            last_error = Instant::now();
+                        }
+                    }
+                }
+            }
+            RpcBench::FirstAvailableBlock => {
+                let mut rpc_time = Measure::start("rpc-get-first-available-block");
+                match client.get_first_available_block() {
+                    Ok(_slot) => {
+                        rpc_time.stop();
+                        stats.success += 1;
+                        stats.total_success_time_us += rpc_time.as_us();
+                    }
+                    Err(e) => {
+                        rpc_time.stop();
+                        stats.total_errors_time_us += rpc_time.as_us();
+                        stats.errors += 1;
+                        if last_error.elapsed().as_secs() > 2 {
+                            info!("get_first_available_block error: {e:?}");
+                            last_error = Instant::now();
+                        }
+                    }
+                }
+            }
             RpcBench::Slot => {
                 let mut rpc_time = Measure::start("rpc-get-slot");
                 match client.get_slot() {
@@ -352,7 +600,26 @@ fn run_rpc_bench_loop(
                         stats.total_errors_time_us += rpc_time.as_us();
                         stats.errors += 1;
                         if last_error.elapsed().as_secs() > 2 {
-                            info!("get_slot error: {:?}", e);
+                            info!("get_slot error: {e:?}");
+                            last_error = Instant::now();
+                        }
+                    }
+                }
+            }
+            RpcBench::Supply => {
+                let mut rpc_time = Measure::start("rpc-get-token-supply");
+                match client.get_token_supply(&mint.unwrap()) {
+                    Ok(_ui_token_amount) => {
+                        rpc_time.stop();
+                        stats.success += 1;
+                        stats.total_success_time_us += rpc_time.as_us();
+                    }
+                    Err(e) => {
+                        rpc_time.stop();
+                        stats.total_errors_time_us += rpc_time.as_us();
+                        stats.errors += 1;
+                        if last_error.elapsed().as_secs() > 2 {
+                            info!("get_token_supply error: {e:?}");
                             last_error = Instant::now();
                         }
                     }
@@ -385,16 +652,16 @@ fn run_rpc_bench_loop(
                         stats.errors += 1;
                         stats.total_errors_time_us += rpc_time.as_us();
                         if last_error.elapsed().as_secs() > 2 {
-                            info!("get-program-accounts error: {:?}", e);
+                            info!("get-program-accounts error: {e:?}");
                             last_error = Instant::now();
                         }
                     }
                 }
             }
-            RpcBench::TokenAccountsByOwner => {
-                let mut rpc_time = Measure::start("rpc-get-token-accounts-by-owner");
+            RpcBench::TokenAccountsByDelegate => {
+                let mut rpc_time = Measure::start("rpc-get-token-accounts-by-delegate");
                 let filter = TokenAccountsFilter::Mint(*mint.as_ref().unwrap());
-                match client.get_token_accounts_by_owner(program_id, filter) {
+                match client.get_token_accounts_by_delegate(base_keypair_pubkey, filter) {
                     Ok(_accounts) => {
                         rpc_time.stop();
                         stats.success += 1;
@@ -405,11 +672,72 @@ fn run_rpc_bench_loop(
                         stats.errors += 1;
                         stats.total_errors_time_us += rpc_time.as_us();
                         if last_error.elapsed().as_secs() > 2 {
-                            info!("get-token-accounts error: {:?}", e);
+                            info!("get-token-accounts-by-delegate error: {e:?}");
                             last_error = Instant::now();
                         }
                     }
                 }
+            }
+            RpcBench::TokenAccountsByOwner => {
+                let mut rpc_time = Measure::start("rpc-get-token-accounts-by-owner");
+                let filter = TokenAccountsFilter::Mint(*mint.as_ref().unwrap());
+                match client.get_token_accounts_by_owner(base_keypair_pubkey, filter) {
+                    Ok(_accounts) => {
+                        rpc_time.stop();
+                        stats.success += 1;
+                        stats.total_success_time_us += rpc_time.as_us();
+                    }
+                    Err(e) => {
+                        rpc_time.stop();
+                        stats.errors += 1;
+                        stats.total_errors_time_us += rpc_time.as_us();
+                        if last_error.elapsed().as_secs() > 2 {
+                            info!("get-token-accounts-by-owner error: {e:?}");
+                            last_error = Instant::now();
+                        }
+                    }
+                }
+            }
+            RpcBench::TokenSupply => {
+                let mut rpc_time = Measure::start("rpc-get-token-supply");
+                match client
+                    .get_token_supply_with_commitment(&mint.unwrap(), CommitmentConfig::confirmed())
+                {
+                    Ok(_ui_token_amount) => {
+                        rpc_time.stop();
+                        stats.success += 1;
+                        stats.total_success_time_us += rpc_time.as_us();
+                    }
+                    Err(e) => {
+                        rpc_time.stop();
+                        stats.errors += 1;
+                        stats.total_errors_time_us += rpc_time.as_us();
+                        if last_error.elapsed().as_secs() > 2 {
+                            info!("get-token-supply error: {e:?}");
+                            last_error = Instant::now();
+                        }
+                    }
+                }
+            }
+            RpcBench::Transaction => {
+                process_get_transaction(
+                    "rpc-get-transaction-base64",
+                    transaction_signature_tracker,
+                    client,
+                    &mut stats,
+                    &mut last_error,
+                    UiTransactionEncoding::Base64,
+                );
+            }
+            RpcBench::TransactionParsed => {
+                process_get_transaction(
+                    "rpc-get-transaction-parsed",
+                    transaction_signature_tracker,
+                    client,
+                    &mut stats,
+                    &mut last_error,
+                    UiTransactionEncoding::JsonParsed,
+                );
             }
             RpcBench::Version => {
                 let mut rpc_time = Measure::start("rpc-get-version");
@@ -429,43 +757,28 @@ fn run_rpc_bench_loop(
         }
 
         if last_print.elapsed().as_secs() > 3 {
-            info!(
-                "t({}) rpc({:?}) iters: {} success: {} errors: {}",
-                thread, rpc_bench, iters, stats.success, stats.errors
-            );
-            if stats.success > 0 {
-                info!(
-                    " t({}) rpc({:?} average success_time: {} us",
-                    thread,
-                    rpc_bench,
-                    stats.total_success_time_us / stats.success
-                );
-            }
-            if stats.errors > 0 {
-                info!(
-                    " rpc average average errors time: {} us",
-                    stats.total_errors_time_us / stats.errors
-                );
-            }
-            last_print = Instant::now();
-            stats = RpcBenchStats::default();
+            flush_stats(&iters, &mut last_print, &rpc_bench, &mut stats, &thread);
         }
 
         iters += 1;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_rpc_bench_threads(
     rpc_benches: Vec<RpcBench>,
     mint: &Option<Pubkey>,
+    start_bench_barrier: &Arc<Barrier>,
     exit: &Arc<AtomicBool>,
     client: &Arc<RpcClient>,
     seed_tracker: &SeedTracker,
+    slot_height: &Arc<AtomicU64>,
     base_keypair_pubkey: Pubkey,
     num_rpc_bench_threads: usize,
+    transaction_signature_tracker: &TransactionSignatureTracker,
 ) -> Vec<JoinHandle<()>> {
     let program_id = if mint.is_some() {
-        inline_spl_token::id()
+        token::id()
     } else {
         system_program::id()
     };
@@ -474,13 +787,17 @@ fn make_rpc_bench_threads(
         .flat_map(|rpc_bench| {
             (0..num_rpc_bench_threads).map(move |thread| {
                 let client = client.clone();
+                let start_bench = start_bench_barrier.clone();
                 let exit = exit.clone();
                 let max_closed = seed_tracker.max_closed.clone();
                 let max_created = seed_tracker.max_created.clone();
+                let slot_height = slot_height.clone();
+                let transaction_signature_tracker = transaction_signature_tracker.clone();
                 let mint = *mint;
                 Builder::new()
-                    .name(format!("rpc-bench-{}", thread))
+                    .name(format!("rpc-bench-{thread}"))
                     .spawn(move || {
+                        start_bench.wait();
                         run_rpc_bench_loop(
                             rpc_bench,
                             thread,
@@ -490,7 +807,9 @@ fn make_rpc_bench_threads(
                             &program_id,
                             &max_closed,
                             &max_created,
+                            &slot_height,
                             &mint,
+                            &transaction_signature_tracker,
                         )
                     })
                     .unwrap()
@@ -522,6 +841,7 @@ fn run_accounts_bench(
     let mut last_log = Instant::now();
     let mut count = 0;
     let mut blockhash = poll_get_latest_blockhash(&client).expect("blockhash");
+    let slot_height = Arc::new(AtomicU64::new(poll_slot_height(&client)));
     let mut tx_sent_count = 0;
     let mut total_accounts_created = 0;
     let mut total_accounts_closed = 0;
@@ -544,8 +864,10 @@ fn run_accounts_bench(
         max_created: Arc::new(AtomicU64::default()),
         max_closed: Arc::new(AtomicU64::default()),
     };
+    let transaction_signature_tracker =
+        TransactionSignatureTracker(Arc::new(RwLock::new(VecDeque::with_capacity(5000))));
 
-    info!("Starting balance(s): {:?}", balances);
+    info!("Starting balance(s): {balances:?}");
 
     let executor = TransactionExecutor::new_with_rpc_client(client.clone());
 
@@ -567,16 +889,24 @@ fn run_accounts_bench(
     );
 
     let exit = Arc::new(AtomicBool::new(false));
+    let mut start_bench_barrier = Some(Arc::new(Barrier::new(
+        // In order to unlock the benchmark threads, `wait()` must be called on each thread and then
+        // once from this thread, after the first pass through the account creation loop.
+        num_rpc_bench_threads + 1,
+    )));
     let base_keypair_pubkey = base_keypair.pubkey();
     let rpc_bench_threads: Vec<_> = if let Some(rpc_benches) = rpc_benches {
         make_rpc_bench_threads(
             rpc_benches,
             &mint,
+            start_bench_barrier.as_ref().unwrap(),
             &exit,
             &client,
             &seed_tracker,
+            &slot_height,
             base_keypair_pubkey,
             num_rpc_bench_threads,
+            &transaction_signature_tracker,
         )
     } else {
         Vec::new()
@@ -585,6 +915,7 @@ fn run_accounts_bench(
     loop {
         if latest_blockhash.elapsed().as_millis() > 10_000 {
             blockhash = poll_get_latest_blockhash(&client).expect("blockhash");
+            slot_height.store(poll_slot_height(&client), Ordering::Relaxed);
             latest_blockhash = Instant::now();
         }
 
@@ -600,10 +931,7 @@ fn run_accounts_bench(
                 }
                 last_balance = Instant::now();
                 if *balance < lamports * 2 {
-                    info!(
-                        "Balance {} is less than needed: {}, doing airdrop...",
-                        balance, lamports
-                    );
+                    info!("Balance {balance} is less than needed: {lamports}, doing airdrop...");
                     if !airdrop_lamports(&client, payer_keypairs[i], lamports * 100_000) {
                         warn!("failed airdrop, exiting");
                         return;
@@ -617,7 +945,7 @@ fn run_accounts_bench(
         if sigs_len < batch_size {
             let num_to_create = batch_size - sigs_len;
             if num_to_create >= payer_keypairs.len() {
-                info!("creating {} new", num_to_create);
+                info!("creating {num_to_create} new");
                 let chunk_size = num_to_create / payer_keypairs.len();
                 if chunk_size > 0 {
                     for (i, keypair) in payer_keypairs.iter().enumerate() {
@@ -639,6 +967,7 @@ fn run_accounts_bench(
                             .collect();
                         balances[i] = balances[i].saturating_sub(lamports * txs.len() as u64);
                         info!("txs: {}", txs.len());
+                        transaction_signature_tracker.track_transactions(&txs);
                         let new_ids = executor.push_transactions(txs);
                         info!("ids: {}", new_ids.len());
                         tx_sent_count += new_ids.len();
@@ -672,6 +1001,7 @@ fn run_accounts_bench(
                         .collect();
                     balances[0] = balances[0].saturating_sub(fee * txs.len() as u64);
                     info!("close txs: {}", txs.len());
+                    transaction_signature_tracker.track_transactions(&txs);
                     let new_ids = executor.push_transactions(txs);
                     info!("close ids: {}", new_ids.len());
                     tx_sent_count += new_ids.len();
@@ -681,6 +1011,12 @@ fn run_accounts_bench(
         } else {
             let _ = executor.drain_cleared();
         }
+
+        if let Some(start_bench) = &start_bench_barrier {
+            // As the final barrier participant, this call to `wait()` unlocks all the bench threads
+            start_bench.wait();
+        }
+        start_bench_barrier = None;
 
         count += 1;
         let max_accounts_met = if let Some(max_accounts) = max_accounts {
@@ -693,8 +1029,9 @@ fn run_accounts_bench(
             || max_accounts_met
         {
             info!(
-                "total_accounts_created: {} total_accounts_closed: {} tx_sent_count: {} loop_count: {} balance(s): {:?}",
-                total_accounts_created, total_accounts_closed, tx_sent_count, count, balances
+                "total_accounts_created: {total_accounts_created} total_accounts_closed: \
+                 {total_accounts_closed} tx_sent_count: {tx_sent_count} loop_count: {count} \
+                 balance(s): {balances:?}"
             );
             last_log = Instant::now();
         }
@@ -736,9 +1073,9 @@ fn run_accounts_bench(
                     (max_created_seed - max_closed_seed) as usize,
                 );
                 if num_to_close >= payer_keypairs.len() {
-                    info!("closing {} accounts", num_to_close);
+                    info!("closing {num_to_close} accounts");
                     let chunk_size = num_to_close / payer_keypairs.len();
-                    info!("{:?} chunk_size", chunk_size);
+                    info!("{chunk_size:?} chunk_size");
                     if chunk_size > 0 {
                         for (i, keypair) in payer_keypairs.iter().enumerate() {
                             let txs: Vec<_> = (0..chunk_size)
@@ -762,6 +1099,7 @@ fn run_accounts_bench(
                                 .collect();
                             balances[i] = balances[i].saturating_sub(fee * txs.len() as u64);
                             info!("close txs: {}", txs.len());
+                            transaction_signature_tracker.track_transactions(&txs);
                             let new_ids = executor.push_transactions(txs);
                             info!("close ids: {}", new_ids.len());
                             tx_sent_count += new_ids.len();
@@ -775,8 +1113,8 @@ fn run_accounts_bench(
             count += 1;
             if last_log.elapsed().as_millis() > 3000 || max_closed_seed >= max_created_seed {
                 info!(
-                    "total_accounts_closed: {} tx_sent_count: {} loop_count: {} balance(s): {:?}",
-                    total_accounts_closed, tx_sent_count, count, balances
+                    "total_accounts_closed: {total_accounts_closed} tx_sent_count: \
+                     {tx_sent_count} loop_count: {count} balance(s): {balances:?}"
                 );
                 last_log = Instant::now();
             }
@@ -798,7 +1136,7 @@ fn run_accounts_bench(
 }
 
 fn main() {
-    solana_logger::setup_with_default("solana=info");
+    agave_logger::setup_with_default("solana=info");
     let matches = App::new(crate_name!())
         .about(crate_description!())
         .version(solana_version::version!())
@@ -824,8 +1162,8 @@ fn main() {
                 .validator(is_url_or_moniker)
                 .conflicts_with("entrypoint")
                 .help(
-                    "URL for Solana's JSON RPC or moniker (or their first letter): \
-                       [mainnet-beta, testnet, devnet, localhost]",
+                    "URL for Solana's JSON RPC or moniker (or their first letter): [mainnet-beta, \
+                     testnet, devnet, localhost]",
                 ),
         )
         .arg(
@@ -849,6 +1187,7 @@ fn main() {
                 .long("space")
                 .takes_value(true)
                 .value_name("BYTES")
+                .conflicts_with("mint")
                 .help("Size of accounts to create"),
         )
         .arg(
@@ -879,11 +1218,10 @@ fn main() {
                 .takes_value(true)
                 .value_name("BYTES")
                 .help(
-                    "Every `n` batches, create a batch of close transactions for
-                    the earliest remaining batch of accounts created.
-                    Note: Should be > 1 to avoid situations where the close \
-                    transactions will be submitted before the corresponding \
-                    create transactions have been confirmed",
+                    "Every `n` batches, create a batch of close transactions for the earliest \
+                     remaining batch of accounts created. Note: Should be > 1 to avoid situations \
+                     where the close transactions will be submitted before the corresponding \
+                     create transactions have been confirmed",
                 ),
         )
         .arg(
@@ -905,12 +1243,23 @@ fn main() {
                 .long("max-accounts")
                 .takes_value(true)
                 .value_name("NUM_ACCOUNTS")
-                .help("Halt after client has created this number of accounts. Does not count closed accounts."),
+                .help(
+                    "Halt after client has created this number of accounts. Does not count closed \
+                     accounts.",
+                ),
         )
         .arg(
             Arg::with_name("check_gossip")
                 .long("check-gossip")
                 .help("Just use entrypoint address directly"),
+        )
+        .arg(
+            Arg::with_name("shred_version")
+                .long("shred-version")
+                .takes_value(true)
+                .value_name("VERSION")
+                .requires("check_gossip")
+                .help("The shred version to use for gossip discovery"),
         )
         .arg(
             Arg::with_name("mint")
@@ -938,12 +1287,17 @@ fn main() {
                 .takes_value(true)
                 .value_name("RPC_BENCH_TYPE(S)")
                 .multiple(true)
+                .requires_ifs(&[("supply", "mint"), ("token-accounts-by-owner", "mint")])
+                .requires_ifs(&[
+                    ("supply", "mint"),
+                    ("token-accounts-by-owner", "mint"),
+                    ("token-supply", "mint"),
+                ])
                 .help("Spawn a thread which calls a specific RPC method in a loop to benchmark it"),
         )
         .get_matches();
 
     let skip_gossip = !matches.is_present("check_gossip");
-
     let space = value_t!(matches, "space", u64).ok();
     let lamports = value_t!(matches, "lamports", u64).ok();
     let batch_size = value_t!(matches, "batch_size", usize).unwrap_or(4);
@@ -988,9 +1342,25 @@ fn main() {
             eprintln!("failed to parse entrypoint address: {e}");
             exit(1)
         });
+        let shred_version: Option<u16> = if !skip_gossip {
+            if let Ok(version) = value_t!(matches, "shred_version", u16) {
+                Some(version)
+            } else {
+                Some(
+                    solana_net_utils::get_cluster_shred_version(&entrypoint_addr).unwrap_or_else(
+                        |err| {
+                            eprintln!("Failed to get shred version: {err}");
+                            exit(1);
+                        },
+                    ),
+                )
+            }
+        } else {
+            None
+        };
 
         let rpc_addr = if !skip_gossip {
-            info!("Finding cluster entry: {:?}", entrypoint_addr);
+            info!("Finding cluster entry: {entrypoint_addr:?}");
             let (gossip_nodes, _validators) = discover(
                 None, // keypair
                 Some(&entrypoint_addr),
@@ -999,7 +1369,7 @@ fn main() {
                 None,                    // find_nodes_by_pubkey
                 Some(&entrypoint_addr),  // find_node_by_gossip_addr
                 None,                    // my_gossip_addr
-                0,                       // my_shred_version
+                shred_version.unwrap(),  // my_shred_version
                 SocketAddrSpace::Unspecified,
             )
             .unwrap_or_else(|err| {
@@ -1010,7 +1380,7 @@ fn main() {
             info!("done found {} nodes", gossip_nodes.len());
             gossip_nodes[0].rpc().unwrap()
         } else {
-            info!("Using {:?} as the RPC address", entrypoint_addr);
+            info!("Using {entrypoint_addr:?} as the RPC address");
             entrypoint_addr
         };
 
@@ -1055,24 +1425,30 @@ fn main() {
 pub mod test {
     use {
         super::*,
-        solana_accounts_db::{
-            accounts_index::{AccountIndex, AccountSecondaryIndexes},
-            inline_spl_token,
-        },
+        solana_accounts_db::accounts_index::{AccountIndex, AccountSecondaryIndexes},
         solana_core::validator::ValidatorConfig,
-        solana_faucet::faucet::run_local_faucet,
+        solana_faucet::faucet::run_local_faucet_for_tests,
         solana_local_cluster::{
             local_cluster::{ClusterConfig, LocalCluster},
             validator_configs::make_identical_validator_configs,
         },
         solana_measure::measure::Measure,
-        solana_sdk::{native_token::sol_to_lamports, poh_config::PohConfig},
+        solana_native_token::LAMPORTS_PER_SOL,
+        solana_poh_config::PohConfig,
+        solana_program_pack::Pack,
         solana_test_validator::TestValidator,
-        spl_token::{
-            solana_program::program_pack::Pack,
-            state::{Account, Mint},
-        },
+        spl_token_interface::state::{Account, Mint},
     };
+
+    fn initialize_and_add_secondary_indexes(validator_config: &mut ValidatorConfig) {
+        let account_indexes = &mut validator_config.accounts_db_config.account_indexes;
+        if account_indexes.is_none() {
+            *account_indexes = Some(AccountSecondaryIndexes::default());
+        }
+        add_secondary_indexes(account_indexes.as_mut().unwrap());
+
+        add_secondary_indexes(&mut validator_config.rpc_config.account_indexes);
+    }
 
     fn add_secondary_indexes(indexes: &mut AccountSecondaryIndexes) {
         indexes.indexes.insert(AccountIndex::SplTokenOwner);
@@ -1082,13 +1458,12 @@ pub mod test {
 
     #[test]
     fn test_accounts_cluster_bench() {
-        solana_logger::setup();
+        agave_logger::setup();
         let mut validator_config = ValidatorConfig::default_for_test();
+        initialize_and_add_secondary_indexes(&mut validator_config);
         let num_nodes = 1;
-        add_secondary_indexes(&mut validator_config.account_indexes);
-        add_secondary_indexes(&mut validator_config.rpc_config.account_indexes);
         let mut config = ClusterConfig {
-            cluster_lamports: 10_000_000,
+            mint_lamports: 10_000_000,
             poh_config: PohConfig::new_sleep(Duration::from_millis(50)),
             node_stakes: vec![100; num_nodes],
             validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
@@ -1128,18 +1503,17 @@ pub mod test {
         );
         let post_txs = client.get_transaction_count().unwrap();
         start.stop();
-        info!("{} pre {} post {}", start, pre_txs, post_txs);
+        info!("{start} pre {pre_txs} post {post_txs}");
     }
 
     #[test]
     fn test_halt_accounts_creation_at_max() {
-        solana_logger::setup();
+        agave_logger::setup();
         let mut validator_config = ValidatorConfig::default_for_test();
+        initialize_and_add_secondary_indexes(&mut validator_config);
         let num_nodes = 1;
-        add_secondary_indexes(&mut validator_config.account_indexes);
-        add_secondary_indexes(&mut validator_config.rpc_config.account_indexes);
         let mut config = ClusterConfig {
-            cluster_lamports: 10_000_000,
+            mint_lamports: 10_000_000,
             poh_config: PohConfig::new_sleep(Duration::from_millis(50)),
             node_stakes: vec![100; num_nodes],
             validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
@@ -1179,15 +1553,19 @@ pub mod test {
         );
         let post_txs = client.get_transaction_count().unwrap();
         start.stop();
-        info!("{} pre {} post {}", start, pre_txs, post_txs);
+        info!("{start} pre {pre_txs} post {post_txs}");
     }
 
     #[test]
     fn test_create_then_reclaim_spl_token_accounts() {
-        solana_logger::setup();
+        agave_logger::setup();
         let mint_keypair = Keypair::new();
         let mint_pubkey = mint_keypair.pubkey();
-        let faucet_addr = run_local_faucet(mint_keypair, None);
+        let faucet_addr = run_local_faucet_for_tests(
+            mint_keypair,
+            None, /* per_time_cap */
+            0,    /* port */
+        );
         let test_validator = TestValidator::with_custom_fees(
             mint_pubkey,
             1,
@@ -1203,11 +1581,7 @@ pub mod test {
         let funder = Keypair::new();
         let latest_blockhash = rpc_client.get_latest_blockhash().unwrap();
         let signature = rpc_client
-            .request_airdrop_with_blockhash(
-                &funder.pubkey(),
-                sol_to_lamports(1.0),
-                &latest_blockhash,
-            )
+            .request_airdrop_with_blockhash(&funder.pubkey(), LAMPORTS_PER_SOL, &latest_blockhash)
             .unwrap();
         rpc_client
             .confirm_transaction_with_spinner(
@@ -1230,10 +1604,10 @@ pub mod test {
                     &spl_mint_keypair.pubkey(),
                     spl_mint_rent,
                     spl_mint_len as u64,
-                    &inline_spl_token::id(),
+                    &token::id(),
                 ),
-                spl_token::instruction::initialize_mint(
-                    &spl_token::id(),
+                spl_token_interface::instruction::initialize_mint(
+                    &spl_token_interface::id(),
                     &spl_mint_keypair.pubkey(),
                     &spl_mint_keypair.pubkey(),
                     None,
@@ -1278,6 +1652,6 @@ pub mod test {
             0,
         );
         start.stop();
-        info!("{}", start);
+        info!("{start}");
     }
 }

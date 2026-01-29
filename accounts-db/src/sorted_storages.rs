@@ -1,8 +1,8 @@
 use {
     crate::accounts_db::AccountStorageEntry,
     log::*,
+    solana_clock::Slot,
     solana_measure::measure::Measure,
-    solana_sdk::clock::Slot,
     std::{
         collections::HashMap,
         ops::{Bound, Range, RangeBounds},
@@ -195,8 +195,8 @@ mod tests {
     use {
         super::*,
         crate::{
-            accounts_db::{AccountStorageEntry, AppendVecId},
-            accounts_file::AccountsFile,
+            accounts_db::{AccountStorageEntry, AccountsFileId},
+            accounts_file::{AccountsFile, AccountsFileProvider, StorageAccess},
             append_vec::AppendVec,
         },
         std::sync::Arc,
@@ -297,7 +297,7 @@ mod tests {
             assert!(
                 (slot != 2 && slot != 4)
                     ^ storage
-                        .map(|storage| storage.append_vec_id() == (slot as AppendVecId))
+                        .map(|storage| storage.id() == (slot as AccountsFileId))
                         .unwrap_or(false),
                 "slot: {slot}, storage: {storage:?}"
             );
@@ -434,19 +434,28 @@ mod tests {
         );
         assert_eq!(result.slot_count(), 1);
         assert_eq!(result.storages.len(), 1);
-        assert_eq!(
-            result.get(slot).unwrap().append_vec_id(),
-            store.append_vec_id()
-        );
+        assert_eq!(result.get(slot).unwrap().id(), store.id());
     }
 
-    fn create_sample_store(id: AppendVecId) -> Arc<AccountStorageEntry> {
+    fn create_sample_store(id: AccountsFileId) -> Arc<AccountStorageEntry> {
         let tf = crate::append_vec::test_utils::get_append_vec_path("create_sample_store");
         let (_temp_dirs, paths) = crate::accounts_db::get_temp_accounts_paths(1).unwrap();
         let size: usize = 123;
         let slot = 0;
-        let mut data = AccountStorageEntry::new(&paths[0], slot, id, size as u64);
-        let av = AccountsFile::AppendVec(AppendVec::new(&tf.path, true, 1024 * 1024));
+        let mut data = AccountStorageEntry::new(
+            &paths[0],
+            slot,
+            id,
+            size as u64,
+            AccountsFileProvider::AppendVec,
+            StorageAccess::File,
+        );
+        let av = AccountsFile::AppendVec(AppendVec::new(
+            &tf.path,
+            true,
+            1024 * 1024,
+            StorageAccess::File,
+        ));
         data.accounts = av;
 
         Arc::new(data)
@@ -473,13 +482,7 @@ mod tests {
         assert!(result.get(5).is_none());
         assert!(result.get(6).is_none());
         assert!(result.get(8).is_none());
-        assert_eq!(
-            result.get(slots[0]).unwrap().append_vec_id(),
-            store.append_vec_id()
-        );
-        assert_eq!(
-            result.get(slots[1]).unwrap().append_vec_id(),
-            store2.append_vec_id()
-        );
+        assert_eq!(result.get(slots[0]).unwrap().id(), store.id());
+        assert_eq!(result.get(slots[1]).unwrap().id(), store2.id());
     }
 }

@@ -1,19 +1,18 @@
 //! A command-line executable for monitoring a cluster's gossip plane.
-
+#[allow(deprecated)]
+use solana_gossip::{contact_info::ContactInfo, gossip_service::discover};
 use {
     clap::{
         crate_description, crate_name, value_t, value_t_or_exit, App, AppSettings, Arg, ArgMatches,
         SubCommand,
     },
+    log::{error, info, warn},
     solana_clap_utils::{
         hidden_unless_forced,
         input_parsers::{keypair_of, pubkeys_of},
         input_validators::{is_keypair_or_ask_keyword, is_port, is_pubkey},
     },
-    solana_gossip::{
-        gossip_service::discover, legacy_contact_info::LegacyContactInfo as ContactInfo,
-    },
-    solana_sdk::pubkey::Pubkey,
+    solana_pubkey::Pubkey,
     solana_streamer::socket::SocketAddrSpace,
     std::{
         error,
@@ -30,6 +29,27 @@ fn parse_matches() -> ArgMatches<'static> {
         .takes_value(true)
         .default_value("0")
         .help("Filter gossip nodes by this shred version");
+
+    let gossip_port_arg = clap::Arg::with_name("gossip_port")
+        .long("gossip-port")
+        .value_name("PORT")
+        .takes_value(true)
+        .validator(is_port)
+        .help("Gossip port number for the node");
+
+    let gossip_host_arg = clap::Arg::with_name("gossip_host")
+        .long("gossip-host")
+        .value_name("HOST")
+        .takes_value(true)
+        .validator(solana_net_utils::is_host)
+        .help("DEPRECATED: --gossip-host is no longer supported. Use --bind-address instead.");
+
+    let bind_address_arg = clap::Arg::with_name("bind_address")
+        .long("bind-address")
+        .value_name("HOST")
+        .takes_value(true)
+        .validator(solana_net_utils::is_host)
+        .help("IP address to bind the node to for gossip (replaces --gossip-host)");
 
     App::new(crate_name!())
         .about(crate_description!())
@@ -77,6 +97,9 @@ fn parse_matches() -> ArgMatches<'static> {
                         .help("Timeout in seconds"),
                 )
                 .arg(&shred_version_arg)
+                .arg(&gossip_port_arg)
+                .arg(&gossip_host_arg)
+                .arg(&bind_address_arg)
                 .setting(AppSettings::DisableVersion),
         )
         .subcommand(
@@ -91,23 +114,6 @@ fn parse_matches() -> ArgMatches<'static> {
                         .takes_value(true)
                         .validator(solana_net_utils::is_host_port)
                         .help("Rendezvous with the cluster at this entrypoint"),
-                )
-                .arg(
-                    clap::Arg::with_name("gossip_port")
-                        .long("gossip-port")
-                        .value_name("PORT")
-                        .takes_value(true)
-                        .validator(is_port)
-                        .help("Gossip port number for the node"),
-                )
-                .arg(
-                    clap::Arg::with_name("gossip_host")
-                        .long("gossip-host")
-                        .value_name("HOST")
-                        .takes_value(true)
-                        .validator(solana_net_utils::is_host)
-                        .help("Gossip DNS name or IP address for the node to advertise in gossip \
-                               [default: ask --entrypoint, or 127.0.0.1 when --entrypoint is not provided]"),
                 )
                 .arg(
                     Arg::with_name("identity")
@@ -146,6 +152,9 @@ fn parse_matches() -> ArgMatches<'static> {
                         .help("Public key of a specific node to wait for"),
                 )
                 .arg(&shred_version_arg)
+                .arg(&gossip_port_arg)
+                .arg(&gossip_host_arg)
+                .arg(&bind_address_arg)
                 .arg(
                     Arg::with_name("timeout")
                         .long("timeout")
@@ -157,27 +166,42 @@ fn parse_matches() -> ArgMatches<'static> {
         .get_matches()
 }
 
-fn parse_gossip_host(matches: &ArgMatches, entrypoint_addr: Option<SocketAddr>) -> IpAddr {
-    matches
-        .value_of("gossip_host")
-        .map(|gossip_host| {
-            solana_net_utils::parse_host(gossip_host).unwrap_or_else(|e| {
-                eprintln!("failed to parse gossip-host: {e}");
-                exit(1);
-            })
+fn parse_bind_address(matches: &ArgMatches, entrypoint_addr: Option<SocketAddr>) -> IpAddr {
+    if let Some(bind_address) = matches.value_of("bind_address") {
+        solana_net_utils::parse_host(bind_address).unwrap_or_else(|e| {
+            eprintln!("failed to parse bind-address: {e}");
+            exit(1);
         })
-        .unwrap_or_else(|| {
-            if let Some(entrypoint_addr) = entrypoint_addr {
-                solana_net_utils::get_public_ip_addr(&entrypoint_addr).unwrap_or_else(|err| {
-                    eprintln!("Failed to contact cluster entrypoint {entrypoint_addr}: {err}");
-                    exit(1);
-                })
-            } else {
-                IpAddr::V4(Ipv4Addr::LOCALHOST)
-            }
+    } else if let Some(gossip_host) = matches.value_of("gossip_host") {
+        warn!("--gossip-host is deprecated. Use --bind-address instead.");
+        solana_net_utils::parse_host(gossip_host).unwrap_or_else(|e| {
+            eprintln!("failed to parse gossip-host: {e}");
+            exit(1);
         })
+    } else if let Some(entrypoint_addr) = entrypoint_addr {
+        solana_net_utils::get_public_ip_addr_with_binding(
+            &entrypoint_addr,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        )
+        .unwrap_or_else(|err| {
+            eprintln!("Failed to contact cluster entrypoint {entrypoint_addr}: {err}");
+            exit(1);
+        })
+    } else {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    }
 }
 
+// allow deprecations here to workaround limitations with dependency specification in
+// multi-target crates and agave-unstable-api. `ContactInfo` is deprecated here, but we
+// cannot specify deprecation allowances on function arguments. since this function is
+// private, we apply the allowance to the entire body as a refactor that would limit it
+// to a wrapper is going to be too invasive
+//
+// this mitigation can be removed once the solana-gossip binary target is moved to its
+// own crate and we can correctly depend on the solana-gossip lib crate with
+// `agave-unstable-api` enabled
+#[allow(deprecated)]
 fn process_spy_results(
     timeout: Option<u64>,
     validators: Vec<ContactInfo>,
@@ -199,7 +223,11 @@ fn process_spy_results(
         }
         if let Some(nodes) = pubkeys {
             for node in nodes {
-                if !validators.iter().any(|x| x.pubkey() == node) {
+                if !validators.iter().any(|x| {
+                    #[allow(deprecated)]
+                    let pubkey = x.pubkey();
+                    pubkey == node
+                }) {
                     eprintln!("Error: Could not find node {node:?}");
                     exit(1);
                 }
@@ -210,6 +238,27 @@ fn process_spy_results(
         if validators.len() > num_nodes_exactly {
             eprintln!("Error: Extra nodes discovered.  Expecting exactly {num_nodes_exactly}");
             exit(1);
+        }
+    }
+}
+
+fn get_entrypoint_shred_version(entrypoint: &Option<SocketAddr>) -> Option<u16> {
+    let Some(entrypoint) = entrypoint else {
+        error!("cannot obtain shred-version without an entrypoint");
+        return None;
+    };
+    match solana_net_utils::get_cluster_shred_version(entrypoint) {
+        Err(err) => {
+            error!("get_cluster_shred_version failed: {entrypoint}, {err}");
+            None
+        }
+        Ok(0) => {
+            error!("entrypoint {entrypoint} returned shred-version zero");
+            None
+        }
+        Ok(shred_version) => {
+            info!("obtained shred-version {shred_version} from entrypoint: {entrypoint}");
+            Some(shred_version)
         }
     }
 }
@@ -226,24 +275,18 @@ fn process_spy(matches: &ArgMatches, socket_addr_space: SocketAddrSpace) -> std:
         .value_of("timeout")
         .map(|secs| secs.to_string().parse().unwrap());
     let pubkeys = pubkeys_of(matches, "node_pubkey");
-    let shred_version = value_t_or_exit!(matches, "shred_version", u16);
     let identity_keypair = keypair_of(matches, "identity");
-
     let entrypoint_addr = parse_entrypoint(matches);
+    let gossip_addr = get_gossip_address(matches, entrypoint_addr);
 
-    let gossip_host = parse_gossip_host(matches, entrypoint_addr);
+    let mut shred_version = value_t_or_exit!(matches, "shred_version", u16);
+    if shred_version == 0 {
+        shred_version = get_entrypoint_shred_version(&entrypoint_addr)
+            .expect("need non-zero shred-version to join the cluster");
+    }
 
-    let gossip_addr = SocketAddr::new(
-        gossip_host,
-        value_t!(matches, "gossip_port", u16).unwrap_or_else(|_| {
-            solana_net_utils::find_available_port_in_range(
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                (0, 1),
-            )
-            .expect("unable to find an available gossip port")
-        }),
-    );
     let discover_timeout = Duration::from_secs(timeout.unwrap_or(u64::MAX));
+    #[allow(deprecated)]
     let (_all_peers, validators) = discover(
         identity_keypair,
         entrypoint_addr.as_ref(),
@@ -282,9 +325,17 @@ fn process_rpc_url(
 ) -> std::io::Result<()> {
     let any = matches.is_present("any");
     let all = matches.is_present("all");
-    let entrypoint_addr = parse_entrypoint(matches);
     let timeout = value_t_or_exit!(matches, "timeout", u64);
-    let shred_version = value_t_or_exit!(matches, "shred_version", u16);
+    let entrypoint_addr = parse_entrypoint(matches);
+    let gossip_addr = get_gossip_address(matches, entrypoint_addr);
+
+    let mut shred_version = value_t_or_exit!(matches, "shred_version", u16);
+    if shred_version == 0 {
+        shred_version = get_entrypoint_shred_version(&entrypoint_addr)
+            .expect("need non-zero shred-version to join the cluster");
+    }
+
+    #[allow(deprecated)]
     let (_all_peers, validators) = discover(
         None, // keypair
         entrypoint_addr.as_ref(),
@@ -292,7 +343,7 @@ fn process_rpc_url(
         Duration::from_secs(timeout),
         None,                     // find_nodes_by_pubkey
         entrypoint_addr.as_ref(), // find_node_by_gossip_addr
-        None,                     // my_gossip_addr
+        Some(&gossip_addr),       // my_gossip_addr
         shred_version,
         socket_addr_space,
     )?;
@@ -300,13 +351,18 @@ fn process_rpc_url(
     let rpc_addrs: Vec<_> = validators
         .iter()
         .filter(|node| {
-            any || all
-                || node
-                    .gossip()
+            any || all || {
+                #[allow(deprecated)]
+                let addrs = node.gossip();
+                addrs
                     .map(|addr| Some(addr) == entrypoint_addr)
                     .unwrap_or_default()
+            }
         })
-        .filter_map(|node| node.rpc().ok())
+        .filter_map(
+            #[allow(deprecated)]
+            ContactInfo::rpc,
+        )
         .filter(|addr| socket_addr_space.check(addr))
         .collect();
 
@@ -325,8 +381,22 @@ fn process_rpc_url(
     Ok(())
 }
 
+fn get_gossip_address(matches: &ArgMatches, entrypoint_addr: Option<SocketAddr>) -> SocketAddr {
+    let bind_address = parse_bind_address(matches, entrypoint_addr);
+    SocketAddr::new(
+        bind_address,
+        value_t!(matches, "gossip_port", u16).unwrap_or_else(|_| {
+            solana_net_utils::find_available_port_in_range(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                (0, 1),
+            )
+            .expect("unable to find an available gossip port")
+        }),
+    )
+}
+
 fn main() -> Result<(), Box<dyn error::Error>> {
-    solana_logger::setup_with_default("solana=info");
+    agave_logger::setup_with_default_filter();
 
     let matches = parse_matches();
     let socket_addr_space = SocketAddrSpace::new(matches.is_present("allow_private_addr"));

@@ -9,7 +9,7 @@ mod sigma_proofs;
 use {
     crate::zk_token_proof_instruction::ProofType,
     num_traits::{FromPrimitive, ToPrimitive},
-    solana_program::instruction::InstructionError,
+    solana_instruction::error::InstructionError,
     thiserror::Error,
 };
 pub use {
@@ -21,9 +21,10 @@ pub use {
     pedersen::PedersenCommitment,
     range_proof::{RangeProofU128, RangeProofU256, RangeProofU64},
     sigma_proofs::{
-        BatchedGroupedCiphertext2HandlesValidityProof, CiphertextCiphertextEqualityProof,
+        BatchedGroupedCiphertext2HandlesValidityProof,
+        BatchedGroupedCiphertext3HandlesValidityProof, CiphertextCiphertextEqualityProof,
         CiphertextCommitmentEqualityProof, FeeSigmaProof, GroupedCiphertext2HandlesValidityProof,
-        PubkeyValidityProof, ZeroBalanceProof,
+        GroupedCiphertext3HandlesValidityProof, PubkeyValidityProof, ZeroBalanceProof,
     },
 };
 
@@ -35,7 +36,9 @@ pub enum ParseError {
     Invalid,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck_derive::Pod, bytemuck_derive::Zeroable,
+)]
 #[repr(transparent)]
 pub struct PodU16([u8; 2]);
 impl From<u16> for PodU16 {
@@ -49,7 +52,9 @@ impl From<PodU16> for u16 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck_derive::Pod, bytemuck_derive::Zeroable,
+)]
 #[repr(transparent)]
 pub struct PodU64([u8; 8]);
 impl From<u64> for PodU64 {
@@ -63,7 +68,9 @@ impl From<PodU64> for u64 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck_derive::Pod, bytemuck_derive::Zeroable,
+)]
 #[repr(transparent)]
 pub struct PodProofType(u8);
 impl From<ProofType> for PodProofType {
@@ -79,7 +86,7 @@ impl TryFrom<PodProofType> for ProofType {
     }
 }
 
-#[derive(Clone, Copy, Pod, Zeroable, PartialEq, Eq)]
+#[derive(Clone, Copy, bytemuck_derive::Pod, bytemuck_derive::Zeroable, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct CompressedRistretto(pub [u8; 32]);
 

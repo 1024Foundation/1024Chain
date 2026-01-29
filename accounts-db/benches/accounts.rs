@@ -7,23 +7,16 @@ use {
     dashmap::DashMap,
     rand::Rng,
     rayon::iter::{IntoParallelRefIterator, ParallelIterator},
+    solana_account::{AccountSharedData, ReadableAccount},
     solana_accounts_db::{
+        account_info::{AccountInfo, StorageLocation},
         accounts::{AccountAddressFilter, Accounts},
-        accounts_db::{
-            test_utils::create_test_accounts, AccountShrinkThreshold, AccountsDb,
-            VerifyAccountsHashAndLamportsConfig, ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS,
-        },
-        accounts_index::{AccountSecondaryIndexes, ScanConfig},
+        accounts_db::{AccountFromStorage, AccountsDb, ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS},
+        accounts_index::ScanConfig,
         ancestors::Ancestors,
     },
-    solana_sdk::{
-        account::{Account, AccountSharedData, ReadableAccount},
-        genesis_config::ClusterType,
-        hash::Hash,
-        pubkey::Pubkey,
-        rent_collector::RentCollector,
-        sysvar::epoch_schedule::EpochSchedule,
-    },
+    solana_hash::Hash,
+    solana_pubkey::Pubkey,
     std::{
         collections::{HashMap, HashSet},
         path::PathBuf,
@@ -33,103 +26,46 @@ use {
     test::Bencher,
 };
 
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 fn new_accounts_db(account_paths: Vec<PathBuf>) -> AccountsDb {
     AccountsDb::new_with_config(
         account_paths,
-        &ClusterType::Development,
-        AccountSecondaryIndexes::default(),
-        AccountShrinkThreshold::default(),
-        Some(ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS),
+        ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS,
         None,
         Arc::default(),
     )
 }
 
 #[bench]
-fn bench_accounts_hash_bank_hash(bencher: &mut Bencher) {
-    let accounts_db = new_accounts_db(vec![PathBuf::from("bench_accounts_hash_internal")]);
-    let accounts = Accounts::new(Arc::new(accounts_db));
-    let mut pubkeys: Vec<Pubkey> = vec![];
-    let num_accounts = 60_000;
-    let slot = 0;
-    create_test_accounts(&accounts, &mut pubkeys, num_accounts, slot);
-    let ancestors = Ancestors::from(vec![0]);
-    let (_, total_lamports) = accounts
-        .accounts_db
-        .update_accounts_hash_for_tests(0, &ancestors, false, false);
-    accounts.add_root(slot);
-    accounts.accounts_db.flush_accounts_cache(true, Some(slot));
-    bencher.iter(|| {
-        assert!(accounts.verify_accounts_hash_and_lamports(
-            0,
-            total_lamports,
-            None,
-            VerifyAccountsHashAndLamportsConfig {
-                ancestors: &ancestors,
-                test_hash_calculation: false,
-                epoch_schedule: &EpochSchedule::default(),
-                rent_collector: &RentCollector::default(),
-                ignore_mismatch: false,
-                store_detailed_debug_info: false,
-                use_bg_thread_pool: false,
-            }
-        ))
-    });
-}
-
-#[bench]
-fn bench_update_accounts_hash(bencher: &mut Bencher) {
-    solana_logger::setup();
-    let accounts_db = new_accounts_db(vec![PathBuf::from("update_accounts_hash")]);
-    let accounts = Accounts::new(Arc::new(accounts_db));
-    let mut pubkeys: Vec<Pubkey> = vec![];
-    create_test_accounts(&accounts, &mut pubkeys, 50_000, 0);
-    let ancestors = Ancestors::from(vec![0]);
-    bencher.iter(|| {
-        accounts
-            .accounts_db
-            .update_accounts_hash_for_tests(0, &ancestors, false, false);
-    });
-}
-
-#[bench]
-fn bench_accounts_delta_hash(bencher: &mut Bencher) {
-    solana_logger::setup();
-    let accounts_db = new_accounts_db(vec![PathBuf::from("accounts_delta_hash")]);
-    let accounts = Accounts::new(Arc::new(accounts_db));
-    let mut pubkeys: Vec<Pubkey> = vec![];
-    create_test_accounts(&accounts, &mut pubkeys, 100_000, 0);
-    bencher.iter(|| {
-        accounts.accounts_db.calculate_accounts_delta_hash(0);
-    });
-}
-
-#[bench]
 fn bench_delete_dependencies(bencher: &mut Bencher) {
-    solana_logger::setup();
+    agave_logger::setup();
     let accounts_db = new_accounts_db(vec![PathBuf::from("accounts_delete_deps")]);
     let accounts = Accounts::new(Arc::new(accounts_db));
     let mut old_pubkey = Pubkey::default();
     let zero_account = AccountSharedData::new(0, 0, AccountSharedData::default().owner());
     for i in 0..1000 {
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
         let account = AccountSharedData::new(i + 1, 0, AccountSharedData::default().owner());
-        accounts.store_slow_uncached(i, &pubkey, &account);
-        accounts.store_slow_uncached(i, &old_pubkey, &zero_account);
+        accounts
+            .accounts_db
+            .store_for_tests((i, [(&pubkey, &account)].as_slice()));
+        accounts
+            .accounts_db
+            .store_for_tests((i, [(&old_pubkey, &zero_account)].as_slice()));
         old_pubkey = pubkey;
-        accounts.add_root(i);
+        accounts.accounts_db.add_root_and_flush_write_cache(i);
     }
     bencher.iter(|| {
         accounts.accounts_db.clean_accounts_for_tests();
     });
 }
 
-fn store_accounts_with_possible_contention<F: 'static>(
-    bench_name: &str,
-    bencher: &mut Bencher,
-    reader_f: F,
-) where
-    F: Fn(&Accounts, &[Pubkey]) + Send + Copy,
+fn store_accounts_with_possible_contention<F>(bench_name: &str, bencher: &mut Bencher, reader_f: F)
+where
+    F: Fn(&Accounts, &[Pubkey]) + Send + Copy + 'static,
 {
     let num_readers = 5;
     let accounts_db = new_accounts_db(vec![PathBuf::from(
@@ -140,17 +76,16 @@ fn store_accounts_with_possible_contention<F: 'static>(
     let num_keys = 1000;
     let slot = 0;
 
-    let pubkeys: Vec<_> = std::iter::repeat_with(solana_sdk::pubkey::new_rand)
+    let pubkeys: Vec<_> = std::iter::repeat_with(solana_pubkey::new_rand)
         .take(num_keys)
         .collect();
-    let accounts_data: Vec<_> = std::iter::repeat(Account {
-        lamports: 1,
-        ..Default::default()
-    })
-    .take(num_keys)
+    let accounts_data: Vec<_> = std::iter::repeat_n(
+        AccountSharedData::new(1, 0, &Pubkey::new_from_array([0u8; 32])),
+        num_keys,
+    )
     .collect();
     let storable_accounts: Vec<_> = pubkeys.iter().zip(accounts_data.iter()).collect();
-    accounts.store_accounts_cached((slot, storable_accounts.as_slice()));
+    accounts.store_accounts_par((slot, storable_accounts.as_slice()), None);
     accounts.add_root(slot);
     accounts
         .accounts_db
@@ -170,14 +105,14 @@ fn store_accounts_with_possible_contention<F: 'static>(
 
     let num_new_keys = 1000;
     bencher.iter(|| {
-        let new_pubkeys: Vec<_> = std::iter::repeat_with(solana_sdk::pubkey::new_rand)
+        let new_pubkeys: Vec<_> = std::iter::repeat_with(solana_pubkey::new_rand)
             .take(num_new_keys)
             .collect();
         let new_storable_accounts: Vec<_> = new_pubkeys.iter().zip(accounts_data.iter()).collect();
         // Write to a different slot than the one being read from. Because
         // there's a new account pubkey being written to every time, will
         // compete for the accounts index lock on every store
-        accounts.store_accounts_cached((slot + 1, new_storable_accounts.as_slice()));
+        accounts.store_accounts_par((slot + 1, new_storable_accounts.as_slice()), None);
     });
 }
 
@@ -295,7 +230,7 @@ fn bench_dashmap_par_iter(bencher: &mut Bencher) {
     let (accounts, dashmap) = setup_bench_dashmap_iter();
 
     bencher.iter(|| {
-        test::black_box(accounts.accounts_db.thread_pool.install(|| {
+        test::black_box(accounts.accounts_db.thread_pool_foreground.install(|| {
             dashmap
                 .par_iter()
                 .map(|cached_account| (*cached_account.key(), cached_account.value().1))
@@ -327,8 +262,11 @@ fn bench_load_largest_accounts(b: &mut Bencher) {
         let lamports = rng.gen();
         let pubkey = Pubkey::new_unique();
         let account = AccountSharedData::new(lamports, 0, &Pubkey::default());
-        accounts.store_slow_uncached(0, &pubkey, &account);
+        accounts
+            .accounts_db
+            .store_for_tests((0, [(&pubkey, &account)].as_slice()));
     }
+    accounts.accounts_db.add_root_and_flush_write_cache(0);
     let ancestors = Ancestors::from(vec![0]);
     let bank_id = 0;
     b.iter(|| {
@@ -338,6 +276,53 @@ fn bench_load_largest_accounts(b: &mut Bencher) {
             20,
             &HashSet::new(),
             AccountAddressFilter::Exclude,
+            false,
         )
     });
+}
+
+#[bench]
+fn bench_sort_and_remove_dups(b: &mut Bencher) {
+    fn generate_sample_account_from_storage(i: u8) -> AccountFromStorage {
+        // offset has to be 8 byte aligned
+        let offset = (i as usize) * std::mem::size_of::<u64>();
+        AccountFromStorage {
+            index_info: AccountInfo::new(StorageLocation::AppendVec(i as u32, offset), i == 0),
+            data_len: i as u64,
+            pubkey: Pubkey::new_from_array([i; 32]),
+        }
+    }
+
+    use rand::prelude::*;
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1234);
+    let accounts: Vec<_> =
+        std::iter::repeat_with(|| generate_sample_account_from_storage(rng.gen::<u8>()))
+            .take(1000)
+            .collect();
+
+    b.iter(|| AccountsDb::sort_and_remove_dups(&mut accounts.clone()));
+}
+
+#[bench]
+fn bench_sort_and_remove_dups_no_dups(b: &mut Bencher) {
+    fn generate_sample_account_from_storage(i: u8) -> AccountFromStorage {
+        // offset has to be 8 byte aligned
+        let offset = (i as usize) * std::mem::size_of::<u64>();
+        AccountFromStorage {
+            index_info: AccountInfo::new(StorageLocation::AppendVec(i as u32, offset), i == 0),
+            data_len: i as u64,
+            pubkey: Pubkey::new_unique(),
+        }
+    }
+
+    use rand::prelude::*;
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1234);
+    let mut accounts: Vec<_> =
+        std::iter::repeat_with(|| generate_sample_account_from_storage(rng.gen::<u8>()))
+            .take(1000)
+            .collect();
+
+    accounts.shuffle(&mut rng);
+
+    b.iter(|| AccountsDb::sort_and_remove_dups(&mut accounts.clone()));
 }

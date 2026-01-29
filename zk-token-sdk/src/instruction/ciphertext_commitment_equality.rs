@@ -24,7 +24,7 @@ use {
         instruction::{ProofType, ZkProofData},
         zk_token_elgamal::pod,
     },
-    bytemuck::{Pod, Zeroable},
+    bytemuck_derive::{Pod, Zeroable},
 };
 /// The instruction data that is needed for the
 /// `ProofInstruction::VerifyCiphertextCommitmentEquality` instruction.
@@ -62,7 +62,7 @@ impl CiphertextCommitmentEqualityProofData {
         amount: u64,
     ) -> Result<Self, ProofGenerationError> {
         let context = CiphertextCommitmentEqualityProofContext {
-            pubkey: pod::ElGamalPubkey(keypair.pubkey().to_bytes()),
+            pubkey: pod::ElGamalPubkey(keypair.pubkey().into()),
             ciphertext: pod::ElGamalCiphertext(ciphertext.to_bytes()),
             commitment: pod::PedersenCommitment(commitment.to_bytes()),
         };

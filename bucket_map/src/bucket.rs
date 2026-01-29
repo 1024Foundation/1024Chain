@@ -1,6 +1,7 @@
+#[cfg(feature = "dev-context-only-utils")]
+use crate::bucket_item::BucketItem;
 use {
     crate::{
-        bucket_item::BucketItem,
         bucket_map::BucketMapError,
         bucket_stats::BucketMapStats,
         bucket_storage::{
@@ -16,13 +17,12 @@ use {
     },
     rand::{thread_rng, Rng},
     solana_measure::measure::Measure,
-    solana_sdk::pubkey::Pubkey,
+    solana_pubkey::Pubkey,
     std::{
         collections::hash_map::DefaultHasher,
         fs,
         hash::{Hash, Hasher},
         num::NonZeroU64,
-        ops::RangeBounds,
         path::PathBuf,
         sync::{
             atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -158,11 +158,12 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
                     Arc::clone(&stats.index),
                     count,
                 );
-                stats.index.resize_grow(0, index.capacity_bytes());
                 let random = thread_rng().gen();
                 restartable_bucket.set_file(file_name, random);
                 (index, random, false /* true = reused file */)
             });
+
+        stats.index.resize_grow(0, index.capacity_bytes());
 
         Self {
             random,
@@ -190,10 +191,8 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
         rv
     }
 
-    pub fn items_in_range<R>(&self, range: &Option<&R>) -> Vec<BucketItem<T>>
-    where
-        R: RangeBounds<Pubkey>,
-    {
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn items(&self) -> Vec<BucketItem<T>> {
         let mut result = Vec::with_capacity(self.index.count.load(Ordering::Relaxed) as usize);
         for i in 0..self.index.capacity() {
             let ii = i % self.index.capacity();
@@ -202,14 +201,12 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
             }
             let ix = IndexEntryPlaceInBucket::new(ii);
             let key = ix.key(&self.index);
-            if range.map(|r| r.contains(key)).unwrap_or(true) {
-                let (v, ref_count) = ix.read_value(&self.index, &self.data);
-                result.push(BucketItem {
-                    pubkey: *key,
-                    ref_count,
-                    slot_list: v.to_vec(),
-                });
-            }
+            let (v, ref_count) = ix.read_value(&self.index, &self.data);
+            result.push(BucketItem {
+                pubkey: *key,
+                ref_count,
+                slot_list: v.to_vec(),
+            });
         }
         result
     }
@@ -286,7 +283,6 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
         random: u64,
         is_resizing: bool,
     ) -> Result<u64, BucketMapError> {
-        let mut m = Measure::start("bucket_create_key");
         let ix = Self::bucket_index_ix(key, random) % index.capacity();
         for i in ix..ix + index.max_search() {
             let ii = i % index.capacity();
@@ -297,19 +293,8 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
             // These fields will be overwritten after allocation by callers.
             // Since this part of the mmapped file could have previously been used by someone else, there can be garbage here.
             IndexEntryPlaceInBucket::new(ii).init(index, key);
-            //debug!(                "INDEX ALLOC {:?} {} {} {}",                key, ii, index.capacity, elem_uid            );
-            m.stop();
-            index
-                .stats
-                .find_index_entry_mut_us
-                .fetch_add(m.as_us(), Ordering::Relaxed);
             return Ok(ii);
         }
-        m.stop();
-        index
-            .stats
-            .find_index_entry_mut_us
-            .fetch_add(m.as_us(), Ordering::Relaxed);
         Err(BucketMapError::IndexNoSpace(index.contents.capacity()))
     }
 
@@ -522,25 +507,27 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
     ) -> Result<(), BucketMapError> {
         let num_slots = data_len as u64;
         let best_fit_bucket = MultipleSlots::data_bucket_from_num_slots(data_len as u64);
+        // num_slots > 1 becuase we can store num_slots = 0 or num_slots = 1 in the index entry
         let requires_data_bucket = num_slots > 1 || ref_count != 1;
         if requires_data_bucket && self.data.get(best_fit_bucket as usize).is_none() {
             // fail early if the data bucket we need doesn't exist - we don't want the index entry partially allocated
             return Err(BucketMapError::DataNoSpace((best_fit_bucket, 0)));
         }
+
         let max_search = self.index.max_search();
         let (elem, elem_ix) = Self::find_index_entry_mut(&self.index, key, self.random)?;
-        let elem = if let Some(elem) = elem {
-            elem
-        } else {
-            let is_resizing = false;
-            self.index.occupy(elem_ix, is_resizing).unwrap();
-            let elem_allocate = IndexEntryPlaceInBucket::new(elem_ix);
-            // These fields will be overwritten after allocation by callers.
-            // Since this part of the mmapped file could have previously been used by someone else, there can be garbage here.
-            elem_allocate.init(&mut self.index, key);
-            elem_allocate
-        };
         if !requires_data_bucket {
+            let elem = if let Some(elem) = elem {
+                elem
+            } else {
+                let is_resizing = false;
+                self.index.occupy(elem_ix, is_resizing).unwrap();
+                let elem_allocate = IndexEntryPlaceInBucket::new(elem_ix);
+                // These fields will be overwritten after allocation by callers.
+                // Since this part of the mmapped file could have previously been used by someone else, there can be garbage here.
+                elem_allocate.init(&mut self.index, key);
+                elem_allocate
+            };
             // new data stored should be stored in IndexEntry and NOT in data file
             // new data len is 0 or 1
             if let OccupiedEnum::MultipleSlots(multiple_slots) =
@@ -556,6 +543,10 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
                 if let Some(single_element) = data.next() {
                     OccupiedEnum::OneSlotInIndex(single_element)
                 } else {
+                    self.stats
+                        .index
+                        .index_uses_uncommon_slot_list_len_or_refcount
+                        .store(true, Ordering::Relaxed);
                     OccupiedEnum::ZeroSlots
                 },
             );
@@ -565,7 +556,10 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
         // storing the slot list requires using the data file
         let mut old_data_entry_to_free = None;
         // see if old elements were in a data file
-        if let Some(multiple_slots) = elem.get_multiple_slots_mut(&mut self.index) {
+        if let Some(multiple_slots) = elem
+            .as_ref()
+            .and_then(|elem| elem.get_multiple_slots_mut(&mut self.index))
+        {
             let bucket_ix = multiple_slots.data_bucket_ix() as usize;
             let current_bucket = &mut self.data[bucket_ix];
             let elem_loc = multiple_slots.data_loc(current_bucket);
@@ -633,10 +627,23 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
                 }
 
                 // update index bucket after data bucket has been updated.
-                elem.set_slot_count_enum_value(
+                elem.unwrap_or_else(|| {
+                    let is_resizing = false;
+                    self.index.occupy(elem_ix, is_resizing).unwrap();
+                    let elem_allocate = IndexEntryPlaceInBucket::new(elem_ix);
+                    // These fields will be overwritten after allocation by callers.
+                    // Since this part of the mmapped file could have previously been used by someone else, there can be garbage here.
+                    elem_allocate.init(&mut self.index, key);
+                    elem_allocate
+                })
+                .set_slot_count_enum_value(
                     &mut self.index,
                     OccupiedEnum::MultipleSlots(&multiple_slots),
                 );
+                self.stats
+                    .index
+                    .index_uses_uncommon_slot_list_len_or_refcount
+                    .store(true, Ordering::Relaxed);
                 success = true;
                 break;
             }
@@ -895,7 +902,6 @@ mod tests {
             let random = 1;
             // with random=1, 6 entries is the most that don't collide on a single hash % cap value.
             for len in 0..7 {
-                log::error!("testing with {len}");
                 // cannot use pubkey [0,0,...] because that matches a zeroed out default file contents.
                 let raw = (0..len)
                     .map(|l| (Pubkey::from([(l + 1) as u8; 32]), v + (l as u64)))
@@ -976,7 +982,7 @@ mod tests {
                 });
 
                 // this was wiped out by the last call to batch_insert..., so recreate it.
-                hashed = hashed_raw.clone();
+                hashed.clone_from(&hashed_raw);
                 let mut duplicates = Vec::default();
                 if reuse_type == 0 {
                     Bucket::<u64>::batch_insert_non_duplicates_reusing_file(
@@ -1221,9 +1227,11 @@ mod tests {
         // This causes it to be skipped.
         let entry = IndexEntryPlaceInBucket::new(ix);
         entry.init(&mut index, &(other.0));
+        entry.set_slot_count_enum_value(&mut index, OccupiedEnum::ZeroSlots);
         let entry = IndexEntryPlaceInBucket::new(ix + 1);
         // sets pubkey value and enum value of ZeroSlots. Leaving it at zero is illegal at startup, so we'll assert when we find this duplicate.
         entry.init(&mut index, &(raw[0].0));
+        entry.set_slot_count_enum_value(&mut index, OccupiedEnum::ZeroSlots);
 
         // since the same key is already in use with a different value, it is a duplicate.
         // But, it is a zero length entry. This is not supported at startup. Startup would have never generated a zero length occupied entry.
@@ -1523,7 +1531,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "index asked to insert the same data twice")]
     fn test_occupy_if_matches_panic() {
-        solana_logger::setup();
+        agave_logger::setup();
         let random = 1;
         let k = Pubkey::from([1u8; 32]);
         let v = 12u64;
@@ -1557,7 +1565,7 @@ mod tests {
     #[should_panic(expected = "batch insertion can only occur prior to any deletes")]
     #[test]
     fn batch_insert_after_delete() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let tmpdir = tempdir().unwrap();
         let paths: Vec<PathBuf> = vec![tmpdir.path().to_path_buf()];

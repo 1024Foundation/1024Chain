@@ -4,6 +4,7 @@ use {
     merlin::Transcript,
 };
 
+#[allow(dead_code)]
 pub trait TranscriptProtocol {
     /// Append a domain separator for an `n`-bit rangeproof for ElGamalKeypair
     /// ciphertext using a decryption key
@@ -37,11 +38,18 @@ pub trait TranscriptProtocol {
     /// Append an ElGamal ciphertext with the given `label`.
     fn append_ciphertext(&mut self, label: &'static [u8], point: &pod::ElGamalCiphertext);
 
-    /// Append a grouped ElGamal ciphertext with the given `label`.
+    /// Append a grouped ElGamal ciphertext with 2 handles with the given `label`.
     fn append_grouped_ciphertext_2_handles(
         &mut self,
         label: &'static [u8],
         point: &pod::GroupedElGamalCiphertext2Handles,
+    );
+
+    /// Append a grouped ElGamal ciphertext with 3 handles with the given `label`.
+    fn append_grouped_ciphertext_3_handles(
+        &mut self,
+        label: &'static [u8],
+        point: &pod::GroupedElGamalCiphertext3Handles,
     );
 
     /// Append a Pedersen commitment with the given `label`.
@@ -148,6 +156,14 @@ impl TranscriptProtocol for Transcript {
         &mut self,
         label: &'static [u8],
         grouped_ciphertext: &pod::GroupedElGamalCiphertext2Handles,
+    ) {
+        self.append_message(label, &grouped_ciphertext.0);
+    }
+
+    fn append_grouped_ciphertext_3_handles(
+        &mut self,
+        label: &'static [u8],
+        grouped_ciphertext: &pod::GroupedElGamalCiphertext3Handles,
     ) {
         self.append_message(label, &grouped_ciphertext.0);
     }

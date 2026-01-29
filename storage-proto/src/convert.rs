@@ -1,23 +1,24 @@
 use {
-    crate::{StoredExtendedRewards, StoredTransactionStatusMeta},
+    crate::{StoredExtendedRewards, StoredTransactionError, StoredTransactionStatusMeta},
     solana_account_decoder::parse_token::{real_number_string_trimmed, UiTokenAmount},
-    solana_sdk::{
-        hash::Hash,
-        instruction::{CompiledInstruction, InstructionError},
-        message::{
-            legacy::Message as LegacyMessage,
-            v0::{self, LoadedAddresses, MessageAddressTableLookup},
-            MessageHeader, VersionedMessage,
-        },
-        pubkey::Pubkey,
-        signature::Signature,
-        transaction::{Transaction, TransactionError, VersionedTransaction},
-        transaction_context::TransactionReturnData,
+    solana_hash::{Hash, HASH_BYTES},
+    solana_instruction::error::InstructionError,
+    solana_message::{
+        compiled_instruction::CompiledInstruction,
+        legacy::Message as LegacyMessage,
+        v0::{self, LoadedAddresses, MessageAddressTableLookup},
+        MessageHeader, VersionedMessage,
     },
+    solana_pubkey::Pubkey,
+    solana_signature::Signature,
+    solana_transaction::{versioned::VersionedTransaction, Transaction},
+    solana_transaction_context::TransactionReturnData,
+    solana_transaction_error::TransactionError,
     solana_transaction_status::{
         ConfirmedBlock, EntrySummary, InnerInstruction, InnerInstructions, Reward, RewardType,
-        TransactionByAddrInfo, TransactionStatusMeta, TransactionTokenBalance,
-        TransactionWithStatusMeta, VersionedConfirmedBlock, VersionedTransactionWithStatusMeta,
+        RewardsAndNumPartitions, TransactionByAddrInfo, TransactionStatusMeta,
+        TransactionTokenBalance, TransactionWithStatusMeta, VersionedConfirmedBlock,
+        VersionedTransactionWithStatusMeta,
     },
     std::{
         convert::{TryFrom, TryInto},
@@ -25,7 +26,6 @@ use {
     },
 };
 
-#[allow(clippy::derive_partial_eq_without_eq)]
 pub mod generated {
     include!(concat!(
         env!("OUT_DIR"),
@@ -33,7 +33,6 @@ pub mod generated {
     ));
 }
 
-#[allow(clippy::derive_partial_eq_without_eq)]
 pub mod tx_by_addr {
     include!(concat!(
         env!("OUT_DIR"),
@@ -41,7 +40,6 @@ pub mod tx_by_addr {
     ));
 }
 
-#[allow(clippy::derive_partial_eq_without_eq)]
 pub mod entries {
     include!(concat!(env!("OUT_DIR"), "/solana.storage.entries.rs"));
 }
@@ -50,6 +48,16 @@ impl From<Vec<Reward>> for generated::Rewards {
     fn from(rewards: Vec<Reward>) -> Self {
         Self {
             rewards: rewards.into_iter().map(|r| r.into()).collect(),
+            num_partitions: None,
+        }
+    }
+}
+
+impl From<RewardsAndNumPartitions> for generated::Rewards {
+    fn from(input: RewardsAndNumPartitions) -> Self {
+        Self {
+            rewards: input.rewards.into_iter().map(|r| r.into()).collect(),
+            num_partitions: input.num_partitions.map(|n| n.into()),
         }
     }
 }
@@ -57,6 +65,17 @@ impl From<Vec<Reward>> for generated::Rewards {
 impl From<generated::Rewards> for Vec<Reward> {
     fn from(rewards: generated::Rewards) -> Self {
         rewards.rewards.into_iter().map(|r| r.into()).collect()
+    }
+}
+
+impl From<generated::Rewards> for (Vec<Reward>, Option<u64>) {
+    fn from(rewards: generated::Rewards) -> Self {
+        (
+            rewards.rewards.into_iter().map(|r| r.into()).collect(),
+            rewards
+                .num_partitions
+                .map(|generated::NumPartitions { num_partitions }| num_partitions),
+        )
     }
 }
 
@@ -70,6 +89,7 @@ impl From<StoredExtendedRewards> for generated::Rewards {
                     r.into()
                 })
                 .collect(),
+            num_partitions: None,
         }
     }
 }
@@ -124,6 +144,12 @@ impl From<generated::Reward> for Reward {
     }
 }
 
+impl From<u64> for generated::NumPartitions {
+    fn from(num_partitions: u64) -> Self {
+        Self { num_partitions }
+    }
+}
+
 impl From<VersionedConfirmedBlock> for generated::ConfirmedBlock {
     fn from(confirmed_block: VersionedConfirmedBlock) -> Self {
         let VersionedConfirmedBlock {
@@ -132,6 +158,7 @@ impl From<VersionedConfirmedBlock> for generated::ConfirmedBlock {
             parent_slot,
             transactions,
             rewards,
+            num_partitions,
             block_time,
             block_height,
         } = confirmed_block;
@@ -142,6 +169,7 @@ impl From<VersionedConfirmedBlock> for generated::ConfirmedBlock {
             parent_slot,
             transactions: transactions.into_iter().map(|tx| tx.into()).collect(),
             rewards: rewards.into_iter().map(|r| r.into()).collect(),
+            num_partitions: num_partitions.map(Into::into),
             block_time: block_time.map(|timestamp| generated::UnixTimestamp { timestamp }),
             block_height: block_height.map(|block_height| generated::BlockHeight { block_height }),
         }
@@ -159,6 +187,7 @@ impl TryFrom<generated::ConfirmedBlock> for ConfirmedBlock {
             parent_slot,
             transactions,
             rewards,
+            num_partitions,
             block_time,
             block_height,
         } = confirmed_block;
@@ -172,6 +201,8 @@ impl TryFrom<generated::ConfirmedBlock> for ConfirmedBlock {
                 .map(|tx| tx.try_into())
                 .collect::<std::result::Result<Vec<_>, Self::Error>>()?,
             rewards: rewards.into_iter().map(|r| r.into()).collect(),
+            num_partitions: num_partitions
+                .map(|generated::NumPartitions { num_partitions }| num_partitions),
             block_time: block_time.map(|generated::UnixTimestamp { timestamp }| timestamp),
             block_height: block_height.map(|generated::BlockHeight { block_height }| block_height),
         })
@@ -255,6 +286,20 @@ impl From<generated::Transaction> for VersionedTransaction {
     }
 }
 
+impl From<TransactionError> for generated::TransactionError {
+    fn from(value: TransactionError) -> Self {
+        let stored_error = StoredTransactionError::from(value).0;
+        Self { err: stored_error }
+    }
+}
+
+impl From<generated::TransactionError> for TransactionError {
+    fn from(value: generated::TransactionError) -> Self {
+        let stored_error = StoredTransactionError(value.err);
+        stored_error.into()
+    }
+}
+
 impl From<LegacyMessage> for generated::Message {
     fn from(message: LegacyMessage) -> Self {
         Self {
@@ -312,7 +357,9 @@ impl From<generated::Message> for VersionedMessage {
             .into_iter()
             .map(|key| Pubkey::try_from(key).unwrap())
             .collect();
-        let recent_blockhash = Hash::new(&value.recent_blockhash);
+        let recent_blockhash = <[u8; HASH_BYTES]>::try_from(value.recent_blockhash)
+            .map(Hash::new_from_array)
+            .unwrap();
         let instructions = value.instructions.into_iter().map(|ix| ix.into()).collect();
         let address_table_lookups = value
             .address_table_lookups
@@ -374,6 +421,7 @@ impl From<TransactionStatusMeta> for generated::TransactionStatusMeta {
             loaded_addresses,
             return_data,
             compute_units_consumed,
+            cost_units,
         } = value;
         let err = match status {
             Ok(()) => None,
@@ -434,6 +482,7 @@ impl From<TransactionStatusMeta> for generated::TransactionStatusMeta {
             return_data,
             return_data_none,
             compute_units_consumed,
+            cost_units,
         }
     }
 }
@@ -466,6 +515,7 @@ impl TryFrom<generated::TransactionStatusMeta> for TransactionStatusMeta {
             return_data,
             return_data_none,
             compute_units_consumed,
+            cost_units,
         } = value;
         let status = match &err {
             None => Ok(()),
@@ -535,6 +585,7 @@ impl TryFrom<generated::TransactionStatusMeta> for TransactionStatusMeta {
             loaded_addresses,
             return_data,
             compute_units_consumed,
+            cost_units,
         })
     }
 }
@@ -742,7 +793,7 @@ impl TryFrom<tx_by_addr::TransactionError> for TransactionError {
                     41 => InstructionError::ProgramFailedToCompile,
                     42 => InstructionError::Immutable,
                     43 => InstructionError::IncorrectAuthority,
-                    44 => InstructionError::BorshIoError(String::new()),
+                    44 => InstructionError::BorshIoError,
                     45 => InstructionError::AccountNotRentExempt,
                     46 => InstructionError::InvalidAccountOwner,
                     47 => InstructionError::ArithmeticOverflow,
@@ -818,6 +869,8 @@ impl TryFrom<tx_by_addr::TransactionError> for TransactionError {
             33 => TransactionError::InvalidLoadedAccountsDataSizeLimit,
             34 => TransactionError::ResanitizationNeeded,
             36 => TransactionError::UnbalancedTransaction,
+            37 => TransactionError::ProgramCacheHitMaxLimit,
+            38 => TransactionError::CommitCancelled,
             _ => return Err("Invalid TransactionError"),
         })
     }
@@ -935,6 +988,12 @@ impl From<TransactionError> for tx_by_addr::TransactionError {
                 }
                 TransactionError::UnbalancedTransaction => {
                     tx_by_addr::TransactionErrorType::UnbalancedTransaction
+                }
+                TransactionError::ProgramCacheHitMaxLimit => {
+                    tx_by_addr::TransactionErrorType::ProgramCacheHitMaxLimit
+                }
+                TransactionError::CommitCancelled => {
+                    tx_by_addr::TransactionErrorType::CommitCancelled
                 }
             } as i32,
             instruction_error: match transaction_error {
@@ -1072,7 +1131,7 @@ impl From<TransactionError> for tx_by_addr::TransactionError {
                             InstructionError::IncorrectAuthority => {
                                 tx_by_addr::InstructionErrorType::IncorrectAuthority
                             }
-                            InstructionError::BorshIoError(_) => {
+                            InstructionError::BorshIoError => {
                                 tx_by_addr::InstructionErrorType::BorshIoError
                             }
                             InstructionError::AccountNotRentExempt => {
@@ -1210,7 +1269,9 @@ impl From<entries::Entry> for EntrySummary {
     fn from(entry: entries::Entry) -> Self {
         EntrySummary {
             num_hashes: entry.num_hashes,
-            hash: Hash::new(&entry.hash),
+            hash: <[u8; HASH_BYTES]>::try_from(entry.hash)
+                .map(Hash::new_from_array)
+                .unwrap(),
             num_transactions: entry.num_transactions,
             starting_transaction_index: entry.starting_transaction_index as usize,
         }

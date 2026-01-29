@@ -1,22 +1,21 @@
 use {
-    solana_program_test::{programs::spl_programs, ProgramTest},
-    solana_sdk::{
-        bpf_loader, bpf_loader_upgradeable,
-        instruction::{AccountMeta, Instruction},
-        pubkey::Pubkey,
-        signature::Signer,
-        signer::keypair::Keypair,
-        system_instruction,
-        sysvar::rent,
-        transaction::Transaction,
-    },
+    solana_instruction::{AccountMeta, Instruction},
+    solana_keypair::Keypair,
+    solana_program_binaries::spl_programs,
+    solana_program_test::ProgramTest,
+    solana_pubkey::Pubkey,
+    solana_sdk_ids::{bpf_loader, bpf_loader_upgradeable},
+    solana_signer::Signer,
+    solana_system_interface::instruction as system_instruction,
+    solana_sysvar::rent,
+    solana_transaction::Transaction,
 };
 
 #[tokio::test]
 async fn programs_present() {
-    let (mut banks_client, _, _) = ProgramTest::default().start().await;
+    let (banks_client, _, _) = ProgramTest::default().start().await;
     let rent = banks_client.get_rent().await.unwrap();
-    let token_2022_id = Pubkey::try_from("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+    let token_2022_id = spl_generic_token::token_2022::id();
     let (token_2022_programdata_id, _) =
         Pubkey::find_program_address(&[token_2022_id.as_ref()], &bpf_loader_upgradeable::id());
 
@@ -32,9 +31,9 @@ async fn programs_present() {
 
 #[tokio::test]
 async fn token_2022() {
-    let (mut banks_client, payer, recent_blockhash) = ProgramTest::default().start().await;
+    let (banks_client, payer, recent_blockhash) = ProgramTest::default().start().await;
 
-    let token_2022_id = Pubkey::try_from("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+    let token_2022_id = spl_generic_token::token_2022::id();
     let mint = Keypair::new();
     let rent = banks_client.get_rent().await.unwrap();
     let space = 82;

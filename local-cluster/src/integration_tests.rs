@@ -16,39 +16,37 @@ use {
         local_cluster::{ClusterConfig, LocalCluster},
         validator_configs::*,
     },
+    agave_snapshots::{snapshot_config::SnapshotConfig, SnapshotInterval},
     log::*,
+    solana_account::AccountSharedData,
     solana_accounts_db::utils::create_accounts_run_and_snapshot_dirs,
+    solana_clock::{self as clock, Slot, DEFAULT_MS_PER_SLOT, DEFAULT_TICKS_PER_SLOT},
     solana_core::{
         consensus::{tower_storage::FileTowerStorage, Tower, SWITCH_FORK_THRESHOLD},
+        snapshot_packager_service::SnapshotPackagerService,
         validator::{is_snapshot_config_valid, ValidatorConfig},
     },
-    solana_gossip::gossip_service::discover_cluster,
+    solana_gossip::gossip_service::discover_validators,
+    solana_hash::Hash,
+    solana_keypair::Keypair,
     solana_ledger::{
         ancestor_iterator::AncestorIterator,
         blockstore::{Blockstore, PurgeType},
         blockstore_meta::DuplicateSlotProof,
         blockstore_options::{AccessType, BlockstoreOptions},
-        leader_schedule::{FixedSchedule, LeaderSchedule},
+        leader_schedule::{FixedSchedule, IdentityKeyedLeaderSchedule, LeaderSchedule},
     },
+    solana_native_token::LAMPORTS_PER_SOL,
+    solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_runtime::{
-        snapshot_bank_utils::DISABLED_SNAPSHOT_ARCHIVE_INTERVAL, snapshot_config::SnapshotConfig,
-    },
-    solana_sdk::{
-        account::AccountSharedData,
-        clock::{self, Slot, DEFAULT_MS_PER_SLOT, DEFAULT_TICKS_PER_SLOT},
-        hash::Hash,
-        native_token::LAMPORTS_PER_SOL,
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-    },
+    solana_signer::Signer,
     solana_streamer::socket::SocketAddrSpace,
     solana_turbine::broadcast_stage::BroadcastStageType,
     static_assertions,
     std::{
         collections::HashSet,
         fs, iter,
-        num::NonZeroUsize,
+        num::{NonZeroU64, NonZeroUsize},
         path::{Path, PathBuf},
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -63,7 +61,6 @@ use {
 pub const RUST_LOG_FILTER: &str =
     "error,solana_core::replay_stage=warn,solana_local_cluster=info,local_cluster=info";
 
-pub const DEFAULT_CLUSTER_LAMPORTS: u64 = 10_000_000 * LAMPORTS_PER_SOL;
 pub const DEFAULT_NODE_STAKE: u64 = 10 * LAMPORTS_PER_SOL;
 
 pub fn last_vote_in_tower(tower_path: &Path, node_pubkey: &Pubkey) -> Option<(Slot, Hash)> {
@@ -108,7 +105,6 @@ pub fn open_blockstore(ledger_path: &Path) -> Blockstore {
         BlockstoreOptions {
             access_type: AccessType::Primary,
             recovery_mode: None,
-            enforce_ulimit_nofile: true,
             ..BlockstoreOptions::default()
         },
     )
@@ -120,7 +116,6 @@ pub fn open_blockstore(ledger_path: &Path) -> Blockstore {
             BlockstoreOptions {
                 access_type: AccessType::Secondary,
                 recovery_mode: None,
-                enforce_ulimit_nofile: true,
                 ..BlockstoreOptions::default()
             },
         )
@@ -190,8 +185,7 @@ pub fn copy_blocks(end_slot: Slot, source: &Blockstore, dest: &Blockstore, is_tr
 /// Computes the numbr of milliseconds `num_blocks` blocks will take given
 /// each slot contains `ticks_per_slot`
 pub fn ms_for_n_slots(num_blocks: u64, ticks_per_slot: u64) -> u64 {
-    ((ticks_per_slot * DEFAULT_MS_PER_SLOT * num_blocks) + DEFAULT_TICKS_PER_SLOT - 1)
-        / DEFAULT_TICKS_PER_SLOT
+    (ticks_per_slot * DEFAULT_MS_PER_SLOT * num_blocks).div_ceil(DEFAULT_TICKS_PER_SLOT)
 }
 
 pub fn run_kill_partition_switch_threshold<C>(
@@ -206,10 +200,7 @@ pub fn run_kill_partition_switch_threshold<C>(
     // Needs to be at least 1/3 or there will be no overlap
     // with the confirmation supermajority 2/3
     static_assertions::const_assert!(SWITCH_FORK_THRESHOLD >= 1f64 / 3f64);
-    info!(
-        "stakes_to_kill: {:?}, alive_stakes: {:?}",
-        stakes_to_kill, alive_stakes
-    );
+    info!("stakes_to_kill: {stakes_to_kill:?}, alive_stakes: {alive_stakes:?}");
 
     // This test:
     // 1) Spins up three partitions
@@ -241,7 +232,7 @@ pub fn run_kill_partition_switch_threshold<C>(
             [0..stakes_to_kill.len()]
             .iter()
             .map(|validator_to_kill| {
-                info!("Killing validator with id: {}", validator_to_kill);
+                info!("Killing validator with id: {validator_to_kill}");
                 cluster.exit_node(validator_to_kill)
             })
             .collect();
@@ -260,6 +251,7 @@ pub fn run_kill_partition_switch_threshold<C>(
         on_before_partition_resolved,
         on_partition_resolved,
         ticks_per_slot,
+        true,
         vec![],
     )
 }
@@ -275,7 +267,9 @@ pub fn create_custom_leader_schedule(
     }
 
     info!("leader_schedule: {}", leader_schedule.len());
-    LeaderSchedule::new_from_schedule(leader_schedule)
+    Box::new(IdentityKeyedLeaderSchedule::new_from_schedule(
+        leader_schedule,
+    ))
 }
 
 pub fn create_custom_leader_schedule_with_random_keys(
@@ -294,13 +288,17 @@ pub fn create_custom_leader_schedule_with_random_keys(
 }
 
 /// This function runs a network, initiates a partition based on a
-/// configuration, resolve the partition, then checks that the network
-/// continues to achieve consensus
-/// # Arguments
+/// configuration, resolve the partition, then checks that the network continues
+/// to achieve consensus.
+///
+/// # Arguments:
 /// * `partitions` - A slice of partition configurations, where each partition
-/// configuration is a usize representing a node's stake
+///   configuration is a usize representing a node's stake
 /// * `leader_schedule` - An option that specifies whether the cluster should
-/// run with a fixed, predetermined leader schedule
+///   run with a fixed, predetermined leader schedule
+/// * `no_wait_for_vote_to_start_leader` - provide option to only allow the
+///   bootstrap to build blocks at first to minimize forking during cluster
+///   startup.
 #[allow(clippy::cognitive_complexity)]
 pub fn run_cluster_partition<C>(
     partitions: &[usize],
@@ -310,9 +308,10 @@ pub fn run_cluster_partition<C>(
     on_before_partition_resolved: impl FnOnce(&mut LocalCluster, &mut C),
     on_partition_resolved: impl FnOnce(&mut LocalCluster, &mut C),
     ticks_per_slot: Option<u64>,
+    no_wait_for_vote_to_start_leader: bool,
     additional_accounts: Vec<(Pubkey, AccountSharedData)>,
 ) {
-    solana_logger::setup_with_default(RUST_LOG_FILTER);
+    agave_logger::setup_with_default(RUST_LOG_FILTER);
     info!("PARTITION_TEST!");
     let num_nodes = partitions.len();
     let node_stakes: Vec<_> = partitions
@@ -320,10 +319,25 @@ pub fn run_cluster_partition<C>(
         .map(|stake_weight| 100 * *stake_weight as u64)
         .collect();
     assert_eq!(node_stakes.len(), num_nodes);
-    let cluster_lamports = node_stakes.iter().sum::<u64>() * 2;
+    let mint_lamports = node_stakes.iter().sum::<u64>() * 2;
     let turbine_disabled = Arc::new(AtomicBool::new(false));
+    let wait_for_supermajority = if no_wait_for_vote_to_start_leader {
+        // This helps nodes get a little more in sync by waiting for
+        // supermajority to observe slot 0. It still doesn't provide perfect
+        // synchronization because there is quite a bit of work todo after the
+        // sync point before nodes are fully operational.
+        Some(0)
+    } else {
+        // If we sync nodes on a slot, this overrides the flag to wait on
+        // building blocks until the node votes. But waiting for the bootstrap
+        // to build a block provides greater synchronization (less
+        // partitioning), so let that take precedence for these tests.
+        None
+    };
     let mut validator_config = ValidatorConfig {
         turbine_disabled: turbine_disabled.clone(),
+        wait_for_supermajority,
+        no_wait_for_vote_to_start_leader,
         ..ValidatorConfig::default_for_test()
     };
 
@@ -350,11 +364,17 @@ pub fn run_cluster_partition<C>(
         }
     };
 
+    // Always ensure at least one node is allowed to build blocks.
+    let mut validator_configs = make_identical_validator_configs(&validator_config, num_nodes);
+    validator_configs
+        .first_mut()
+        .unwrap()
+        .no_wait_for_vote_to_start_leader = true;
     let slots_per_epoch = 2048;
     let mut config = ClusterConfig {
-        cluster_lamports,
+        mint_lamports,
         node_stakes,
-        validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
+        validator_configs,
         validator_keys: Some(
             validator_keys
                 .into_iter()
@@ -386,9 +406,10 @@ pub fn run_cluster_partition<C>(
         &cluster.connection_cache,
     );
 
-    let cluster_nodes = discover_cluster(
+    let cluster_nodes = discover_validators(
         &cluster.entry_point_info.gossip().unwrap(),
         num_nodes,
+        cluster.entry_point_info.shred_version(),
         SocketAddrSpace::Unspecified,
     )
     .unwrap();
@@ -463,7 +484,7 @@ pub fn test_faulty_node(
         // Use a fixed leader schedule so that only the faulty node gets leader slots.
         let validator_to_slots = vec![(
             validator_keys[0].0.as_ref().pubkey(),
-            solana_sdk::clock::DEFAULT_DEV_SLOTS_PER_EPOCH as usize,
+            solana_clock::DEFAULT_DEV_SLOTS_PER_EPOCH as usize,
         )];
         let leader_schedule = create_custom_leader_schedule(validator_to_slots.into_iter());
         FixedSchedule {
@@ -488,10 +509,11 @@ pub fn test_faulty_node(
     validator_configs[0].broadcast_stage_type = faulty_node_type;
     for config in &mut validator_configs {
         config.fixed_leader_schedule = Some(fixed_leader_schedule.clone());
+        config.wait_for_supermajority = Some(0);
     }
 
     let mut cluster_config = ClusterConfig {
-        cluster_lamports: 10_000,
+        mint_lamports: 10_000,
         node_stakes,
         validator_configs,
         validator_keys: Some(validator_keys.clone()),
@@ -535,17 +557,12 @@ pub struct SnapshotValidatorConfig {
 
 impl SnapshotValidatorConfig {
     pub fn new(
-        full_snapshot_archive_interval_slots: Slot,
-        incremental_snapshot_archive_interval_slots: Slot,
-        accounts_hash_interval_slots: Slot,
+        full_snapshot_archive_interval: SnapshotInterval,
+        incremental_snapshot_archive_interval: SnapshotInterval,
         num_account_paths: usize,
     ) -> SnapshotValidatorConfig {
-        // Interval values must be nonzero
-        assert!(accounts_hash_interval_slots > 0);
-        assert!(full_snapshot_archive_interval_slots > 0);
-        assert!(incremental_snapshot_archive_interval_slots > 0);
         // Ensure that some snapshots will be created
-        assert!(full_snapshot_archive_interval_slots != DISABLED_SNAPSHOT_ARCHIVE_INTERVAL);
+        assert_ne!(full_snapshot_archive_interval, SnapshotInterval::Disabled);
 
         // Create the snapshot config
         let _ = fs::create_dir_all(farf_dir());
@@ -553,8 +570,8 @@ impl SnapshotValidatorConfig {
         let full_snapshot_archives_dir = tempfile::tempdir_in(farf_dir()).unwrap();
         let incremental_snapshot_archives_dir = tempfile::tempdir_in(farf_dir()).unwrap();
         let snapshot_config = SnapshotConfig {
-            full_snapshot_archive_interval_slots,
-            incremental_snapshot_archive_interval_slots,
+            full_snapshot_archive_interval,
+            incremental_snapshot_archive_interval,
             full_snapshot_archives_dir: full_snapshot_archives_dir.path().to_path_buf(),
             incremental_snapshot_archives_dir: incremental_snapshot_archives_dir
                 .path()
@@ -564,10 +581,7 @@ impl SnapshotValidatorConfig {
             maximum_incremental_snapshot_archives_to_retain: NonZeroUsize::new(usize::MAX).unwrap(),
             ..SnapshotConfig::default()
         };
-        assert!(is_snapshot_config_valid(
-            &snapshot_config,
-            accounts_hash_interval_slots
-        ));
+        assert!(is_snapshot_config_valid(&snapshot_config));
 
         // Create the account paths
         let (account_storage_dirs, account_storage_paths) =
@@ -577,7 +591,11 @@ impl SnapshotValidatorConfig {
         let validator_config = ValidatorConfig {
             snapshot_config,
             account_paths: account_storage_paths,
-            accounts_hash_interval_slots,
+            validator_exit_backpressure: [(
+                SnapshotPackagerService::NAME.to_string(),
+                Arc::new(AtomicBool::new(false)),
+            )]
+            .into(),
             ..ValidatorConfig::default_for_test()
         };
 
@@ -592,13 +610,12 @@ impl SnapshotValidatorConfig {
 }
 
 pub fn setup_snapshot_validator_config(
-    snapshot_interval_slots: Slot,
+    snapshot_interval_slots: NonZeroU64,
     num_account_paths: usize,
 ) -> SnapshotValidatorConfig {
     SnapshotValidatorConfig::new(
-        snapshot_interval_slots,
-        DISABLED_SNAPSHOT_ARCHIVE_INTERVAL,
-        snapshot_interval_slots,
+        SnapshotInterval::Slots(snapshot_interval_slots),
+        SnapshotInterval::Disabled,
         num_account_paths,
     )
 }

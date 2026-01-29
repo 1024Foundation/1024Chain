@@ -1,4 +1,7 @@
 #![allow(clippy::arithmetic_side_effects)]
+// Allow deprecated warnings since this crate will be removed along with
+// `solana-zk-token-sdk` will be removed
+#![allow(deprecated)]
 use {
     criterion::{criterion_group, criterion_main, Criterion},
     curve25519_dalek::scalar::Scalar,
@@ -10,11 +13,12 @@ use {
         },
         instruction::{
             transfer::FeeParameters, BatchedGroupedCiphertext2HandlesValidityProofData,
-            BatchedRangeProofU128Data, BatchedRangeProofU256Data, BatchedRangeProofU64Data,
+            BatchedGroupedCiphertext3HandlesValidityProofData, BatchedRangeProofU128Data,
+            BatchedRangeProofU256Data, BatchedRangeProofU64Data,
             CiphertextCiphertextEqualityProofData, CiphertextCommitmentEqualityProofData,
-            FeeSigmaProofData, GroupedCiphertext2HandlesValidityProofData, PubkeyValidityData,
-            RangeProofU64Data, TransferData, TransferWithFeeData, WithdrawData,
-            ZeroBalanceProofData, ZkProofData,
+            FeeSigmaProofData, GroupedCiphertext2HandlesValidityProofData,
+            GroupedCiphertext3HandlesValidityProofData, PubkeyValidityData, RangeProofU64Data,
+            TransferData, TransferWithFeeData, WithdrawData, ZeroBalanceProofData, ZkProofData,
         },
     },
 };
@@ -31,7 +35,7 @@ fn bench_pubkey_validity(c: &mut Criterion) {
 }
 
 fn bench_range_proof_u64(c: &mut Criterion) {
-    let amount = std::u64::MAX;
+    let amount = u64::MAX;
     let (commitment, opening) = Pedersen::new(amount);
     let proof_data = RangeProofU64Data::new(&commitment, amount, &opening).unwrap();
 
@@ -74,7 +78,7 @@ fn bench_zero_balance(c: &mut Criterion) {
     });
 }
 
-fn bench_grouped_ciphertext_validity(c: &mut Criterion) {
+fn bench_grouped_ciphertext_2_handles_validity(c: &mut Criterion) {
     let destination_keypair = ElGamalKeypair::new_rand();
     let destination_pubkey = destination_keypair.pubkey();
 
@@ -95,7 +99,42 @@ fn bench_grouped_ciphertext_validity(c: &mut Criterion) {
     )
     .unwrap();
 
-    c.bench_function("grouped_ciphertext_validity", |b| {
+    c.bench_function("grouped_ciphertext_2_handles_validity", |b| {
+        b.iter(|| {
+            proof_data.verify_proof().unwrap();
+        })
+    });
+}
+
+fn bench_grouped_ciphertext_3_handles_validity(c: &mut Criterion) {
+    let source_keypair = ElGamalKeypair::new_rand();
+    let source_pubkey = source_keypair.pubkey();
+
+    let destination_keypair = ElGamalKeypair::new_rand();
+    let destination_pubkey = destination_keypair.pubkey();
+
+    let auditor_keypair = ElGamalKeypair::new_rand();
+    let auditor_pubkey = auditor_keypair.pubkey();
+
+    let amount: u64 = 55;
+    let opening = PedersenOpening::new_rand();
+    let grouped_ciphertext = GroupedElGamal::encrypt_with(
+        [source_pubkey, destination_pubkey, auditor_pubkey],
+        amount,
+        &opening,
+    );
+
+    let proof_data = GroupedCiphertext3HandlesValidityProofData::new(
+        source_pubkey,
+        destination_pubkey,
+        auditor_pubkey,
+        &grouped_ciphertext,
+        amount,
+        &opening,
+    )
+    .unwrap();
+
+    c.bench_function("grouped_ciphertext_3_handles_validity", |b| {
         b.iter(|| {
             proof_data.verify_proof().unwrap();
         })
@@ -153,7 +192,7 @@ fn bench_ciphertext_ciphertext_equality(c: &mut Criterion) {
     });
 }
 
-fn bench_batched_grouped_ciphertext_validity(c: &mut Criterion) {
+fn bench_batched_grouped_ciphertext_2_handles_validity(c: &mut Criterion) {
     let destination_keypair = ElGamalKeypair::new_rand();
     let destination_pubkey = destination_keypair.pubkey();
 
@@ -185,6 +224,54 @@ fn bench_batched_grouped_ciphertext_validity(c: &mut Criterion) {
     .unwrap();
 
     c.bench_function("batched_grouped_ciphertext_validity", |b| {
+        b.iter(|| {
+            proof_data.verify_proof().unwrap();
+        })
+    });
+}
+
+fn bench_batched_grouped_ciphertext_3_handles_validity(c: &mut Criterion) {
+    let source_keypair = ElGamalKeypair::new_rand();
+    let source_pubkey = source_keypair.pubkey();
+
+    let destination_keypair = ElGamalKeypair::new_rand();
+    let destination_pubkey = destination_keypair.pubkey();
+
+    let auditor_keypair = ElGamalKeypair::new_rand();
+    let auditor_pubkey = auditor_keypair.pubkey();
+
+    let amount_lo: u64 = 11;
+    let amount_hi: u64 = 22;
+
+    let opening_lo = PedersenOpening::new_rand();
+    let opening_hi = PedersenOpening::new_rand();
+
+    let grouped_ciphertext_lo = GroupedElGamal::encrypt_with(
+        [source_pubkey, destination_pubkey, auditor_pubkey],
+        amount_lo,
+        &opening_lo,
+    );
+
+    let grouped_ciphertext_hi = GroupedElGamal::encrypt_with(
+        [source_pubkey, destination_pubkey, auditor_pubkey],
+        amount_hi,
+        &opening_hi,
+    );
+
+    let proof_data = BatchedGroupedCiphertext3HandlesValidityProofData::new(
+        source_pubkey,
+        destination_pubkey,
+        auditor_pubkey,
+        &grouped_ciphertext_lo,
+        &grouped_ciphertext_hi,
+        amount_lo,
+        amount_hi,
+        &opening_lo,
+        &opening_hi,
+    )
+    .unwrap();
+
+    c.bench_function("batched_grouped_ciphertext_3_handles_validity", |b| {
         b.iter(|| {
             proof_data.verify_proof().unwrap();
         })
@@ -447,10 +534,12 @@ criterion_group!(
     bench_range_proof_u64,
     bench_withdraw,
     bench_zero_balance,
-    bench_grouped_ciphertext_validity,
+    bench_grouped_ciphertext_2_handles_validity,
+    bench_grouped_ciphertext_3_handles_validity,
     bench_ciphertext_commitment_equality,
     bench_ciphertext_ciphertext_equality,
-    bench_batched_grouped_ciphertext_validity,
+    bench_batched_grouped_ciphertext_2_handles_validity,
+    bench_batched_grouped_ciphertext_3_handles_validity,
     bench_batched_range_proof_u64,
     bench_batched_range_proof_u128,
     bench_batched_range_proof_u256,

@@ -1,8 +1,12 @@
 use {
     futures_util::StreamExt,
-    rand::Rng,
     serde_json::{json, Value},
+    solana_clock::Slot,
+    solana_commitment_config::{CommitmentConfig, CommitmentLevel},
+    solana_keypair::Keypair,
     solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path_auto_delete},
+    solana_native_token::LAMPORTS_PER_SOL,
+    solana_pubkey::Pubkey,
     solana_pubsub_client::{nonblocking, pubsub_client::PubsubClient},
     solana_rpc::{
         optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
@@ -24,15 +28,10 @@ use {
         commitment::{BlockCommitmentCache, CommitmentSlots},
         genesis_utils::{create_genesis_config, GenesisConfigInfo},
     },
-    solana_sdk::{
-        clock::Slot,
-        commitment_config::{CommitmentConfig, CommitmentLevel},
-        native_token::sol_to_lamports,
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-        system_program, system_transaction,
-    },
+    solana_signer::Signer,
     solana_streamer::socket::SocketAddrSpace,
+    solana_system_interface::program as system_program,
+    solana_system_transaction as system_transaction,
     solana_test_validator::TestValidator,
     solana_transaction_status::{
         BlockEncodingOptions, ConfirmedBlock, TransactionDetails, UiTransactionEncoding,
@@ -48,25 +47,23 @@ use {
         time::{Duration, Instant},
     },
     systemstat::Ipv4Addr,
-    tungstenite::connect,
+    tungstenite::{client::IntoClientRequest, connect},
 };
 
 fn pubsub_addr() -> SocketAddr {
-    SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        rand::thread_rng().gen_range(1024..65535),
-    )
+    let port_range = solana_net_utils::sockets::localhost_port_range_for_tests();
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_range.0)
 }
 
 #[test]
 fn test_rpc_client() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let alice = Keypair::new();
     let test_validator =
         TestValidator::with_no_fees(alice.pubkey(), None, SocketAddrSpace::Unspecified);
 
-    let bob_pubkey = solana_sdk::pubkey::new_rand();
+    let bob_pubkey = solana_pubkey::new_rand();
 
     let client = RpcClient::new(test_validator.rpc_url());
 
@@ -83,7 +80,7 @@ fn test_rpc_client() {
 
     let blockhash = client.get_latest_blockhash().unwrap();
 
-    let tx = system_transaction::transfer(&alice, &bob_pubkey, sol_to_lamports(20.0), blockhash);
+    let tx = system_transaction::transfer(&alice, &bob_pubkey, 20 * LAMPORTS_PER_SOL, blockhash);
     let signature = client.send_transaction(&tx).unwrap();
 
     let mut confirmed_tx = false;
@@ -109,14 +106,14 @@ fn test_rpc_client() {
             .get_balance_with_commitment(&bob_pubkey, CommitmentConfig::processed())
             .unwrap()
             .value,
-        sol_to_lamports(20.0)
+        20 * LAMPORTS_PER_SOL
     );
     assert_eq!(
         client
             .get_balance_with_commitment(&alice.pubkey(), CommitmentConfig::processed())
             .unwrap()
             .value,
-        original_alice_balance - sol_to_lamports(20.0)
+        original_alice_balance - 20 * LAMPORTS_PER_SOL
     );
 }
 
@@ -138,11 +135,9 @@ fn test_account_subscription() {
     bank_forks.write().unwrap().insert(bank1);
     let bob = Keypair::new();
     let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-    let max_complete_rewards_slot = Arc::new(AtomicU64::default());
     let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
         exit.clone(),
         max_complete_transaction_status_slot,
-        max_complete_rewards_slot,
         bank_forks.clone(),
         Arc::new(RwLock::new(BlockCommitmentCache::default())),
         OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
@@ -159,7 +154,7 @@ fn test_account_subscription() {
         min_context_slot: None,
     });
     let (mut client, receiver) = PubsubClient::account_subscribe(
-        &format!("ws://0.0.0.0:{}/", pubsub_addr.port()),
+        format!("ws://0.0.0.0:{}/", pubsub_addr.port()),
         &bob.pubkey(),
         config,
     )
@@ -256,12 +251,10 @@ fn test_block_subscription() {
         max_complete_transaction_status_slot,
     );
     let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-    let max_complete_rewards_slot = Arc::new(AtomicU64::default());
     // setup RpcSubscriptions && PubSubService
     let subscriptions = Arc::new(RpcSubscriptions::new_for_tests_with_blockstore(
         exit.clone(),
         max_complete_transaction_status_slot,
-        max_complete_rewards_slot,
         blockstore.clone(),
         bank_forks.clone(),
         Arc::new(RwLock::new(BlockCommitmentCache::default())),
@@ -278,7 +271,7 @@ fn test_block_subscription() {
 
     // setup PubsubClient
     let (mut client, receiver) = PubsubClient::block_subscribe(
-        &format!("ws://0.0.0.0:{}/", pubsub_addr.port()),
+        format!("ws://0.0.0.0:{}/", pubsub_addr.port()),
         RpcBlockSubscribeFilter::All,
         Some(RpcBlockSubscribeConfig {
             commitment: Some(CommitmentConfig {
@@ -344,11 +337,9 @@ fn test_program_subscription() {
     bank_forks.write().unwrap().insert(bank1);
     let bob = Keypair::new();
     let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-    let max_complete_rewards_slot = Arc::new(AtomicU64::default());
     let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
         exit.clone(),
         max_complete_transaction_status_slot,
-        max_complete_rewards_slot,
         bank_forks.clone(),
         Arc::new(RwLock::new(BlockCommitmentCache::default())),
         OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
@@ -364,7 +355,7 @@ fn test_program_subscription() {
 
     let program_id = Pubkey::new_unique();
     let (mut client, receiver) = PubsubClient::program_subscribe(
-        &format!("ws://0.0.0.0:{}/", pubsub_addr.port()),
+        format!("ws://0.0.0.0:{}/", pubsub_addr.port()),
         &program_id,
         config,
     )
@@ -430,11 +421,9 @@ fn test_root_subscription() {
     let bank1 = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
     bank_forks.write().unwrap().insert(bank1);
     let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-    let max_complete_rewards_slot = Arc::new(AtomicU64::default());
     let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
         exit.clone(),
         max_complete_transaction_status_slot,
-        max_complete_rewards_slot,
         bank_forks.clone(),
         Arc::new(RwLock::new(BlockCommitmentCache::default())),
         OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
@@ -445,7 +434,7 @@ fn test_root_subscription() {
     check_server_is_ready_or_panic(&pubsub_addr, 10, Duration::from_millis(300));
 
     let (mut client, receiver) =
-        PubsubClient::root_subscribe(&format!("ws://0.0.0.0:{}/", pubsub_addr.port())).unwrap();
+        PubsubClient::root_subscribe(format!("ws://0.0.0.0:{}/", pubsub_addr.port())).unwrap();
 
     let roots = vec![1, 2, 3];
     subscriptions.notify_roots(roots.clone());
@@ -481,11 +470,9 @@ fn test_slot_subscription() {
     let optimistically_confirmed_bank =
         OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
     let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-    let max_complete_rewards_slot = Arc::new(AtomicU64::default());
     let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
         exit.clone(),
         max_complete_transaction_status_slot,
-        max_complete_rewards_slot,
         bank_forks,
         Arc::new(RwLock::new(BlockCommitmentCache::default())),
         optimistically_confirmed_bank,
@@ -495,8 +482,11 @@ fn test_slot_subscription() {
 
     check_server_is_ready_or_panic(&pubsub_addr, 10, Duration::from_millis(300));
 
-    let (mut client, receiver) =
-        PubsubClient::slot_subscribe(&format!("ws://0.0.0.0:{}/", pubsub_addr.port())).unwrap();
+    let client_request = format!("ws://0.0.0.0:{}/", pubsub_addr.port())
+        .into_client_request()
+        .map_err(Box::new)
+        .unwrap();
+    let (mut client, receiver) = PubsubClient::slot_subscribe(client_request).unwrap();
 
     let mut errors: Vec<(SlotInfo, SlotInfo)> = Vec::new();
 
@@ -557,11 +547,9 @@ async fn test_slot_subscription_async() {
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-        let max_complete_rewards_slot = Arc::new(AtomicU64::default());
         let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             exit.clone(),
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             bank_forks,
             Arc::new(RwLock::new(BlockCommitmentCache::default())),
             optimistically_confirmed_bank,

@@ -1,7 +1,7 @@
 use {
-    crate::bench_tps_client::BenchTpsClient,
     log::*,
-    solana_sdk::{commitment_config::CommitmentConfig, timing::duration_as_s},
+    solana_commitment_config::CommitmentConfig,
+    solana_tps_client::TpsClient,
     std::{
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -16,8 +16,6 @@ use {
 pub struct SampleStats {
     /// Maximum TPS reported by this node
     pub tps: f32,
-    /// Total time taken for those txs
-    pub elapsed: Duration,
     /// Total transactions reported by this node
     pub txs: u64,
 }
@@ -28,7 +26,7 @@ pub fn sample_txs<T>(
     sample_period: u64,
     client: &Arc<T>,
 ) where
-    T: BenchTpsClient + ?Sized,
+    T: TpsClient + ?Sized,
 {
     let mut max_tps = 0.0;
     let mut total_elapsed;
@@ -47,7 +45,7 @@ pub fn sample_txs<T>(
         let mut txs =
             match client.get_transaction_count_with_commitment(CommitmentConfig::processed()) {
                 Err(e) => {
-                    info!("Couldn't get transaction count {:?}", e);
+                    info!("Couldn't get transaction count {e:?}");
                     sleep(Duration::from_secs(sample_period));
                     continue;
                 }
@@ -55,14 +53,14 @@ pub fn sample_txs<T>(
             };
 
         if txs < last_txs {
-            info!("Expected txs({}) >= last_txs({})", txs, last_txs);
+            info!("Expected txs({txs}) >= last_txs({last_txs})");
             txs = last_txs;
         }
         total_txs = txs - initial_txs;
         let sample_txs = txs - last_txs;
         last_txs = txs;
 
-        let tps = sample_txs as f32 / duration_as_s(&elapsed);
+        let tps = sample_txs as f32 / elapsed.as_secs_f32();
         if tps > max_tps {
             max_tps = tps;
         }
@@ -78,7 +76,6 @@ pub fn sample_txs<T>(
         if exit_signal.load(Ordering::Relaxed) {
             let stats = SampleStats {
                 tps: max_tps,
-                elapsed: total_elapsed,
                 txs: total_txs,
             };
             sample_stats.write().unwrap().push((client.addr(), stats));

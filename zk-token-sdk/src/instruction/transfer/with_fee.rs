@@ -1,3 +1,7 @@
+use crate::{
+    instruction::{ProofType, ZkProofData},
+    zk_token_elgamal::pod,
+};
 #[cfg(not(target_os = "solana"))]
 use {
     crate::{
@@ -29,13 +33,6 @@ use {
     std::convert::TryInto,
     subtle::{ConditionallySelectable, ConstantTimeGreater},
 };
-use {
-    crate::{
-        instruction::{ProofType, ZkProofData},
-        zk_token_elgamal::pod,
-    },
-    bytemuck::{Pod, Zeroable},
-};
 
 #[cfg(not(target_os = "solana"))]
 const MAX_FEE_BASIS_POINTS: u64 = 10_000;
@@ -60,18 +57,18 @@ const FEE_AMOUNT_LO_BITS: usize = 16;
 const FEE_AMOUNT_HI_BITS: usize = 32;
 
 #[cfg(not(target_os = "solana"))]
-lazy_static::lazy_static! {
-    pub static ref COMMITMENT_MAX: PedersenCommitment = Pedersen::encode((1_u64 <<
-                                                                         TRANSFER_AMOUNT_LO_NEGATED_BITS) - 1);
-    pub static ref COMMITMENT_MAX_FEE_BASIS_POINTS: PedersenCommitment = Pedersen::encode(MAX_FEE_BASIS_POINTS);
-    pub static ref COMMITMENT_MAX_DELTA_RANGE: PedersenCommitment = Pedersen::encode(MAX_DELTA_RANGE);
-}
+pub static COMMITMENT_MAX: std::sync::LazyLock<PedersenCommitment> =
+    std::sync::LazyLock::new(|| Pedersen::encode((1_u64 << TRANSFER_AMOUNT_LO_NEGATED_BITS) - 1));
+pub static COMMITMENT_MAX_FEE_BASIS_POINTS: std::sync::LazyLock<PedersenCommitment> =
+    std::sync::LazyLock::new(|| Pedersen::encode(MAX_FEE_BASIS_POINTS));
+pub static COMMITMENT_MAX_DELTA_RANGE: std::sync::LazyLock<PedersenCommitment> =
+    std::sync::LazyLock::new(|| Pedersen::encode(MAX_DELTA_RANGE));
 
 /// The instruction data that is needed for the `ProofInstruction::TransferWithFee` instruction.
 ///
 /// It includes the cryptographic proof as well as the context data information needed to verify
 /// the proof.
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, bytemuck_derive::Pod, bytemuck_derive::Zeroable)]
 #[repr(C)]
 pub struct TransferWithFeeData {
     /// The context data for the transfer with fee proof
@@ -82,7 +79,7 @@ pub struct TransferWithFeeData {
 }
 
 /// The context data needed to verify a transfer-with-fee proof.
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, bytemuck_derive::Pod, bytemuck_derive::Zeroable)]
 #[repr(C)]
 pub struct TransferWithFeeProofContext {
     /// Group encryption of the low 16 bites of the transfer amount
@@ -108,7 +105,7 @@ pub struct TransferWithFeeProofContext {
 }
 
 /// The ElGamal public keys needed for a transfer with fee
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, bytemuck_derive::Pod, bytemuck_derive::Zeroable)]
 #[repr(C)]
 pub struct TransferWithFeePubkeys {
     pub source: pod::ElGamalPubkey,
@@ -453,7 +450,7 @@ impl TransferWithFeeProofContext {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, bytemuck_derive::Pod, bytemuck_derive::Zeroable)]
 pub struct TransferWithFeeProof {
     pub new_source_commitment: pod::PedersenCommitment,
     pub claimed_commitment: pod::PedersenCommitment,
@@ -820,7 +817,7 @@ fn compute_delta_commitment(
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use {super::*, bytemuck::Zeroable};
 
     #[test]
     fn test_fee_correctness() {
@@ -859,7 +856,7 @@ mod test {
         assert!(fee_data.verify_proof().is_ok());
 
         // Case 2: transfer max amount
-        let spendable_balance: u64 = u64::max_value();
+        let spendable_balance: u64 = u64::MAX;
         let spendable_ciphertext = source_keypair.pubkey().encrypt(spendable_balance);
 
         let transfer_amount: u64 =

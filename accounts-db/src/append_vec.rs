@@ -2,43 +2,53 @@
 //!
 //! For more information, see:
 //!
-//! <https://docs.solanalabs.com/implemented-proposals/persistent-account-storage>
+//! <https://docs.anza.xyz/implemented-proposals/persistent-account-storage>
 
+mod meta;
+pub mod test_utils;
+
+#[cfg(feature = "dev-context-only-utils")]
+pub use meta::{AccountMeta, StoredAccountMeta, StoredMeta};
+#[cfg(not(feature = "dev-context-only-utils"))]
+use meta::{AccountMeta, StoredAccountMeta, StoredMeta};
 use {
     crate::{
-        account_storage::meta::{
-            AccountMeta, StorableAccountsWithHashesAndWriteVersions, StoredAccountInfo,
-            StoredAccountMeta, StoredMeta, StoredMetaWriteVersion,
-        },
-        accounts_file::{AccountsFileError, MatchAccountOwnerError, Result, ALIGN_BOUNDARY_OFFSET},
-        accounts_hash::AccountHash,
+        account_info::Offset,
+        account_storage::stored_account_info::{StoredAccountInfo, StoredAccountInfoWithoutData},
+        accounts_file::{InternalsForArchive, StorageAccess, StoredAccountsInfo},
+        is_zero_lamport::IsZeroLamport,
         storable_accounts::StorableAccounts,
         u64_align,
+        utils::create_account_shared_data,
+    },
+    agave_fs::{
+        buffered_reader::{
+            BufReaderWithOverflow, BufferedReader, FileBufRead as _, RequiredLenBufFileRead,
+            RequiredLenBufRead as _,
+        },
+        file_io::{read_into_buffer, write_buffer_to_file},
     },
     log::*,
     memmap2::MmapMut,
-    solana_sdk::{
-        account::{AccountSharedData, ReadableAccount},
-        clock::Slot,
-        pubkey::Pubkey,
-        stake_history::Epoch,
-    },
+    meta::StoredAccountNoData,
+    solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
+    solana_pubkey::Pubkey,
+    solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
     std::{
-        borrow::Borrow,
+        self,
         convert::TryFrom,
-        fs::{remove_file, OpenOptions},
-        io::{Seek, SeekFrom, Write},
-        mem,
+        fs::{remove_file, File, OpenOptions},
+        io::{self, BufRead, Seek, SeekFrom, Write},
+        mem::{self, MaybeUninit},
         path::{Path, PathBuf},
+        ptr, slice,
         sync::{
-            atomic::{AtomicU64, AtomicUsize, Ordering},
-            Mutex,
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+            Mutex, MutexGuard,
         },
     },
     thiserror::Error,
 };
-
-pub mod test_utils;
 
 /// size of the fixed sized fields in an append vec
 /// we need to add data len and align it to get the actual stored size
@@ -49,7 +59,7 @@ const _: () = assert!(
     STORE_META_OVERHEAD
         == mem::size_of::<StoredMeta>()
             + mem::size_of::<AccountMeta>()
-            + mem::size_of::<AccountHash>()
+            + mem::size_of::<ObsoleteAccountHash>()
 );
 
 /// Returns the size this item will take to store plus possible alignment padding bytes before the next entry.
@@ -59,11 +69,28 @@ pub fn aligned_stored_size(data_len: usize) -> usize {
     u64_align!(STORE_META_OVERHEAD + data_len)
 }
 
+/// Checked variant of [`aligned_stored_size`].
+#[inline(always)]
+fn aligned_stored_size_checked(data_len: usize) -> Option<usize> {
+    Some(u64_align!(stored_size_checked(data_len)?))
+}
+
+/// Compute the (unaligned) stored size of an account.
+#[inline(always)]
+fn stored_size_checked(data_len: usize) -> Option<usize> {
+    STORE_META_OVERHEAD.checked_add(data_len)
+}
+
 pub const MAXIMUM_APPEND_VEC_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB
 
-#[derive(Error, Debug)]
+pub type Result<T> = std::result::Result<T, AppendVecError>;
+
 /// An enum for AppendVec related errors.
+#[derive(Error, Debug)]
 pub enum AppendVecError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+
     #[error("too small file size {0} for AppendVec")]
     FileSizeTooSmall(usize),
 
@@ -77,179 +104,172 @@ pub enum AppendVecError {
     OffsetOutOfBounds(usize, usize),
 }
 
-pub struct AppendVecAccountsIter<'append_vec> {
-    append_vec: &'append_vec AppendVec,
-    offset: usize,
-}
+/// A slice whose contents are known to be valid.
+/// The slice contains no undefined bytes.
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct ValidSlice<'a>(&'a [u8]);
 
-impl<'append_vec> AppendVecAccountsIter<'append_vec> {
-    pub fn new(append_vec: &'append_vec AppendVec) -> Self {
-        Self {
-            append_vec,
-            offset: 0,
-        }
+impl<'a> ValidSlice<'a> {
+    #[inline(always)]
+    pub(crate) fn new(data: &'a [u8]) -> Self {
+        Self(data)
+    }
+
+    #[inline(always)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
     }
 }
 
-impl<'append_vec> Iterator for AppendVecAccountsIter<'append_vec> {
-    type Item = StoredAccountMeta<'append_vec>;
+/// offsets to help navigate the persisted format of `AppendVec`
+#[derive(Debug)]
+struct AccountOffsets {
+    /// offset to the end of the &[u8] data
+    offset_to_end_of_data: usize,
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some((account, next_offset)) = self.append_vec.get_account(self.offset) {
-            self.offset = next_offset;
-            Some(account)
+#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
+#[derive(Debug)]
+enum AppendVecFileBacking {
+    /// A file-backed block of memory that is used to store the data for each appended item.
+    Mmap(MmapMut),
+    /// This was opened as a read only file
+    File(File),
+}
+
+/// Validates and serializes appends (when `append_guard` is called) such that only
+/// writable AppendVec is updated and only from a single thread at a time.
+#[derive(Debug)]
+enum ReadWriteState {
+    ReadOnly,
+    Writable {
+        /// A lock used to serialize append operations.
+        append_lock: Mutex<()>,
+    },
+}
+
+impl ReadWriteState {
+    fn new(allow_writes: bool) -> Self {
+        if allow_writes {
+            Self::Writable {
+                append_lock: Mutex::new(()),
+            }
         } else {
-            None
+            Self::ReadOnly
         }
     }
-}
 
-/// References to account data stored elsewhere. Getting an `Account` requires cloning
-/// (see `StoredAccountMeta::clone_account()`).
-#[derive(PartialEq, Eq, Debug)]
-pub struct AppendVecStoredAccountMeta<'append_vec> {
-    pub meta: &'append_vec StoredMeta,
-    /// account data
-    pub account_meta: &'append_vec AccountMeta,
-    pub(crate) data: &'append_vec [u8],
-    pub(crate) offset: usize,
-    pub(crate) stored_size: usize,
-    pub(crate) hash: &'append_vec AccountHash,
-}
-
-impl<'append_vec> AppendVecStoredAccountMeta<'append_vec> {
-    pub fn pubkey(&self) -> &'append_vec Pubkey {
-        &self.meta.pubkey
-    }
-
-    pub fn hash(&self) -> &'append_vec AccountHash {
-        self.hash
-    }
-
-    pub fn stored_size(&self) -> usize {
-        self.stored_size
-    }
-
-    pub fn offset(&self) -> usize {
-        self.offset
-    }
-
-    pub fn data(&self) -> &'append_vec [u8] {
-        self.data
-    }
-
-    pub fn data_len(&self) -> u64 {
-        self.meta.data_len
-    }
-
-    pub fn write_version(&self) -> StoredMetaWriteVersion {
-        self.meta.write_version_obsolete
-    }
-
-    pub fn meta(&self) -> &StoredMeta {
-        self.meta
-    }
-
-    pub fn set_meta(&mut self, meta: &'append_vec StoredMeta) {
-        self.meta = meta;
-    }
-
-    pub(crate) fn sanitize(&self) -> bool {
-        self.sanitize_executable() && self.sanitize_lamports()
-    }
-
-    fn sanitize_executable(&self) -> bool {
-        // Sanitize executable to ensure higher 7-bits are cleared correctly.
-        self.ref_executable_byte() & !1 == 0
-    }
-
-    fn sanitize_lamports(&self) -> bool {
-        // Sanitize 0 lamports to ensure to be same as AccountSharedData::default()
-        self.account_meta.lamports != 0
-            || self.to_account_shared_data() == AccountSharedData::default()
-    }
-
-    fn ref_executable_byte(&self) -> &u8 {
-        // Use extra references to avoid value silently clamped to 1 (=true) and 0 (=false)
-        // Yes, this really happens; see test_new_from_file_crafted_executable
-        let executable_bool: &bool = &self.account_meta.executable;
-        // UNSAFE: Force to interpret mmap-backed bool as u8 to really read the actual memory content
-        let executable_byte: &u8 = unsafe { &*(executable_bool as *const bool as *const u8) };
-        executable_byte
-    }
-}
-
-impl<'append_vec> ReadableAccount for AppendVecStoredAccountMeta<'append_vec> {
-    fn lamports(&self) -> u64 {
-        self.account_meta.lamports
-    }
-    fn data(&self) -> &'append_vec [u8] {
-        self.data()
-    }
-    fn owner(&self) -> &'append_vec Pubkey {
-        &self.account_meta.owner
-    }
-    fn executable(&self) -> bool {
-        self.account_meta.executable
-    }
-    fn rent_epoch(&self) -> Epoch {
-        self.account_meta.rent_epoch
+    fn append_guard(&self) -> MutexGuard<'_, ()> {
+        match self {
+            Self::ReadOnly => panic!("append not allowed in read-only state"),
+            Self::Writable { append_lock } => append_lock.lock().unwrap(),
+        }
     }
 }
 
 /// A thread-safe, file-backed block of memory used to store `Account` instances. Append operations
-/// are serialized such that only one thread updates the internal `append_lock` at a time. No
-/// restrictions are placed on reading. That is, one may read items from one thread while another
-/// is appending new items.
-#[derive(Debug, AbiExample)]
+/// are serialized using `read_write_state`'s internal lock such that only one thread updates the
+/// file at a time. No restrictions are placed on reading. That is, one may read items from one
+/// thread while another is appending new items.
+#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
+#[derive(Debug)]
 pub struct AppendVec {
     /// The file path where the data is stored.
     path: PathBuf,
 
-    /// A file-backed block of memory that is used to store the data for each appended item.
-    map: MmapMut,
+    /// access the file data
+    backing: AppendVecFileBacking,
 
-    /// A lock used to serialize append operations.
-    append_lock: Mutex<()>,
+    /// Guards and serializes writes if allowed
+    read_write_state: ReadWriteState,
 
     /// The number of bytes used to store items, not the number of items.
     current_len: AtomicUsize,
 
     /// The number of bytes available for storing items.
     file_size: u64,
+
+    /// if true, remove file when dropped
+    remove_file_on_drop: AtomicBool,
+
+    /// Flags if the append vec is dirty or not.
+    /// Since fastboot requires that all storages are flushed to disk, be smart about it.
+    /// AppendVecs are (almost) always write-once.  The common case is that an AppendVec
+    /// will only need to be flushed once.  This avoids unnecessary syscalls/kernel work
+    /// when nothing in the AppendVec has changed.
+    is_dirty: AtomicBool,
 }
 
-lazy_static! {
-    pub static ref APPEND_VEC_MMAPPED_FILES_OPEN: AtomicU64 = AtomicU64::default();
+const PAGE_SIZE: usize = 4 * 1024;
+
+pub struct AppendVecStat {
+    pub open_as_mmap: AtomicU64,
+    pub open_as_file_io: AtomicU64,
+    pub files_open: AtomicU64,
+    pub files_dirty: AtomicU64,
 }
+
+pub static APPEND_VEC_STATS: AppendVecStat = AppendVecStat {
+    open_as_mmap: AtomicU64::new(0),
+    open_as_file_io: AtomicU64::new(0),
+    files_open: AtomicU64::new(0),
+    files_dirty: AtomicU64::new(0),
+};
 
 impl Drop for AppendVec {
     fn drop(&mut self) {
-        APPEND_VEC_MMAPPED_FILES_OPEN.fetch_sub(1, Ordering::Relaxed);
-        if let Err(_err) = remove_file(&self.path) {
-            // promote this to panic soon.
-            // disabled due to many false positive warnings while running tests.
-            // blocked by rpc's upgrade to jsonrpc v17
-            //error!("AppendVec failed to remove {}: {err}", &self.path.display());
-            inc_new_counter_info!("append_vec_drop_fail", 1);
+        APPEND_VEC_STATS.files_open.fetch_sub(1, Ordering::Relaxed);
+
+        if *self.is_dirty.get_mut() {
+            APPEND_VEC_STATS.files_dirty.fetch_sub(1, Ordering::Relaxed);
+        }
+
+        match &self.backing {
+            AppendVecFileBacking::Mmap(_) => {
+                APPEND_VEC_STATS
+                    .open_as_mmap
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
+            AppendVecFileBacking::File(_) => {
+                APPEND_VEC_STATS
+                    .open_as_file_io
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        if self.remove_file_on_drop.load(Ordering::Acquire) {
+            // If we're reopening in readonly mode, we don't delete the file. See
+            // AppendVec::reopen_as_readonly.
+            if let Err(_err) = remove_file(&self.path) {
+                // promote this to panic soon.
+                // disabled due to many false positive warnings while running tests.
+                // blocked by rpc's upgrade to jsonrpc v17
+                //error!("AppendVec failed to remove {}: {err}", &self.path.display());
+                inc_new_counter_info!("append_vec_drop_fail", 1);
+            }
         }
     }
 }
 
 impl AppendVec {
-    pub fn new(file: &Path, create: bool, size: usize) -> Self {
+    pub fn new(
+        file: impl Into<PathBuf>,
+        create: bool,
+        size: usize,
+        storage_access: StorageAccess,
+    ) -> Self {
+        let file = file.into();
         let initial_len = 0;
         AppendVec::sanitize_len_and_size(initial_len, size).unwrap();
 
         if create {
-            let _ignored = remove_file(file);
+            let _ignored = remove_file(&file);
         }
 
         let mut data = OpenOptions::new()
             .read(true)
             .write(true)
             .create(create)
-            .open(file)
+            .open(&file)
             .map_err(|e| {
                 panic!(
                     "Unable to {} data file {} in current dir({:?}): {:?}",
@@ -269,60 +289,113 @@ impl AppendVec {
         data.rewind().unwrap();
         data.flush().unwrap();
 
-        //UNSAFE: Required to create a Mmap
-        let map = unsafe { MmapMut::map_mut(&data) };
-        let map = map.unwrap_or_else(|e| {
-            error!(
-                "Failed to map the data file (size: {}): {}.\n
-                    Please increase sysctl vm.max_map_count or equivalent for your platform.",
-                size, e
-            );
-            std::process::exit(1);
-        });
-        APPEND_VEC_MMAPPED_FILES_OPEN.fetch_add(1, Ordering::Relaxed);
+        let backing = match storage_access {
+            StorageAccess::Mmap => {
+                //UNSAFE: Required to create a Mmap
+                let mmap = unsafe { MmapMut::map_mut(&data) };
+                let mmap = mmap.unwrap_or_else(|err| {
+                    panic!(
+                        "Failed to map the data file (size: {size}): {err}. Please increase \
+                         sysctl vm.max_map_count or equivalent for your platform.",
+                    );
+                });
+                APPEND_VEC_STATS
+                    .open_as_mmap
+                    .fetch_add(1, Ordering::Relaxed);
+                AppendVecFileBacking::Mmap(mmap)
+            }
+            StorageAccess::File => {
+                APPEND_VEC_STATS
+                    .open_as_file_io
+                    .fetch_add(1, Ordering::Relaxed);
+                AppendVecFileBacking::File(data)
+            }
+        };
+        APPEND_VEC_STATS.files_open.fetch_add(1, Ordering::Relaxed);
 
         AppendVec {
-            path: file.to_path_buf(),
-            map,
-            // This mutex forces append to be single threaded, but concurrent with reads
-            // See UNSAFE usage in `append_ptr`
-            append_lock: Mutex::new(()),
+            path: file,
+            backing,
+            // writable state's mutex forces append to be single threaded, but concurrent with
+            // reads. See UNSAFE usage in `append_ptr`
+            read_write_state: ReadWriteState::new(true),
             current_len: AtomicUsize::new(initial_len),
             file_size: size as u64,
+            remove_file_on_drop: AtomicBool::new(true),
+            is_dirty: AtomicBool::new(false),
         }
     }
 
     fn sanitize_len_and_size(current_len: usize, file_size: usize) -> Result<()> {
         if file_size == 0 {
-            Err(AccountsFileError::AppendVecError(
-                AppendVecError::FileSizeTooSmall(file_size),
-            ))
+            Err(AppendVecError::FileSizeTooSmall(file_size))
         } else if usize::try_from(MAXIMUM_APPEND_VEC_FILE_SIZE)
             .map(|max| file_size > max)
             .unwrap_or(true)
         {
-            Err(AccountsFileError::AppendVecError(
-                AppendVecError::FileSizeTooLarge(file_size),
-            ))
+            Err(AppendVecError::FileSizeTooLarge(file_size))
         } else if current_len > file_size {
-            Err(AccountsFileError::AppendVecError(
-                AppendVecError::OffsetOutOfBounds(current_len, file_size),
-            ))
+            Err(AppendVecError::OffsetOutOfBounds(current_len, file_size))
         } else {
             Ok(())
         }
     }
 
+    pub fn dead_bytes_due_to_zero_lamport_single_ref(&self, count: usize) -> usize {
+        aligned_stored_size(0) * count
+    }
+
+    /// Flushes contents to disk
     pub fn flush(&self) -> Result<()> {
-        self.map.flush()?;
+        // Check to see if we're actually dirty before flushing.
+        let should_flush = self.is_dirty.swap(false, Ordering::AcqRel);
+        if should_flush {
+            match &self.backing {
+                AppendVecFileBacking::Mmap(mmap) => {
+                    mmap.flush()?;
+                }
+                AppendVecFileBacking::File(file) => {
+                    file.sync_all()?;
+                }
+            }
+            APPEND_VEC_STATS.files_dirty.fetch_sub(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 
+    #[cfg(feature = "dev-context-only-utils")]
     pub fn reset(&self) {
-        // This mutex forces append to be single threaded, but concurrent with reads
-        // See UNSAFE usage in `append_ptr`
-        let _lock = self.append_lock.lock().unwrap();
+        // Writable state's mutex forces append to be single threaded, but concurrent
+        // with reads. See UNSAFE usage in `append_ptr`
+        let _lock = self.read_write_state.append_guard();
         self.current_len.store(0, Ordering::Release);
+    }
+
+    /// Return AppendVec opened in read-only file-io mode or `None` if it already is such
+    pub(crate) fn reopen_as_readonly_file_io(&self) -> Option<Self> {
+        if matches!(self.read_write_state, ReadWriteState::ReadOnly)
+            && matches!(self.backing, AppendVecFileBacking::File(_))
+        {
+            // Early return if already in read-only mode *and* already a file-io
+            return None;
+        }
+
+        // we are re-opening the file, so don't remove the file on disk when the old one is dropped
+        self.remove_file_on_drop.store(false, Ordering::Release);
+
+        // add a memory barrier to ensure the the last mmap writes
+        // happen before the first file-io reads
+        std::sync::atomic::fence(Ordering::AcqRel);
+
+        // The file should have already been sanitized. Don't need to check when we open the file again.
+        let mut new =
+            AppendVec::new_from_file_unchecked(self.path.clone(), self.len(), StorageAccess::File)
+                .ok()?;
+        if self.is_dirty.swap(false, Ordering::AcqRel) {
+            // *move* the dirty-ness to the new append vec
+            *new.is_dirty.get_mut() = true;
+        }
+        Some(new)
     }
 
     /// how many more bytes can be stored in this append vec
@@ -331,6 +404,7 @@ impl AppendVec {
             .saturating_sub(u64_align!(self.len()) as u64)
     }
 
+    /// Returns the number of bytes, *not items*, used in the AppendVec
     pub fn len(&self) -> usize {
         self.current_len.load(Ordering::Acquire)
     }
@@ -339,120 +413,210 @@ impl AppendVec {
         self.len() == 0
     }
 
+    /// Returns the total number of bytes, *not items*, the AppendVec can hold
     pub fn capacity(&self) -> u64 {
         self.file_size
     }
 
-    pub fn file_name(slot: Slot, id: impl std::fmt::Display) -> String {
-        format!("{slot}.{id}")
-    }
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn new_from_file(
+        path: impl Into<PathBuf>,
+        current_len: usize,
+        storage_access: StorageAccess,
+    ) -> Result<(Self, usize)> {
+        let path = path.into();
+        let new = Self::new_from_file_unchecked(path, current_len, storage_access)?;
 
-    pub fn new_from_file<P: AsRef<Path>>(path: P, current_len: usize) -> Result<(Self, usize)> {
-        let new = Self::new_from_file_unchecked(&path, current_len)?;
-
-        let (sanitized, num_accounts) = new.sanitize_layout_and_length();
-        if !sanitized {
-            // This info show the failing accountvec file path.  It helps debugging
-            // the appendvec data corrupution issues related to recycling.
-            return Err(AccountsFileError::AppendVecError(
-                AppendVecError::IncorrectLayout(path.as_ref().to_path_buf()),
-            ));
-        }
-
+        let num_accounts = new.sanitize_layout_and_length()?;
         Ok((new, num_accounts))
     }
 
-    /// Creates an appendvec from file without performing sanitize checks or counting the number of accounts
-    pub fn new_from_file_unchecked<P: AsRef<Path>>(path: P, current_len: usize) -> Result<Self> {
+    /// Creates a new AppendVec for the underlying storage at `path`
+    ///
+    /// This version of `new()` may only be called when reconstructing storages as part of startup.
+    /// It trusts the snapshot's value for `current_len`, and relies on later index generation or
+    /// accounts verification to ensure it is valid.
+    pub fn new_for_startup(
+        path: impl Into<PathBuf>,
+        current_len: usize,
+        storage_access: StorageAccess,
+    ) -> Result<Self> {
+        let new = Self::new_from_file_unchecked(path, current_len, storage_access)?;
+
+        // The current_len is allowed to be either exactly the same as file_size, or
+        // u64-aligned-equivalent to file_size.  This is because `flush` and `shink` compute the
+        // required file size with *aligned* stored size per account, including the very last
+        // account.  So the file size may have padding to the next u64-alignment.
+        // For our usage, this is still safe as these padding bytes could never be used for an
+        // account.  This renders the `get_` and `scan_` functions safe.
+        if (current_len as u64 == new.file_size)
+            || (u64_align!(current_len) as u64 == new.file_size)
+        {
+            Ok(new)
+        } else {
+            // However, if opening a minimized snapshot, the file sizes can be
+            // larger than current length [^1].  So when the `if` condition fails,
+            // fallback to the old/slow impl that does the full sanitization.
+            // [^1]: https://github.com/anza-xyz/agave/issues/6797
+            info!(
+                "Could not optimistically create new AppendVec, falling back to pessimistic impl: \
+                 file size ({}) and current length ({}) do not match for '{}'",
+                new.file_size,
+                current_len,
+                new.path.display(),
+            );
+            let _num_accounts = new.sanitize_layout_and_length()?;
+            Ok(new)
+        }
+    }
+
+    /// Creates an appendvec from existing file in read-only mode and without full data checks
+    ///
+    /// Validation of account data and counting the number of accounts is skipped.
+    pub fn new_from_file_unchecked(
+        path: impl Into<PathBuf>,
+        current_len: usize,
+        storage_access: StorageAccess,
+    ) -> Result<Self> {
+        let path = path.into();
         let file_size = std::fs::metadata(&path)?.len();
         Self::sanitize_len_and_size(current_len, file_size as usize)?;
 
+        // AppendVec is in read-only mode, but mmap access requires file to be writable
         let data = OpenOptions::new()
             .read(true)
-            .write(true)
+            .write(storage_access == StorageAccess::Mmap)
             .create(false)
             .open(&path)?;
 
-        let map = unsafe {
+        APPEND_VEC_STATS.files_open.fetch_add(1, Ordering::Relaxed);
+
+        if storage_access == StorageAccess::File {
+            APPEND_VEC_STATS
+                .open_as_file_io
+                .fetch_add(1, Ordering::Relaxed);
+
+            return Ok(AppendVec {
+                path,
+                backing: AppendVecFileBacking::File(data),
+                read_write_state: ReadWriteState::ReadOnly,
+                current_len: AtomicUsize::new(current_len),
+                file_size,
+                remove_file_on_drop: AtomicBool::new(true),
+                is_dirty: AtomicBool::new(false),
+            });
+        }
+
+        let mmap = unsafe {
             let result = MmapMut::map_mut(&data);
             if result.is_err() {
                 // for vm.max_map_count, error is: {code: 12, kind: Other, message: "Cannot allocate memory"}
-                info!("memory map error: {:?}. This may be because vm.max_map_count is not set correctly.", result);
+                info!(
+                    "memory map error: {result:?}. This may be because vm.max_map_count is not \
+                     set correctly."
+                );
             }
             result?
         };
-        APPEND_VEC_MMAPPED_FILES_OPEN.fetch_add(1, Ordering::Relaxed);
+
+        APPEND_VEC_STATS
+            .open_as_mmap
+            .fetch_add(1, Ordering::Relaxed);
 
         Ok(AppendVec {
-            path: path.as_ref().to_path_buf(),
-            map,
-            append_lock: Mutex::new(()),
+            path,
+            backing: AppendVecFileBacking::Mmap(mmap),
+            read_write_state: ReadWriteState::ReadOnly,
             current_len: AtomicUsize::new(current_len),
             file_size,
+            remove_file_on_drop: AtomicBool::new(true),
+            is_dirty: AtomicBool::new(false),
         })
     }
 
-    fn sanitize_layout_and_length(&self) -> (bool, usize) {
-        let mut offset = 0;
+    /// Opens the AppendVec at `path` for use by `store-tool`
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn new_for_store_tool(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let file_size = std::fs::metadata(&path)?.len();
+        Self::new_from_file_unchecked(path, file_size as usize, StorageAccess::default())
+    }
 
+    /// Checks that all accounts layout is correct and returns the number of accounts.
+    fn sanitize_layout_and_length(&self) -> Result<usize> {
         // This discards allocated accounts immediately after check at each loop iteration.
         //
         // This code should not reuse AppendVec.accounts() method as the current form or
         // extend it to be reused here because it would allow attackers to accumulate
         // some measurable amount of memory needlessly.
         let mut num_accounts = 0;
-        while let Some((account, next_offset)) = self.get_account(offset) {
-            if !account.sanitize() {
-                return (false, num_accounts);
+        let mut matches = true;
+        let mut last_offset = 0;
+        self.scan_stored_accounts_no_data(|account| {
+            if !matches || !account.sanitize() {
+                matches = false;
+                return;
             }
-            offset = next_offset;
+            last_offset = account.offset() + account.stored_size();
             num_accounts += 1;
-        }
+        })?;
         let aligned_current_len = u64_align!(self.current_len.load(Ordering::Acquire));
 
-        (offset == aligned_current_len, num_accounts)
+        if !matches || last_offset != aligned_current_len {
+            return Err(AppendVecError::IncorrectLayout(self.path.clone()));
+        }
+
+        Ok(num_accounts)
     }
 
     /// Get a reference to the data at `offset` of `size` bytes if that slice
     /// doesn't overrun the internal buffer. Otherwise return None.
     /// Also return the offset of the first byte after the requested data that
     /// falls on a 64-byte boundary.
-    fn get_slice(&self, offset: usize, size: usize) -> Option<(&[u8], usize)> {
-        let (next, overflow) = offset.overflowing_add(size);
-        if overflow || next > self.len() {
-            return None;
-        }
-        let data = &self.map[offset..next];
-        let next = u64_align!(next);
-
-        Some((
-            //UNSAFE: This unsafe creates a slice that represents a chunk of self.map memory
-            //The lifetime of this slice is tied to &self, since it points to self.map memory
-            unsafe { std::slice::from_raw_parts(data.as_ptr(), size) },
-            next,
-        ))
+    fn get_slice(slice: ValidSlice<'_>, offset: usize, size: usize) -> Option<(&[u8], usize)> {
+        // SAFETY: Wrapping math is safe here because if `end` does wrap, the Range
+        // parameter to `.get()` will be invalid, and `.get()` will correctly return None.
+        let end = offset.wrapping_add(size);
+        slice
+            .0
+            .get(offset..end)
+            .map(|subslice| (subslice, u64_align!(end)))
     }
 
     /// Copy `len` bytes from `src` to the first 64-byte boundary after position `offset` of
     /// the internal buffer. Then update `offset` to the first byte after the copied data.
-    fn append_ptr(&self, offset: &mut usize, src: *const u8, len: usize) {
+    fn append_ptr(&self, offset: &mut usize, src: *const u8, len: usize) -> io::Result<()> {
         let pos = u64_align!(*offset);
-        let data = &self.map[pos..(pos + len)];
-        //UNSAFE: This mut append is safe because only 1 thread can append at a time
-        //Mutex<()> guarantees exclusive write access to the memory occupied in
-        //the range.
-        unsafe {
-            let dst = data.as_ptr() as *mut u8;
-            std::ptr::copy(src, dst, len);
-        };
+        match &self.backing {
+            AppendVecFileBacking::Mmap(mmap) => {
+                let data = &mmap[pos..(pos + len)];
+                //UNSAFE: This mut append is safe because only 1 thread can append at a time
+                //Mutex<()> guarantees exclusive write access to the memory occupied in
+                //the range.
+                unsafe {
+                    let dst = data.as_ptr() as *mut _;
+                    ptr::copy(src, dst, len);
+                };
+            }
+            AppendVecFileBacking::File(file) => {
+                // Safety: caller should ensure the passed pointer and length are valid.
+                let data = unsafe { slice::from_raw_parts(src, len) };
+                write_buffer_to_file(file, data, pos as u64)?;
+            }
+        }
         *offset = pos + len;
+        Ok(())
     }
 
     /// Copy each value in `vals`, in order, to the first 64-byte boundary after position `offset`.
     /// If there is sufficient space, then update `offset` and the internal `current_len` to the
     /// first byte after the copied data and return the starting position of the copied data.
     /// Otherwise return None and leave `offset` unchanged.
-    fn append_ptrs_locked(&self, offset: &mut usize, vals: &[(*const u8, usize)]) -> Option<usize> {
+    fn append_ptrs_locked(
+        &self,
+        offset: &mut usize,
+        vals: &[(*const u8, usize)],
+    ) -> io::Result<Option<usize>> {
         let mut end = *offset;
         for val in vals {
             end = u64_align!(end);
@@ -460,78 +624,279 @@ impl AppendVec {
         }
 
         if (self.file_size as usize) < end {
-            return None;
+            return Ok(None);
         }
 
         let pos = u64_align!(*offset);
         for val in vals {
-            self.append_ptr(offset, val.0, val.1)
+            self.append_ptr(offset, val.0, val.1)?
         }
         self.current_len.store(*offset, Ordering::Release);
-        Some(pos)
+        Ok(Some(pos))
     }
 
     /// Return a reference to the type at `offset` if its data doesn't overrun the internal buffer.
     /// Otherwise return None. Also return the offset of the first byte after the requested data
     /// that falls on a 64-byte boundary.
-    fn get_type<T>(&self, offset: usize) -> Option<(&T, usize)> {
-        let (data, next) = self.get_slice(offset, mem::size_of::<T>())?;
-        let ptr: *const T = data.as_ptr() as *const T;
+    fn get_type<T>(slice: ValidSlice<'_>, offset: usize) -> Option<(&T, usize)> {
+        let (data, next) = Self::get_slice(slice, offset, mem::size_of::<T>())?;
+        let ptr = data.as_ptr().cast();
         //UNSAFE: The cast is safe because the slice is aligned and fits into the memory
         //and the lifetime of the &T is tied to self, which holds the underlying memory map
         Some((unsafe { &*ptr }, next))
     }
 
-    /// Return stored account metadata for the account at `offset` if its data doesn't overrun
-    /// the internal buffer. Otherwise return None. Also return the offset of the first byte
-    /// after the requested data that falls on a 64-byte boundary.
-    pub fn get_account(&self, offset: usize) -> Option<(StoredAccountMeta, usize)> {
-        let (meta, next): (&StoredMeta, _) = self.get_type(offset)?;
-        let (account_meta, next): (&AccountMeta, _) = self.get_type(next)?;
-        let (hash, next): (&AccountHash, _) = self.get_type(next)?;
-        let (data, next) = self.get_slice(next, meta.data_len as usize)?;
-        let stored_size = next - offset;
-        Some((
-            StoredAccountMeta::AppendVec(AppendVecStoredAccountMeta {
-                meta,
-                account_meta,
-                data,
-                offset,
-                stored_size,
-                hash,
-            }),
-            next,
-        ))
+    /// MmapMut could have more capacity than `len()` knows is valid.
+    /// Return the subset of `mmap` that is known to be valid.
+    /// This allows comparisons against the slice len.
+    fn get_valid_slice_from_mmap<'a>(&self, mmap: &'a MmapMut) -> ValidSlice<'a> {
+        ValidSlice(&mmap[..self.len()])
     }
 
-    fn get_account_meta(&self, offset: usize) -> Option<&AccountMeta> {
-        // Skip over StoredMeta data in the account
-        let offset = offset.checked_add(mem::size_of::<StoredMeta>())?;
-        // u64_align! does an unchecked add for alignment. Check that it won't cause an overflow.
-        offset.checked_add(ALIGN_BOUNDARY_OFFSET - 1)?;
-        let (account_meta, _): (&AccountMeta, _) = self.get_type(u64_align!(offset))?;
-        Some(account_meta)
-    }
-
-    /// Return Ok(index_of_matching_owner) if the account owner at `offset` is one of the pubkeys in `owners`.
-    /// Return Err(MatchAccountOwnerError::NoMatch) if the account has 0 lamports or the owner is not one of
-    /// the pubkeys in `owners`.
-    /// Return Err(MatchAccountOwnerError::UnableToLoad) if the `offset` value causes a data overrun.
-    pub fn account_matches_owners(
+    /// Calls `callback` with the stored account at `offset`.
+    ///
+    /// Returns `None` if there is no account at `offset`, otherwise returns the result of
+    /// `callback` in `Some`.
+    ///
+    /// This fn does *not* load the account's data, just the data length.  If the data is needed,
+    /// use `get_stored_account_callback()` instead.  However, prefer this fn when possible.
+    pub fn get_stored_account_without_data_callback<Ret>(
         &self,
         offset: usize,
-        owners: &[Pubkey],
-    ) -> std::result::Result<usize, MatchAccountOwnerError> {
-        let account_meta = self
-            .get_account_meta(offset)
-            .ok_or(MatchAccountOwnerError::UnableToLoad)?;
-        if account_meta.lamports == 0 {
-            Err(MatchAccountOwnerError::NoMatch)
-        } else {
-            owners
-                .iter()
-                .position(|entry| &account_meta.owner == entry)
-                .ok_or(MatchAccountOwnerError::NoMatch)
+        mut callback: impl for<'local> FnMut(StoredAccountInfoWithoutData<'local>) -> Ret,
+    ) -> Option<Ret> {
+        self.get_stored_account_no_data_callback(offset, |stored_account| {
+            let account = StoredAccountInfoWithoutData {
+                pubkey: stored_account.pubkey(),
+                lamports: stored_account.lamports(),
+                owner: stored_account.owner(),
+                data_len: stored_account.data_len() as usize,
+                executable: stored_account.executable(),
+                rent_epoch: stored_account.rent_epoch(),
+            };
+            callback(account)
+        })
+    }
+
+    /// Calls `callback` with the stored account at `offset`.
+    ///
+    /// Returns `None` if there is no account at `offset`, otherwise returns the result of
+    /// `callback` in `Some`.
+    ///
+    /// This fn *does* load the account's data.  If the data is not needed,
+    /// use `get_stored_account_without_data_callback()` instead.
+    pub fn get_stored_account_callback<Ret>(
+        &self,
+        offset: usize,
+        mut callback: impl for<'local> FnMut(StoredAccountInfo<'local>) -> Ret,
+    ) -> Option<Ret> {
+        self.get_stored_account_meta_callback(offset, |stored_account_meta| {
+            let account = StoredAccountInfo {
+                pubkey: stored_account_meta.pubkey(),
+                lamports: stored_account_meta.lamports(),
+                owner: stored_account_meta.owner(),
+                data: stored_account_meta.data(),
+                executable: stored_account_meta.executable(),
+                rent_epoch: stored_account_meta.rent_epoch(),
+            };
+            callback(account)
+        })
+    }
+
+    /// calls `callback` with the stored account metadata for the account at `offset` if its data doesn't overrun
+    /// the internal buffer. Otherwise return None.
+    ///
+    /// Prefer get_stored_account_callback() when possible, as it does not contain file format
+    /// implementation details, and thus potentially can read less and be faster.
+    pub fn get_stored_account_meta_callback<Ret>(
+        &self,
+        offset: usize,
+        mut callback: impl for<'local> FnMut(StoredAccountMeta<'local>) -> Ret,
+    ) -> Option<Ret> {
+        match &self.backing {
+            AppendVecFileBacking::Mmap(mmap) => {
+                let slice = self.get_valid_slice_from_mmap(mmap);
+                let (meta, next) = Self::get_type::<StoredMeta>(slice, offset)?;
+                let (account_meta, next) = Self::get_type::<AccountMeta>(slice, next)?;
+                let (_hash, next) = Self::get_type::<ObsoleteAccountHash>(slice, next)?;
+                let (data, next) = Self::get_slice(slice, next, meta.data_len as usize)?;
+                let stored_size = next - offset;
+                Some(callback(StoredAccountMeta {
+                    meta,
+                    account_meta,
+                    data,
+                    offset,
+                    stored_size,
+                }))
+            }
+            AppendVecFileBacking::File(file) => {
+                // 4096 was just picked to be a single page size
+                let mut buf = [MaybeUninit::<u8>::uninit(); PAGE_SIZE];
+                // SAFETY: `read_into_buffer` will only write to uninitialized memory.
+                let bytes_read = read_into_buffer(file, self.len(), offset, unsafe {
+                    slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
+                })
+                .ok()?;
+                // SAFETY: we only read the initialized portion.
+                let valid_bytes = ValidSlice(unsafe {
+                    slice::from_raw_parts(buf.as_ptr() as *const u8, bytes_read)
+                });
+                let (meta, next) = Self::get_type::<StoredMeta>(valid_bytes, 0)?;
+                let (account_meta, next) = Self::get_type::<AccountMeta>(valid_bytes, next)?;
+                let (_hash, next) = Self::get_type::<ObsoleteAccountHash>(valid_bytes, next)?;
+                let data_len = meta.data_len;
+                let remaining_bytes_for_data = bytes_read - next;
+                Some(if remaining_bytes_for_data >= data_len as usize {
+                    // we already read enough data to load this account
+                    let (data, next) = Self::get_slice(valid_bytes, next, meta.data_len as usize)?;
+                    let stored_size = next;
+                    let account = StoredAccountMeta {
+                        meta,
+                        account_meta,
+                        data,
+                        offset,
+                        stored_size,
+                    };
+                    callback(account)
+                } else {
+                    // not enough was read from file to get `data`
+                    assert!(data_len <= MAX_PERMITTED_DATA_LENGTH, "{data_len}");
+                    let mut data: Box<[MaybeUninit<u8>]> = Box::new_uninit_slice(data_len as usize);
+                    // instead, we could piece together what we already read here. Maybe we just needed 1 more byte.
+                    // Note here `next` is a 0-based offset from the beginning of this account.
+                    // SAFETY: `read_into_buffer` will only write to uninitialized memory.
+                    let bytes_read = read_into_buffer(file, self.len(), offset + next, unsafe {
+                        slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, data_len as usize)
+                    })
+                    .ok()?;
+                    if bytes_read < data_len as usize {
+                        // eof or otherwise couldn't read all the data
+                        return None;
+                    }
+                    // SAFETY: we've just checked that `bytes_read` is at least `data_len`.
+                    let data = unsafe { data.assume_init() };
+                    let stored_size = aligned_stored_size(data_len as usize);
+                    let account = StoredAccountMeta {
+                        meta,
+                        account_meta,
+                        data: &data[..],
+                        offset,
+                        stored_size,
+                    };
+                    callback(account)
+                })
+            }
+        }
+    }
+
+    /// calls `callback` with the stored account fixed portion for the account at `offset` if its data doesn't overrun
+    /// the internal buffer. Otherwise return None.
+    fn get_stored_account_no_data_callback<Ret>(
+        &self,
+        offset: usize,
+        mut callback: impl for<'local> FnMut(StoredAccountNoData<'local>) -> Ret,
+    ) -> Option<Ret> {
+        match &self.backing {
+            AppendVecFileBacking::Mmap(mmap) => {
+                let slice = self.get_valid_slice_from_mmap(mmap);
+                let (meta, next) = Self::get_type::<StoredMeta>(slice, offset)?;
+                let (account_meta, _) = Self::get_type::<AccountMeta>(slice, next)?;
+                let stored_size = aligned_stored_size_checked(meta.data_len as usize)?;
+
+                Some(callback(StoredAccountNoData {
+                    meta,
+                    account_meta,
+                    offset,
+                    stored_size,
+                }))
+            }
+            AppendVecFileBacking::File(file) => {
+                let mut buf = [MaybeUninit::<u8>::uninit(); STORE_META_OVERHEAD];
+                // SAFETY: `read_into_buffer` will only write to uninitialized memory.
+                let bytes_read = read_into_buffer(file, self.len(), offset, unsafe {
+                    slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
+                })
+                .ok()?;
+                // SAFETY: we only read the initialized portion.
+                let valid_bytes = ValidSlice(unsafe {
+                    slice::from_raw_parts(buf.as_ptr() as *const u8, bytes_read)
+                });
+                let (meta, next) = Self::get_type::<StoredMeta>(valid_bytes, 0)?;
+                let (account_meta, _) = Self::get_type::<AccountMeta>(valid_bytes, next)?;
+                let stored_size = aligned_stored_size_checked(meta.data_len as usize)?;
+
+                Some(callback(StoredAccountNoData {
+                    meta,
+                    account_meta,
+                    offset,
+                    stored_size,
+                }))
+            }
+        }
+    }
+
+    /// return an `AccountSharedData` for an account at `offset`.
+    /// This fn can efficiently return exactly what is needed by a caller.
+    /// This is on the critical path of tx processing for accounts not in the read or write caches.
+    pub fn get_account_shared_data(&self, offset: usize) -> Option<AccountSharedData> {
+        match &self.backing {
+            AppendVecFileBacking::Mmap(_) => self
+                .get_stored_account_meta_callback(offset, |account| {
+                    create_account_shared_data(&account)
+                }),
+            AppendVecFileBacking::File(file) => {
+                let mut buf = MaybeUninit::<[u8; PAGE_SIZE]>::uninit();
+                let bytes_read =
+                    read_into_buffer(file, self.len(), offset, unsafe { &mut *buf.as_mut_ptr() })
+                        .ok()?;
+                // SAFETY: we only read the initialized portion.
+                let valid_bytes = ValidSlice(unsafe {
+                    slice::from_raw_parts(buf.as_ptr() as *const u8, bytes_read)
+                });
+                let (meta, next) = Self::get_type::<StoredMeta>(valid_bytes, 0)?;
+                let (account_meta, next) = Self::get_type::<AccountMeta>(valid_bytes, next)?;
+                let (_hash, next) = Self::get_type::<ObsoleteAccountHash>(valid_bytes, next)?;
+                let data_len = meta.data_len;
+                let remaining_bytes_for_data = bytes_read - next;
+                Some(if remaining_bytes_for_data >= data_len as usize {
+                    // we already read enough data to load this account
+                    let (data, next) = Self::get_slice(valid_bytes, next, meta.data_len as usize)?;
+                    let stored_size = next;
+                    let account = StoredAccountMeta {
+                        meta,
+                        account_meta,
+                        data,
+                        offset,
+                        stored_size,
+                    };
+                    // data is within `buf`, so just allocate a new vec for data
+                    create_account_shared_data(&account)
+                } else {
+                    // not enough was read from file to get `data`
+                    assert!(data_len <= MAX_PERMITTED_DATA_LENGTH, "{data_len}");
+                    let mut data = Vec::with_capacity(data_len as usize);
+                    let slice = data.spare_capacity_mut();
+                    // Note here `next` is a 0-based offset from the beginning of this account.
+                    // SAFETY: `read_into_buffer` will only write to uninitialized memory.
+                    let bytes_read = read_into_buffer(file, self.len(), offset + next, unsafe {
+                        slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut u8, data_len as usize)
+                    })
+                    .ok()?;
+                    if bytes_read < data_len as usize {
+                        // eof or otherwise couldn't read all the data
+                        return None;
+                    }
+                    // SAFETY: we've just checked that `bytes_read` is at least `data_len`.
+                    unsafe { data.set_len(data_len as usize) };
+                    AccountSharedData::create(
+                        account_meta.lamports,
+                        data,
+                        account_meta.owner,
+                        account_meta.executable,
+                        account_meta.rent_epoch,
+                    )
+                })
+            }
         }
     }
 
@@ -539,29 +904,339 @@ impl AppendVec {
     pub fn get_account_test(
         &self,
         offset: usize,
-    ) -> Option<(StoredMeta, solana_sdk::account::AccountSharedData)> {
-        let (stored_account, _) = self.get_account(offset)?;
-        let meta = stored_account.meta().clone();
-        Some((meta, stored_account.to_account_shared_data()))
-    }
-
-    pub fn get_path(&self) -> PathBuf {
-        self.path.clone()
-    }
-
-    /// Return iterator for account metadata
-    pub fn account_iter(&self) -> AppendVecAccountsIter {
-        AppendVecAccountsIter::new(self)
-    }
-
-    /// Return a vector of account metadata for each account, starting from `offset`.
-    pub fn accounts(&self, mut offset: usize) -> Vec<StoredAccountMeta> {
-        let mut accounts = vec![];
-        while let Some((account, next)) = self.get_account(offset) {
-            accounts.push(account);
-            offset = next;
+    ) -> Option<(Pubkey, solana_account::AccountSharedData)> {
+        let data_len = self.get_account_data_lens(&[offset]);
+        let sizes: usize = data_len
+            .iter()
+            .map(|len| AppendVec::calculate_stored_size(*len))
+            .sum();
+        let result = self.get_stored_account_meta_callback(offset, |r_callback| {
+            let r2 = self.get_account_shared_data(offset);
+            assert!(solana_account::accounts_equal(
+                &r_callback,
+                r2.as_ref().unwrap()
+            ));
+            assert_eq!(sizes, r_callback.stored_size());
+            let pubkey = r_callback.meta().pubkey;
+            Some((pubkey, create_account_shared_data(&r_callback)))
+        });
+        if result.is_none() {
+            assert!(self
+                .get_stored_account_meta_callback(offset, |_| {})
+                .is_none());
+            assert!(self.get_account_shared_data(offset).is_none());
+            // it has different rules for checking len and returning None
+            assert_eq!(sizes, 0);
         }
-        accounts
+        result.flatten()
+    }
+
+    /// Returns the path to the file where the data is stored
+    pub fn path(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    /// help with the math of offsets when navigating the on-disk layout in an AppendVec.
+    /// data is at the end of each account and is variable sized
+    /// the next account is then aligned on a 64 bit boundary.
+    /// With these helpers, we can skip over reading some of the data depending on what the caller wants.
+    ///
+    /// *Safety* - The caller must ensure that the `stored_meta.data_len` won't overflow the calculation.
+    fn next_account_offset(start_offset: usize, stored_meta: &StoredMeta) -> AccountOffsets {
+        let stored_size_unaligned = STORE_META_OVERHEAD
+            .checked_add(stored_meta.data_len as usize)
+            .expect("stored size cannot overflow");
+        let offset_to_end_of_data = start_offset + stored_size_unaligned;
+
+        AccountOffsets {
+            offset_to_end_of_data,
+        }
+    }
+
+    /// Iterate over all accounts and call `callback` with each account.
+    ///
+    /// `callback` parameters:
+    /// * Offset: the offset within the file of this account
+    /// * StoredAccountInfoWithoutData: the account itself, without account data
+    ///
+    /// Note that account data is not read/passed to the callback.
+    pub fn scan_accounts_without_data(
+        &self,
+        mut callback: impl for<'local> FnMut(Offset, StoredAccountInfoWithoutData<'local>),
+    ) -> Result<()> {
+        self.scan_stored_accounts_no_data(|stored_account| {
+            let offset = stored_account.offset();
+            let account = StoredAccountInfoWithoutData {
+                pubkey: stored_account.pubkey(),
+                lamports: stored_account.lamports(),
+                owner: stored_account.owner(),
+                data_len: stored_account.data_len() as usize,
+                executable: stored_account.executable(),
+                rent_epoch: stored_account.rent_epoch(),
+            };
+            callback(offset, account);
+        })
+    }
+
+    /// Iterate over all accounts and call `callback` with each account.
+    ///
+    /// `callback` parameters:
+    /// * Offset: the offset within the file of this account
+    /// * StoredAccountInfo: the account itself, with account data
+    ///
+    /// Prefer scan_accounts_without_data() when account data is not needed,
+    /// as it can potentially read less and be faster.
+    pub(crate) fn scan_accounts<'a>(
+        &'a self,
+        reader: &mut impl RequiredLenBufFileRead<'a>,
+        mut callback: impl for<'local> FnMut(Offset, StoredAccountInfo<'local>),
+    ) -> Result<()> {
+        self.scan_accounts_stored_meta(reader, |stored_account_meta| {
+            let offset = stored_account_meta.offset();
+            let account = StoredAccountInfo {
+                pubkey: stored_account_meta.pubkey(),
+                lamports: stored_account_meta.lamports(),
+                owner: stored_account_meta.owner(),
+                data: stored_account_meta.data(),
+                executable: stored_account_meta.executable(),
+                rent_epoch: stored_account_meta.rent_epoch(),
+            };
+            callback(offset, account);
+        })
+    }
+
+    /// Iterate over all accounts and call `callback` with each account.
+    ///
+    /// Prefer scan_accounts() when possible, as it does not contain file format
+    /// implementation details, and thus potentially can read less and be faster.
+    #[allow(clippy::blocks_in_conditions)]
+    fn scan_accounts_stored_meta<'a>(
+        &'a self,
+        reader: &mut impl RequiredLenBufFileRead<'a>,
+        mut callback: impl for<'local> FnMut(StoredAccountMeta<'local>),
+    ) -> Result<()> {
+        match &self.backing {
+            AppendVecFileBacking::Mmap(_mmap) => {
+                let mut offset = 0;
+                while self
+                    .get_stored_account_meta_callback(offset, |account| {
+                        offset += account.stored_size();
+                        if account.is_zero_lamport() && account.pubkey() == &Pubkey::default() {
+                            // we passed the last useful account
+                            return false;
+                        }
+
+                        callback(account);
+                        true
+                    })
+                    .unwrap_or_default()
+                {}
+            }
+            AppendVecFileBacking::File(file) => {
+                reader.set_file(file, self.len())?;
+
+                let mut min_buf_len = STORE_META_OVERHEAD;
+                loop {
+                    let offset = reader.get_file_offset();
+                    let bytes = match reader.fill_buf_required(min_buf_len) {
+                        Ok([]) => break,
+                        Ok(bytes) => ValidSlice::new(bytes),
+                        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(err) => return Err(AppendVecError::Io(err)),
+                    };
+
+                    let (meta, next) = Self::get_type::<StoredMeta>(bytes, 0).unwrap();
+                    let (account_meta, next) = Self::get_type::<AccountMeta>(bytes, next).unwrap();
+                    if account_meta.lamports == 0 && meta.pubkey == Pubkey::default() {
+                        // we passed the last useful account
+                        break;
+                    }
+                    let (_hash, next) = Self::get_type::<ObsoleteAccountHash>(bytes, next).unwrap();
+                    let data_len = meta.data_len as usize;
+                    let leftover = bytes.len() - next;
+                    if leftover >= data_len {
+                        // we already read enough data to load this account
+                        let data = &bytes.0[next..(next + data_len)];
+                        let stored_size = aligned_stored_size(data_len);
+                        let account = StoredAccountMeta {
+                            meta,
+                            account_meta,
+                            data,
+                            offset,
+                            stored_size,
+                        };
+                        callback(account);
+                        reader.consume(stored_size);
+                        // restore default required buffer size
+                        min_buf_len = STORE_META_OVERHEAD;
+                    } else {
+                        // repeat loop with required buffer size holding whole account data
+                        min_buf_len = STORE_META_OVERHEAD + data_len;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Scans accounts with StoredAccountMeta
+    ///
+    /// Only intended to be called by agave-store-tool.
+    /// Refer to `scan_accounts_stored_meta` for further documentation.
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn scan_accounts_stored_meta_for_store_tool(
+        &self,
+        callback: impl for<'local> FnMut(StoredAccountMeta<'local>),
+    ) -> Result<()> {
+        let mut reader = new_scan_accounts_reader();
+        self.scan_accounts_stored_meta(&mut reader, callback)
+    }
+
+    /// Calculate the amount of storage required for an account with the passed
+    /// in data_len
+    pub(crate) fn calculate_stored_size(data_len: usize) -> usize {
+        aligned_stored_size(data_len)
+    }
+
+    /// for each offset in `sorted_offsets`, get the the amount of data stored in the account.
+    pub(crate) fn get_account_data_lens(&self, sorted_offsets: &[usize]) -> Vec<usize> {
+        // self.len() is an atomic load, so only do it once
+        let self_len = self.len();
+        let mut account_sizes = Vec::with_capacity(sorted_offsets.len());
+        match &self.backing {
+            AppendVecFileBacking::Mmap(mmap) => {
+                let slice = self.get_valid_slice_from_mmap(mmap);
+                for &offset in sorted_offsets {
+                    let Some((stored_meta, _)) = Self::get_type::<StoredMeta>(slice, offset) else {
+                        break;
+                    };
+                    let next = Self::next_account_offset(offset, stored_meta);
+                    if next.offset_to_end_of_data > self_len {
+                        // data doesn't fit, so don't include
+                        break;
+                    }
+                    account_sizes.push(stored_meta.data_len as usize);
+                }
+            }
+            AppendVecFileBacking::File(file) => {
+                let mut buffer = [MaybeUninit::<u8>::uninit(); mem::size_of::<StoredMeta>()];
+                for &offset in sorted_offsets {
+                    // SAFETY: `read_into_buffer` will only write to uninitialized memory.
+                    let Some(bytes_read) = read_into_buffer(file, self_len, offset, unsafe {
+                        slice::from_raw_parts_mut(
+                            buffer.as_mut_ptr() as *mut u8,
+                            mem::size_of::<StoredMeta>(),
+                        )
+                    })
+                    .ok() else {
+                        break;
+                    };
+                    // SAFETY: we only read the initialized portion.
+                    let bytes = ValidSlice(unsafe {
+                        slice::from_raw_parts(buffer.as_ptr() as *const u8, bytes_read)
+                    });
+                    let Some((stored_meta, _)) = Self::get_type::<StoredMeta>(bytes, 0) else {
+                        break;
+                    };
+                    let next = Self::next_account_offset(offset, stored_meta);
+                    if next.offset_to_end_of_data > self_len {
+                        // data doesn't fit, so don't include
+                        break;
+                    }
+                    account_sizes.push(stored_meta.data_len as usize);
+                }
+            }
+        }
+        account_sizes
+    }
+
+    /// iterate over all pubkeys and call `callback`.
+    /// no references have to be maintained/returned from an iterator function.
+    /// This fn can operate on a batch of data at once.
+    pub fn scan_pubkeys(&self, mut callback: impl FnMut(&Pubkey)) -> Result<()> {
+        self.scan_stored_accounts_no_data(|account| {
+            callback(account.pubkey());
+        })
+    }
+
+    /// Iterate over all accounts and call `callback` with the fixed sized portion of each account.
+    fn scan_stored_accounts_no_data(
+        &self,
+        mut callback: impl FnMut(StoredAccountNoData),
+    ) -> Result<()> {
+        let self_len = self.len();
+        match &self.backing {
+            AppendVecFileBacking::Mmap(mmap) => {
+                let mut offset = 0;
+                let slice = self.get_valid_slice_from_mmap(mmap);
+                loop {
+                    let Some((stored_meta, next)) = Self::get_type::<StoredMeta>(slice, offset)
+                    else {
+                        break;
+                    };
+                    let Some((account_meta, _)) = Self::get_type::<AccountMeta>(slice, next) else {
+                        break;
+                    };
+                    if account_meta.lamports == 0 && stored_meta.pubkey == Pubkey::default() {
+                        // we passed the last useful account
+                        break;
+                    }
+                    let Some(stored_size) = stored_size_checked(stored_meta.data_len as usize)
+                    else {
+                        break;
+                    };
+                    if offset + stored_size > self_len {
+                        break;
+                    }
+                    let stored_size = u64_align!(stored_size);
+                    callback(StoredAccountNoData {
+                        meta: stored_meta,
+                        account_meta,
+                        offset,
+                        stored_size,
+                    });
+                    offset += stored_size;
+                }
+            }
+            AppendVecFileBacking::File(file) => {
+                // Heuristic observed in benchmarking that maintains a reasonable balance between syscalls and data waste
+                const BUFFER_SIZE: usize = PAGE_SIZE * 4;
+                let mut reader = BufferedReader::<BUFFER_SIZE>::new().with_file(file, self_len);
+                const REQUIRED_READ_LEN: usize =
+                    mem::size_of::<StoredMeta>() + mem::size_of::<AccountMeta>();
+                loop {
+                    let offset = reader.get_file_offset();
+                    let bytes = match reader.fill_buf_required(REQUIRED_READ_LEN) {
+                        Ok([]) => break,
+                        Ok(bytes) => ValidSlice::new(bytes),
+                        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(err) => return Err(AppendVecError::Io(err)),
+                    };
+                    let (stored_meta, next) = Self::get_type::<StoredMeta>(bytes, 0).unwrap();
+                    let (account_meta, _) = Self::get_type::<AccountMeta>(bytes, next).unwrap();
+                    if account_meta.lamports == 0 && stored_meta.pubkey == Pubkey::default() {
+                        // we passed the last useful account
+                        break;
+                    }
+                    let Some(stored_size) = stored_size_checked(stored_meta.data_len as usize)
+                    else {
+                        break;
+                    };
+                    if offset + stored_size > self_len {
+                        break;
+                    }
+                    let stored_size = u64_align!(stored_size);
+                    callback(StoredAccountNoData {
+                        meta: stored_meta,
+                        account_meta,
+                        offset,
+                        stored_size,
+                    });
+                    reader.consume(stored_size);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Copy each account metadata, account and hash to the internal buffer.
@@ -571,83 +1246,113 @@ impl AppendVec {
     /// So, return.len() is 1 + (number of accounts written)
     /// After each account is appended, the internal `current_len` is updated
     /// and will be available to other threads.
-    pub fn append_accounts<
-        'a,
-        'b,
-        T: ReadableAccount + Sync,
-        U: StorableAccounts<'a, T>,
-        V: Borrow<AccountHash>,
-    >(
+    pub fn append_accounts<'a>(
         &self,
-        accounts: &StorableAccountsWithHashesAndWriteVersions<'a, 'b, T, U, V>,
+        accounts: &impl StorableAccounts<'a>,
         skip: usize,
-    ) -> Option<Vec<StoredAccountInfo>> {
-        let _lock = self.append_lock.lock().unwrap();
+    ) -> Option<StoredAccountsInfo> {
+        let _lock = self.read_write_state.append_guard();
         let mut offset = self.len();
-
-        let len = accounts.accounts.len();
+        let len = accounts.len();
         // Here we have `len - skip` number of accounts.  The +1 extra capacity
-        // is for storing the aligned offset of the last entry to that is used
-        // to compute the StoredAccountInfo of the last entry.
+        // is for storing the aligned offset of the last-plus-one entry,
+        // which is used to compute the size of the last stored account.
         let offsets_len = len - skip + 1;
         let mut offsets = Vec::with_capacity(offsets_len);
+        let mut stop = false;
         for i in skip..len {
-            let (account, pubkey, hash, write_version_obsolete) = accounts.get(i);
-            let account_meta = account
-                .map(|account| AccountMeta {
+            if stop {
+                break;
+            }
+            accounts.account_default_if_zero_lamport(i, |account| {
+                let account_meta = AccountMeta {
                     lamports: account.lamports(),
                     owner: *account.owner(),
                     rent_epoch: account.rent_epoch(),
                     executable: account.executable(),
-                })
-                .unwrap_or_default();
+                };
 
-            let stored_meta = StoredMeta {
-                pubkey: *pubkey,
-                data_len: account
-                    .map(|account| account.data().len())
-                    .unwrap_or_default() as u64,
-                write_version_obsolete,
-            };
-            let meta_ptr = &stored_meta as *const StoredMeta;
-            let account_meta_ptr = &account_meta as *const AccountMeta;
-            let data_len = stored_meta.data_len as usize;
-            let data_ptr = account
-                .map(|account| account.data())
-                .unwrap_or_default()
-                .as_ptr();
-            let hash_ptr = bytemuck::bytes_of(hash).as_ptr();
-            let ptrs = [
-                (meta_ptr as *const u8, mem::size_of::<StoredMeta>()),
-                (account_meta_ptr as *const u8, mem::size_of::<AccountMeta>()),
-                (hash_ptr, mem::size_of::<AccountHash>()),
-                (data_ptr, data_len),
-            ];
-            if let Some(res) = self.append_ptrs_locked(&mut offset, &ptrs) {
-                offsets.push(res)
-            } else {
-                break;
+                let stored_meta = StoredMeta {
+                    pubkey: *account.pubkey(),
+                    data_len: account.data().len() as u64,
+                    write_version_obsolete: 0,
+                };
+                let stored_meta_ptr = ptr::from_ref(&stored_meta).cast();
+                let account_meta_ptr = ptr::from_ref(&account_meta).cast();
+                let hash_ptr = ObsoleteAccountHash::ZEROED.0.as_ptr();
+                let data_ptr = account.data().as_ptr();
+                let ptrs = [
+                    (stored_meta_ptr, mem::size_of::<StoredMeta>()),
+                    (account_meta_ptr, mem::size_of::<AccountMeta>()),
+                    (hash_ptr, mem::size_of::<ObsoleteAccountHash>()),
+                    (data_ptr, stored_meta.data_len as usize),
+                ];
+                if let Some(start_offset) = self
+                    .append_ptrs_locked(&mut offset, &ptrs)
+                    .expect("must append data to append_vec")
+                {
+                    offsets.push(start_offset)
+                } else {
+                    stop = true;
+                }
+            });
+        }
+
+        if !offsets.is_empty() {
+            // If we've actually written to the AppendVec, make sure we mark it as dirty.
+            // This ensures we properly flush it later.
+            let was_dirty = self.is_dirty.swap(true, Ordering::AcqRel);
+            if !was_dirty {
+                APPEND_VEC_STATS.files_dirty.fetch_add(1, Ordering::Relaxed);
             }
         }
 
-        if offsets.is_empty() {
-            None
-        } else {
-            let mut rv = Vec::with_capacity(offsets.len());
-
-            // The last entry in this offset needs to be the u64 aligned offset, because that's
+        (!offsets.is_empty()).then(|| {
+            // The last entry in the offsets needs to be the u64 aligned `offset`, because that's
             // where the *next* entry will begin to be stored.
+            // This is used to compute the size of the last stored account; make sure to remove
+            // it afterwards!
             offsets.push(u64_align!(offset));
-            for offsets in offsets.windows(2) {
-                rv.push(StoredAccountInfo {
-                    offset: offsets[0],
-                    size: offsets[1] - offsets[0],
-                });
-            }
+            let size = offsets.windows(2).map(|offset| offset[1] - offset[0]).sum();
+            offsets.pop();
 
-            Some(rv)
+            StoredAccountsInfo { offsets, size }
+        })
+    }
+
+    /// Returns the way to access this accounts file when archiving
+    pub(crate) fn internals_for_archive(&self) -> InternalsForArchive<'_> {
+        match &self.backing {
+            AppendVecFileBacking::File(_file) => InternalsForArchive::FileIo(self.path()),
+            // note this returns the entire mmap slice, even bytes that we consider invalid
+            AppendVecFileBacking::Mmap(mmap) => InternalsForArchive::Mmap(mmap),
         }
     }
+}
+
+/// Create a reusable buffered reader tuned for scanning storages with account data.
+pub(crate) fn new_scan_accounts_reader<'a>() -> impl RequiredLenBufFileRead<'a> {
+    // 128KiB covers a reasonably large distribution of typical account sizes.
+    // In a recent sample, 99.98% of accounts' data lengths were less than or equal to 128KiB.
+    const MIN_CAPACITY: usize = 1024 * 128;
+    const MAX_CAPACITY: usize = STORE_META_OVERHEAD + MAX_PERMITTED_DATA_LENGTH as usize;
+    const BUFFER_SIZE: usize = PAGE_SIZE * 8;
+    BufReaderWithOverflow::new(
+        BufferedReader::<BUFFER_SIZE>::new(),
+        MIN_CAPACITY,
+        MAX_CAPACITY,
+    )
+}
+
+/// The per-account hash, stored in the AppendVec.
+///
+/// This field is now obsolete, but it still lives in the file format.
+#[derive(Debug)]
+struct ObsoleteAccountHash([u8; 32]);
+
+impl ObsoleteAccountHash {
+    /// The constant of all zeroes, to be stored in the file.
+    const ZEROED: Self = Self([0; 32]);
 }
 
 #[cfg(test)]
@@ -656,233 +1361,31 @@ pub mod tests {
         super::{test_utils::*, *},
         assert_matches::assert_matches,
         memoffset::offset_of,
-        rand::{thread_rng, Rng},
-        solana_sdk::{
-            account::{accounts_equal, Account, AccountSharedData, WritableAccount},
-            hash::Hash,
-            timing::duration_as_ms,
-        },
+        rand::prelude::*,
+        rand_chacha::ChaChaRng,
+        solana_account::{accounts_equal, Account, AccountSharedData},
+        solana_clock::Slot,
         std::{mem::ManuallyDrop, time::Instant},
+        test_case::{test_case, test_matrix},
     };
 
     impl AppendVec {
-        pub(crate) fn set_current_len_for_tests(&self, len: usize) {
-            self.current_len.store(len, Ordering::Release);
-        }
-
-        fn append_account_test(&self, data: &(StoredMeta, AccountSharedData)) -> Option<usize> {
+        fn append_account_test(&self, data: &(Pubkey, AccountSharedData)) -> Option<usize> {
             let slot_ignored = Slot::MAX;
-            let accounts = [(&data.0.pubkey, &data.1)];
+            let accounts = [(&data.0, &data.1)];
             let slice = &accounts[..];
-            let account_data = (slot_ignored, slice);
-            let hash = AccountHash(Hash::default());
-            let storable_accounts =
-                StorableAccountsWithHashesAndWriteVersions::new_with_hashes_and_write_versions(
-                    &account_data,
-                    vec![&hash],
-                    vec![data.0.write_version_obsolete],
-                );
+            let storable_accounts = (slot_ignored, slice);
 
             self.append_accounts(&storable_accounts, 0)
-                .map(|res| res[0].offset)
-        }
-    }
-
-    impl StoredAccountMeta<'_> {
-        pub(crate) fn ref_executable_byte(&self) -> &u8 {
-            match self {
-                Self::AppendVec(av) => av.ref_executable_byte(),
-                // Tests currently only cover AppendVec.
-                Self::Hot(_) => unreachable!(),
-            }
-        }
-    }
-
-    impl AppendVecStoredAccountMeta<'_> {
-        fn set_data_len_unsafe(&self, new_data_len: u64) {
-            // UNSAFE: cast away & (= const ref) to &mut to force to mutate append-only (=read-only) AppendVec
-            unsafe {
-                #[allow(invalid_reference_casting)]
-                std::ptr::write(
-                    std::mem::transmute::<*const u64, *mut u64>(&self.meta.data_len),
-                    new_data_len,
-                );
-            }
-        }
-
-        fn get_executable_byte(&self) -> u8 {
-            let executable_bool: bool = self.executable();
-            // UNSAFE: Force to interpret mmap-backed bool as u8 to really read the actual memory content
-            let executable_byte: u8 = unsafe { std::mem::transmute::<bool, u8>(executable_bool) };
-            executable_byte
-        }
-
-        fn set_executable_as_byte(&self, new_executable_byte: u8) {
-            // UNSAFE: Force to interpret mmap-backed &bool as &u8 to write some crafted value;
-            unsafe {
-                #[allow(invalid_reference_casting)]
-                std::ptr::write(
-                    std::mem::transmute::<*const bool, *mut u8>(&self.account_meta.executable),
-                    new_executable_byte,
-                );
-            }
+                .map(|res| res.offsets[0])
         }
     }
 
     // Hash is [u8; 32], which has no alignment
     static_assertions::assert_eq_align!(u64, StoredMeta, AccountMeta);
 
-    #[test]
-    #[should_panic(expected = "accounts.has_hash_and_write_version()")]
-    fn test_storable_accounts_with_hashes_and_write_versions_new() {
-        let account = AccountSharedData::default();
-        // for (Slot, &'a [(&'a Pubkey, &'a T)])
-        let slot = 0 as Slot;
-        let pubkey = Pubkey::default();
-        StorableAccountsWithHashesAndWriteVersions::<'_, '_, _, _, &AccountHash>::new(&(
-            slot,
-            &[(&pubkey, &account)][..],
-        ));
-    }
-
-    fn test_mismatch(correct_hashes: bool, correct_write_versions: bool) {
-        let account = AccountSharedData::default();
-        // for (Slot, &'a [(&'a Pubkey, &'a T)])
-        let slot = 0 as Slot;
-        let pubkey = Pubkey::default();
-        // mismatch between lens of accounts, hashes, write_versions
-        let mut hashes = Vec::default();
-        if correct_hashes {
-            hashes.push(AccountHash(Hash::default()));
-        }
-        let mut write_versions = Vec::default();
-        if correct_write_versions {
-            write_versions.push(0);
-        }
-        StorableAccountsWithHashesAndWriteVersions::new_with_hashes_and_write_versions(
-            &(slot, &[(&pubkey, &account)][..]),
-            hashes,
-            write_versions,
-        );
-    }
-
-    #[test]
-    // rust 1.73+ (our as-of-writing nightly version) changed panic message. we're stuck with this
-    // short common substring until the monorepo is fully 1.73+ including stable.
-    #[should_panic(expected = "left == right")]
-    fn test_storable_accounts_with_hashes_and_write_versions_new2() {
-        test_mismatch(false, false);
-    }
-
-    #[test]
-    // rust 1.73+ (our as-of-writing nightly version) changed panic message. we're stuck with this
-    // short common substring until the monorepo is fully 1.73+ including stable.
-    #[should_panic(expected = "left == right")]
-    fn test_storable_accounts_with_hashes_and_write_versions_new3() {
-        test_mismatch(false, true);
-    }
-
-    #[test]
-    // rust 1.73+ (our as-of-writing nightly version) changed panic message. we're stuck with this
-    // short common substring until the monorepo is fully 1.73+ including stable.
-    #[should_panic(expected = "left == right")]
-    fn test_storable_accounts_with_hashes_and_write_versions_new4() {
-        test_mismatch(true, false);
-    }
-
-    #[test]
-    fn test_storable_accounts_with_hashes_and_write_versions_empty() {
-        // for (Slot, &'a [(&'a Pubkey, &'a T)])
-        let account = AccountSharedData::default();
-        let slot = 0 as Slot;
-        let pubkeys = [Pubkey::default()];
-        let hashes = Vec::<AccountHash>::default();
-        let write_versions = Vec::default();
-        let mut accounts = vec![(&pubkeys[0], &account)];
-        accounts.clear();
-        let accounts2 = (slot, &accounts[..]);
-        let storable =
-            StorableAccountsWithHashesAndWriteVersions::new_with_hashes_and_write_versions(
-                &accounts2,
-                hashes,
-                write_versions,
-            );
-        assert_eq!(storable.len(), 0);
-        assert!(storable.is_empty());
-    }
-
-    #[test]
-    fn test_storable_accounts_with_hashes_and_write_versions_hash_and_write_version() {
-        // for (Slot, &'a [(&'a Pubkey, &'a T)])
-        let account = AccountSharedData::default();
-        let slot = 0 as Slot;
-        let pubkeys = [Pubkey::from([5; 32]), Pubkey::from([6; 32])];
-        let hashes = vec![
-            AccountHash(Hash::new(&[3; 32])),
-            AccountHash(Hash::new(&[4; 32])),
-        ];
-        let write_versions = vec![42, 43];
-        let accounts = [(&pubkeys[0], &account), (&pubkeys[1], &account)];
-        let accounts2 = (slot, &accounts[..]);
-        let storable =
-            StorableAccountsWithHashesAndWriteVersions::new_with_hashes_and_write_versions(
-                &accounts2,
-                hashes.clone(),
-                write_versions.clone(),
-            );
-        assert_eq!(storable.len(), pubkeys.len());
-        assert!(!storable.is_empty());
-        (0..2).for_each(|i| {
-            let (_, pubkey, hash, write_version) = storable.get(i);
-            assert_eq!(hash, &hashes[i]);
-            assert_eq!(write_version, write_versions[i]);
-            assert_eq!(pubkey, &pubkeys[i]);
-        });
-    }
-
-    #[test]
-    fn test_storable_accounts_with_hashes_and_write_versions_default() {
-        // 0 lamport account, should return default account (or None in this case)
-        let account = Account {
-            data: vec![0],
-            ..Account::default()
-        }
-        .to_account_shared_data();
-        // for (Slot, &'a [(&'a Pubkey, &'a T)])
-        let slot = 0 as Slot;
-        let pubkey = Pubkey::default();
-        let hashes = vec![AccountHash(Hash::default())];
-        let write_versions = vec![0];
-        let accounts = [(&pubkey, &account)];
-        let accounts2 = (slot, &accounts[..]);
-        let storable =
-            StorableAccountsWithHashesAndWriteVersions::new_with_hashes_and_write_versions(
-                &accounts2,
-                hashes.clone(),
-                write_versions.clone(),
-            );
-        let get_account = storable.account(0);
-        assert!(get_account.is_none());
-
-        // non-zero lamports, data should be correct
-        let account = Account {
-            lamports: 1,
-            data: vec![0],
-            ..Account::default()
-        }
-        .to_account_shared_data();
-        // for (Slot, &'a [(&'a Pubkey, &'a T)])
-        let accounts = [(&pubkey, &account)];
-        let accounts2 = (slot, &accounts[..]);
-        let storable =
-            StorableAccountsWithHashesAndWriteVersions::new_with_hashes_and_write_versions(
-                &accounts2,
-                hashes,
-                write_versions,
-            );
-        let get_account = storable.account(0);
-        assert!(accounts_equal(&account, get_account.unwrap()));
-    }
+    // Offset of the first account's `data_len` field.
+    const ACCOUNT_0_DATA_LEN_OFFSET: u64 = core::mem::offset_of!(StoredMeta, data_len) as u64;
 
     #[test]
     fn test_account_meta_default() {
@@ -921,26 +1424,28 @@ pub mod tests {
         assert_eq!(&def1, &def2);
     }
 
-    #[test]
-    #[should_panic(expected = "AppendVecError(FileSizeTooSmall(0))")]
-    fn test_append_vec_new_bad_size() {
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    #[should_panic(expected = "FileSizeTooSmall(0)")]
+    fn test_append_vec_new_bad_size(storage_access: StorageAccess) {
         let path = get_append_vec_path("test_append_vec_new_bad_size");
-        let _av = AppendVec::new(&path.path, true, 0);
+        let _av = AppendVec::new(&path.path, true, 0, storage_access);
     }
 
-    #[test]
-    fn test_append_vec_new_from_file_bad_size() {
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_append_vec_new_from_file_bad_size(storage_access: StorageAccess) {
         let file = get_append_vec_path("test_append_vec_new_from_file_bad_size");
         let path = &file.path;
 
         let _data = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create_new(true)
             .open(path)
             .expect("create a test file for mmap");
 
-        let result = AppendVec::new_from_file(path, 0);
+        let result = AppendVec::new_from_file(path, 0, storage_access);
         assert_matches!(result, Err(ref message) if message.to_string().contains("too small file size 0 for AppendVec"));
     }
 
@@ -984,21 +1489,55 @@ pub mod tests {
         assert_matches!(result, Err(ref message) if message.to_string().contains("is larger than file size (1048576)"));
     }
 
-    #[test]
-    fn test_append_vec_one() {
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_append_vec_one(storage_access: StorageAccess) {
         let path = get_append_vec_path("test_append");
-        let av = AppendVec::new(&path.path, true, 1024 * 1024);
+        let av = AppendVec::new(&path.path, true, 1024 * 1024, storage_access);
         let account = create_test_account(0);
         let index = av.append_account_test(&account).unwrap();
         assert_eq!(av.get_account_test(index).unwrap(), account);
+        truncate_and_test(av, index);
     }
 
-    #[test]
-    fn test_remaining_bytes() {
+    /// truncate `av` and make sure that we fail to get an account. This verifies that the eof
+    /// code is working correctly.
+    fn truncate_and_test(av: AppendVec, index: usize) {
+        // truncate the hash, 1 byte at a time
+        let hash_size = std::mem::size_of::<ObsoleteAccountHash>();
+        for _ in 0..hash_size {
+            av.current_len.fetch_sub(1, Ordering::Relaxed);
+            assert_eq!(av.get_account_test(index), None);
+        }
+        // truncate 1 byte into the AccountMeta
+        av.current_len.fetch_sub(1, Ordering::Relaxed);
+        assert_eq!(av.get_account_test(index), None);
+    }
+
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_append_vec_one_with_data(storage_access: StorageAccess) {
+        let path = get_append_vec_path("test_append");
+        let av = AppendVec::new(&path.path, true, 1024 * 1024, storage_access);
+        let data_len = 1;
+        let account = create_test_account(data_len);
+        let index = av.append_account_test(&account).unwrap();
+        // make the append vec 1 byte too short. we should get `None` since the append vec was truncated
+        assert_eq!(
+            STORE_META_OVERHEAD + data_len,
+            av.current_len.load(Ordering::Relaxed)
+        );
+        assert_eq!(av.get_account_test(index).unwrap(), account);
+        truncate_and_test(av, index);
+    }
+
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_remaining_bytes(storage_access: StorageAccess) {
         let path = get_append_vec_path("test_append");
         let sz = 1024 * 1024;
         let sz64 = sz as u64;
-        let av = AppendVec::new(&path.path, true, sz);
+        let av = AppendVec::new(&path.path, true, sz, storage_access);
         assert_eq!(av.capacity(), sz64);
         assert_eq!(av.remaining_bytes(), sz64);
 
@@ -1033,10 +1572,11 @@ pub mod tests {
         assert_eq!(av.remaining_bytes(), sz64 - u64_align!(av_len) as u64);
     }
 
-    #[test]
-    fn test_append_vec_data() {
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_append_vec_data(storage_access: StorageAccess) {
         let path = get_append_vec_path("test_append_data");
-        let av = AppendVec::new(&path.path, true, 1024 * 1024);
+        let av = AppendVec::new(&path.path, true, 1024 * 1024, storage_access);
         let account = create_test_account(5);
         let index = av.append_account_test(&account).unwrap();
         assert_eq!(av.get_account_test(index).unwrap(), account);
@@ -1046,87 +1586,258 @@ pub mod tests {
         assert_eq!(av.get_account_test(index1).unwrap(), account1);
     }
 
-    #[test]
-    fn test_account_matches_owners() {
-        let path = get_append_vec_path("test_append_data");
-        let av = AppendVec::new(&path.path, true, 1024 * 1024);
-        let owners: Vec<Pubkey> = (0..2).map(|_| Pubkey::new_unique()).collect();
-
-        let mut account = create_test_account(5);
-        account.1.set_owner(owners[0]);
-        let index = av.append_account_test(&account).unwrap();
-        assert_eq!(av.account_matches_owners(index, &owners), Ok(0));
-
-        let mut account1 = create_test_account(6);
-        account1.1.set_owner(owners[1]);
-        let index1 = av.append_account_test(&account1).unwrap();
-        assert_eq!(av.account_matches_owners(index1, &owners), Ok(1));
-        assert_eq!(av.account_matches_owners(index, &owners), Ok(0));
-
-        let mut account2 = create_test_account(6);
-        account2.1.set_owner(Pubkey::new_unique());
-        let index2 = av.append_account_test(&account2).unwrap();
-        assert_eq!(
-            av.account_matches_owners(index2, &owners),
-            Err(MatchAccountOwnerError::NoMatch)
-        );
-
-        // tests for overflow
-        assert_eq!(
-            av.account_matches_owners(usize::MAX - mem::size_of::<StoredMeta>(), &owners),
-            Err(MatchAccountOwnerError::UnableToLoad)
-        );
-
-        assert_eq!(
-            av.account_matches_owners(
-                usize::MAX - mem::size_of::<StoredMeta>() - mem::size_of::<AccountMeta>() + 1,
-                &owners
-            ),
-            Err(MatchAccountOwnerError::UnableToLoad)
-        );
+    impl AppendVec {
+        /// return how many accounts in the storage
+        fn accounts_count(&self) -> usize {
+            let mut count = 0;
+            self.scan_stored_accounts_no_data(|_| {
+                count += 1;
+            })
+            .expect("must scan accounts storage");
+            count
+        }
     }
 
+    /// Generate a random append vec with the given number of accounts.
+    ///
+    /// This provides the accounts and pubkeys used to populate the append vec. As such,
+    /// it may be used to test the correctness of reading back the accounts from the append vec.
+    ///
+    /// It also ensures the following:
+    /// - A `MAX_PERMITTED_DATA_LENGTH` and 64KiB account are present. This can be useful for exercising
+    ///   implementation details that are sensitive to the size of the account. For example, `scan_accounts_stored_meta`
+    ///   will need to use a heap-allocated buffer when the account data size is greater than its stack buffer.
+    /// - Accounts have randomized data, lamports, and owner.
+    fn rand_exhaustive_append_vec(
+        num_accounts: usize,
+    ) -> (
+        ManuallyDrop<AppendVec>,
+        StoredAccountsInfo,
+        Vec<(Pubkey, AccountSharedData)>,
+        TempFile,
+    ) {
+        let mut rng = thread_rng();
+        let mut create_account = |data_len: usize| -> (Pubkey, AccountSharedData) {
+            let pubkey = Pubkey::new_from_array(rng.gen());
+            let owner = Pubkey::new_from_array(rng.gen());
+            let mut account = AccountSharedData::new(rng.gen(), data_len, &owner);
+            // Ensure we actually have some unique data to compare against when checking correctness
+            let data = std::iter::from_fn(|| Some(rng.gen::<u8>()))
+                .take(data_len)
+                .collect::<Vec<_>>();
+            account.set_data(data);
+            (pubkey, account)
+        };
+
+        let mut test_accounts = Vec::with_capacity(num_accounts);
+        let mut file_size = 0;
+        let special_file_interval = num_accounts / 8;
+        for i in 0..num_accounts {
+            let data_len = match i {
+                // Create several spread out accounts with varying sizes:
+                // for (x / special_file_interval) in 0..7 range
+                x if x % special_file_interval == 0 => {
+                    // mult increases in 0 to 3 range twice
+                    let mult = (x / special_file_interval) % 4;
+                    // and data_len goes over 0..MAX_PERMITTED_DATA_LENGTH range also twice
+                    mult * (MAX_PERMITTED_DATA_LENGTH as usize) / 3
+                }
+                // Otherwise use a reasonably small account to avoid long test times
+                x => x % 256,
+            };
+            let account = create_account(data_len);
+            let size = aligned_stored_size(account.1.data().len());
+            file_size += size;
+            test_accounts.push(account);
+        }
+
+        let path = get_append_vec_path("test_scan_accounts_stored_meta_correctness");
+        let av = ManuallyDrop::new(AppendVec::new(
+            &path.path,
+            true,
+            file_size,
+            StorageAccess::Mmap,
+        ));
+        let slot = 42;
+        let stored_accounts_info = av
+            .append_accounts(&(slot, test_accounts.as_slice()), 0)
+            .unwrap();
+        av.flush().unwrap();
+        (av, stored_accounts_info, test_accounts, path)
+    }
+
+    /// Test that scanning accounts correctly reads back all accounts that were written.
     #[test]
-    fn test_append_vec_append_many() {
+    fn test_scan_accounts_correctness() {
+        let num_accounts = 100;
+        let (av_mmap, _, test_accounts, path) = rand_exhaustive_append_vec(num_accounts);
+        let av_file = AppendVec::new_from_file(&path.path, av_mmap.len(), StorageAccess::File)
+            .unwrap()
+            .0;
+        let mut reader = new_scan_accounts_reader();
+        for av in [&av_mmap, &av_file] {
+            let mut index = 0;
+            av.scan_accounts_stored_meta(&mut reader, |v| {
+                let (pubkey, account) = &test_accounts[index];
+                let recovered = create_account_shared_data(&v);
+                assert_eq!(&recovered, account);
+                assert_eq!(v.pubkey(), pubkey);
+                index += 1;
+            })
+            .expect("must scan accounts storage");
+            assert_eq!(index, num_accounts);
+        }
+        for av in [&av_mmap, &av_file] {
+            let mut index = 0;
+            av.scan_stored_accounts_no_data(|stored_account| {
+                let (pubkey, account) = &test_accounts[index];
+                assert_eq!(stored_account.pubkey(), pubkey);
+                assert_eq!(stored_account.lamports(), account.lamports());
+                assert_eq!(stored_account.owner(), account.owner());
+                assert_eq!(stored_account.data_len(), account.data().len() as u64);
+                assert_eq!(stored_account.executable(), account.executable());
+                assert_eq!(stored_account.rent_epoch(), account.rent_epoch());
+                index += 1;
+            })
+            .expect("must scan accounts storage");
+            assert_eq!(index, num_accounts);
+        }
+    }
+
+    /// Test that scanning accounts correctly handles useless accounts.
+    #[test]
+    fn test_scan_useless_accounts() {
+        let num_accounts = 33;
+        let num_new_accounts = num_accounts - 2;
+        let (av_mmap, stored_accounts_info, test_accounts, path) =
+            rand_exhaustive_append_vec(num_accounts);
+        let av_current_len = av_mmap.len();
+
+        // Rewrite the append vec to mark account at num_new_accounts as useless.
+        // This will also "hide" any accounts later in the file.
+        if let AppendVecFileBacking::Mmap(mmap) = &av_mmap.backing {
+            let slice = av_mmap.get_valid_slice_from_mmap(mmap);
+            let mut stored_meta_offset = stored_accounts_info.offsets[num_new_accounts];
+            let (stored_meta, mut account_meta_offset) =
+                AppendVec::get_type::<StoredMeta>(slice, stored_meta_offset).unwrap();
+            let (account_meta, _next) =
+                AppendVec::get_type::<AccountMeta>(slice, account_meta_offset).unwrap();
+            assert_eq!(stored_meta.pubkey, test_accounts[num_new_accounts].0);
+
+            let new_stored_meta = StoredMeta {
+                pubkey: Pubkey::default(),
+                ..stored_meta.clone()
+            };
+            let new_account_meta = AccountMeta {
+                lamports: 0,
+                ..account_meta.clone()
+            };
+            av_mmap
+                .append_ptr(
+                    &mut stored_meta_offset,
+                    ptr::from_ref(&new_stored_meta).cast(),
+                    size_of::<StoredMeta>(),
+                )
+                .unwrap();
+            av_mmap
+                .append_ptr(
+                    &mut account_meta_offset,
+                    ptr::from_ref(&new_account_meta).cast(),
+                    size_of::<AccountMeta>(),
+                )
+                .unwrap();
+            av_mmap.flush().unwrap();
+        } else {
+            panic!("append vec must be mmap");
+        }
+
+        let av_file =
+            AppendVec::new_from_file_unchecked(&path.path, av_current_len, StorageAccess::File)
+                .unwrap();
+        let mut reader = new_scan_accounts_reader();
+        for av in [&av_mmap, &av_file] {
+            let mut index = 0;
+            av.scan_accounts_stored_meta(&mut reader, |stored_account| {
+                let (pubkey, account) = &test_accounts[index];
+                let recovered = create_account_shared_data(&stored_account);
+                assert_eq!(stored_account.pubkey(), pubkey);
+                assert_eq!(recovered, *account);
+                index += 1;
+            })
+            .expect("must scan accounts storage");
+            assert_eq!(index, num_new_accounts);
+        }
+        for av in [&av_mmap, &av_file] {
+            let mut index = 0;
+            av.scan_stored_accounts_no_data(|stored_account| {
+                let (pubkey, account) = &test_accounts[index];
+                assert_eq!(stored_account.pubkey(), pubkey);
+                assert_eq!(stored_account.lamports(), account.lamports());
+                assert_eq!(stored_account.owner(), account.owner());
+                assert_eq!(stored_account.data_len(), account.data().len() as u64);
+                assert_eq!(stored_account.executable(), account.executable());
+                assert_eq!(stored_account.rent_epoch(), account.rent_epoch());
+                index += 1;
+            })
+            .expect("must scan accounts storage");
+            assert_eq!(index, num_new_accounts);
+        }
+    }
+
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_append_vec_append_many(storage_access: StorageAccess) {
         let path = get_append_vec_path("test_append_many");
-        let av = AppendVec::new(&path.path, true, 1024 * 1024);
+        let av = AppendVec::new(&path.path, true, 1024 * 1024, storage_access);
         let size = 1000;
         let mut indexes = vec![];
         let now = Instant::now();
+        let mut sizes = vec![];
         for sample in 0..size {
-            let account = create_test_account(sample);
+            // sample + 1 is so sample = 0 won't be used.
+            // sample = 0 produces default account with default pubkey
+            let account = create_test_account(sample + 1);
+            sizes.push(aligned_stored_size(account.1.data().len()));
             let pos = av.append_account_test(&account).unwrap();
             assert_eq!(av.get_account_test(pos).unwrap(), account);
-            indexes.push(pos)
+            indexes.push(pos);
+            let stored_size = av
+                .get_account_data_lens(indexes.as_slice())
+                .iter()
+                .map(|len| AppendVec::calculate_stored_size(*len))
+                .sum::<usize>();
+            assert_eq!(sizes.iter().sum::<usize>(), stored_size);
         }
-        trace!("append time: {} ms", duration_as_ms(&now.elapsed()),);
+        trace!("append time: {} ms", now.elapsed().as_millis());
 
         let now = Instant::now();
         for _ in 0..size {
             let sample = thread_rng().gen_range(0..indexes.len());
-            let account = create_test_account(sample);
+            let account = create_test_account(sample + 1);
             assert_eq!(av.get_account_test(indexes[sample]).unwrap(), account);
         }
-        trace!("random read time: {} ms", duration_as_ms(&now.elapsed()),);
-
-        let now = Instant::now();
+        trace!("random read time: {} ms", now.elapsed().as_millis());
         assert_eq!(indexes.len(), size);
         assert_eq!(indexes[0], 0);
-        let mut accounts = av.accounts(indexes[0]);
-        assert_eq!(accounts.len(), size);
-        for (sample, v) in accounts.iter_mut().enumerate() {
-            let account = create_test_account(sample);
-            let recovered = v.to_account_shared_data();
-            assert_eq!(recovered, account.1)
-        }
-        trace!(
-            "sequential read time: {} ms",
-            duration_as_ms(&now.elapsed()),
-        );
+        assert_eq!(av.accounts_count(), size);
+
+        let mut reader = new_scan_accounts_reader();
+
+        let mut sample = 0;
+        let now = Instant::now();
+        av.scan_accounts_stored_meta(&mut reader, |v| {
+            let account = create_test_account(sample + 1);
+            let recovered = create_account_shared_data(&v);
+            assert_eq!(recovered, account.1);
+            sample += 1;
+        })
+        .expect("must scan accounts storage");
+        trace!("sequential read time: {} ms", now.elapsed().as_millis());
     }
 
-    #[test]
-    fn test_new_from_file_crafted_zero_lamport_account() {
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_new_from_file_crafted_zero_lamport_account(storage_access: StorageAccess) {
         // This test verifies that when we sanitize on load, that we fail sanitizing if we load an account with zero lamports that does not have all default value fields.
         // This test writes an account with zero lamports, but with 3 bytes of data. On load, it asserts that load fails.
         // It used to be possible to use the append vec api to write an account to an append vec with zero lamports, but with non-default values for other account fields.
@@ -1134,14 +1845,14 @@ pub mod tests {
         // So, the sanitizing on load behavior can be tested by capturing [u8] that would be created if such a write was possible (as it used to be).
         // The contents of [u8] written by an append vec cannot easily or reasonably change frequently since it has released a long time.
         /*
-            solana_logger::setup();
+            agave_logger::setup();
             // uncomment this code to generate the invalid append vec that will fail on load
             let file = get_append_vec_path("test_append");
             let path = &file.path;
             let mut av = AppendVec::new(path, true, 256);
             av.set_no_remove_on_drop();
 
-            let pubkey = solana_sdk::pubkey::new_rand();
+            let pubkey = solana_pubkey::new_rand();
             let owner = Pubkey::default();
             let data_len = 3_u64;
             let mut account = AccountSharedData::new(0, data_len as usize, &owner);
@@ -1193,134 +1904,194 @@ pub mod tests {
             writer.write_all(append_vec_data.as_slice()).unwrap();
         }
 
-        let result = AppendVec::new_from_file(path, accounts_len);
+        let result = AppendVec::new_from_file(path, accounts_len, storage_access);
         assert_matches!(result, Err(ref message) if message.to_string().contains("incorrect layout/length/data"));
     }
 
-    #[test]
-    fn test_new_from_file_crafted_data_len() {
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_new_from_file_crafted_data_len(storage_access: StorageAccess) {
         let file = get_append_vec_path("test_new_from_file_crafted_data_len");
         let path = &file.path;
         let accounts_len = {
             // wrap AppendVec in ManuallyDrop to ensure we do not remove the backing file when dropped
-            let av = ManuallyDrop::new(AppendVec::new(path, true, 1024 * 1024));
-
-            let crafted_data_len = 1;
+            let av = ManuallyDrop::new(AppendVec::new(path, true, 1024 * 1024, storage_access));
 
             av.append_account_test(&create_test_account(10)).unwrap();
-
-            let accounts = av.accounts(0);
-            let StoredAccountMeta::AppendVec(account) = accounts.first().unwrap() else {
-                panic!("StoredAccountMeta can only be AppendVec in this test.");
-            };
-            account.set_data_len_unsafe(crafted_data_len);
-            assert_eq!(account.data_len(), crafted_data_len);
-
-            // Reload accounts and observe crafted_data_len
-            let accounts = av.accounts(0);
-            let account = accounts.first().unwrap();
-            assert_eq!(account.data_len(), crafted_data_len);
-
             av.flush().unwrap();
             av.len()
         };
-        let result = AppendVec::new_from_file(path, accounts_len);
+
+        // Assert that the file is currently valid.
+        {
+            let av =
+                ManuallyDrop::new(AppendVec::new_from_file(path, accounts_len, storage_access));
+            assert!(av.is_ok());
+        }
+
+        // Manually manipulate the `data_len` bytes of the first account.
+        {
+            let crafted_data_len = 1u64;
+
+            let mut file = OpenOptions::new().write(true).open(path).unwrap();
+            file.seek(SeekFrom::Start(ACCOUNT_0_DATA_LEN_OFFSET))
+                .unwrap();
+            file.write_all(&crafted_data_len.to_ne_bytes()).unwrap();
+            file.flush().unwrap();
+        }
+
+        let result = AppendVec::new_from_file(path, accounts_len, storage_access);
         assert_matches!(result, Err(ref message) if message.to_string().contains("incorrect layout/length/data"));
     }
 
-    #[test]
-    fn test_new_from_file_too_large_data_len() {
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_append_vec_reset(storage_access: StorageAccess) {
+        let file = get_append_vec_path("test_append_vec_reset");
+        let path = &file.path;
+        let av = AppendVec::new(path, true, 1024 * 1024, storage_access);
+        av.append_account_test(&create_test_account(10)).unwrap();
+
+        assert!(!av.is_empty());
+        av.reset();
+        assert_eq!(av.len(), 0);
+    }
+
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_append_vec_flush(storage_access: StorageAccess) {
+        let file = get_append_vec_path("test_append_vec_flush");
+        let path = &file.path;
+        let accounts_len = {
+            // wrap AppendVec in ManuallyDrop to ensure we do not remove the backing file when dropped
+            let av = ManuallyDrop::new(AppendVec::new(path, true, 1024 * 1024, storage_access));
+            av.append_account_test(&create_test_account(10)).unwrap();
+            av.len()
+        };
+
+        let (av, num_account) =
+            AppendVec::new_from_file(path, accounts_len, storage_access).unwrap();
+        av.flush().unwrap();
+        assert_eq!(num_account, 1);
+    }
+
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_append_vec_reopen_as_readonly(storage_access: StorageAccess) {
+        let file = get_append_vec_path("test_append_vec_flush");
+        let path = &file.path;
+        let accounts_len = {
+            let av = AppendVec::new(path, true, 1024 * 1024, storage_access);
+            av.append_account_test(&create_test_account(10)).unwrap();
+            // wrap AppendVec in ManuallyDrop to ensure we do not remove the backing file when dropped
+            let ro_av = ManuallyDrop::new(
+                av.reopen_as_readonly_file_io()
+                    .expect("appendable AppendVec should always re-open as read-only"),
+            );
+            ro_av.len()
+        };
+
+        let (av, _) = AppendVec::new_from_file(path, accounts_len, storage_access).unwrap();
+        let reopen = av.reopen_as_readonly_file_io();
+        // even if AppendVec is already read-only, but uses mmap, it should reopen as file_io
+        if storage_access == StorageAccess::File {
+            assert!(reopen.is_none());
+        } else {
+            assert!(reopen.is_some());
+        }
+    }
+
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_new_from_file_too_large_data_len(storage_access: StorageAccess) {
         let file = get_append_vec_path("test_new_from_file_too_large_data_len");
         let path = &file.path;
         let accounts_len = {
             // wrap AppendVec in ManuallyDrop to ensure we do not remove the backing file when dropped
-            let av = ManuallyDrop::new(AppendVec::new(path, true, 1024 * 1024));
+            let av = ManuallyDrop::new(AppendVec::new(path, true, 1024 * 1024, storage_access));
 
-            let too_large_data_len = u64::max_value();
             av.append_account_test(&create_test_account(10)).unwrap();
-
-            let accounts = av.accounts(0);
-            let StoredAccountMeta::AppendVec(account) = accounts.first().unwrap() else {
-                panic!("StoredAccountMeta can only be AppendVec in this test.");
-            };
-            account.set_data_len_unsafe(too_large_data_len);
-            assert_eq!(account.data_len(), too_large_data_len);
-
-            // Reload accounts and observe no account with bad offset
-            let accounts = av.accounts(0);
-            assert_matches!(accounts.first(), None);
 
             av.flush().unwrap();
             av.len()
         };
-        let result = AppendVec::new_from_file(path, accounts_len);
+
+        // Assert that the file is currently valid.
+        {
+            let av =
+                ManuallyDrop::new(AppendVec::new_from_file(path, accounts_len, storage_access));
+            assert!(av.is_ok());
+        }
+
+        // Manually manipulate the `data_len` bytes of the first account.
+        {
+            let too_large_data_len = u64::MAX;
+
+            let mut file = OpenOptions::new().write(true).open(path).unwrap();
+            file.seek(SeekFrom::Start(ACCOUNT_0_DATA_LEN_OFFSET))
+                .unwrap();
+            file.write_all(&too_large_data_len.to_ne_bytes()).unwrap();
+            file.flush().unwrap();
+        }
+
+        let result = AppendVec::new_from_file(path, accounts_len, storage_access);
         assert_matches!(result, Err(ref message) if message.to_string().contains("incorrect layout/length/data"));
     }
 
-    #[test]
-    fn test_new_from_file_crafted_executable() {
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_new_from_file_crafted_executable(storage_access: StorageAccess) {
         let file = get_append_vec_path("test_new_from_crafted_executable");
         let path = &file.path;
+
+        // Write a valid append vec file.
         let accounts_len = {
             // wrap AppendVec in ManuallyDrop to ensure we do not remove the backing file when dropped
-            let av = ManuallyDrop::new(AppendVec::new(path, true, 1024 * 1024));
+            let av = ManuallyDrop::new(AppendVec::new(path, true, 1024 * 1024, storage_access));
             av.append_account_test(&create_test_account(10)).unwrap();
-            {
+            let offset_1 = {
                 let mut executable_account = create_test_account(10);
                 executable_account.1.set_executable(true);
-                av.append_account_test(&executable_account).unwrap();
-            }
+                av.append_account_test(&executable_account).unwrap()
+            };
 
             // reload accounts
-            let accounts = av.accounts(0);
-
             // ensure false is 0u8 and true is 1u8 actually
-            assert_eq!(*accounts[0].ref_executable_byte(), 0);
-            assert_eq!(*accounts[1].ref_executable_byte(), 1);
-
-            let StoredAccountMeta::AppendVec(account) = &accounts[0] else {
-                panic!("StoredAccountMeta can only be AppendVec in this test.");
-            };
-            let crafted_executable = u8::max_value() - 1;
-
-            account.set_executable_as_byte(crafted_executable);
-
-            // reload crafted accounts
-            let accounts = av.accounts(0);
-            let StoredAccountMeta::AppendVec(account) = accounts.first().unwrap() else {
-                panic!("StoredAccountMeta can only be AppendVec in this test.");
-            };
-
-            // upper 7-bits are not 0, so sanitization should fail
-            assert!(!account.sanitize_executable());
-
-            // we can observe crafted value by ref
-            {
-                let executable_bool: &bool = &account.account_meta.executable;
-                // Depending on use, *executable_bool can be truthy or falsy due to direct memory manipulation
-                // assert_eq! thinks *executable_bool is equal to false but the if condition thinks it's not, contradictorily.
-                assert!(!*executable_bool);
-                #[cfg(not(target_arch = "aarch64"))]
-                {
-                    const FALSE: bool = false; // keep clippy happy
-                    if *executable_bool == FALSE {
-                        panic!("This didn't occur if this test passed.");
-                    }
-                }
-                assert_eq!(*account.ref_executable_byte(), crafted_executable);
-            }
-
-            // we can NOT observe crafted value by value
-            {
-                let executable_bool: bool = account.executable();
-                assert!(!executable_bool);
-                assert_eq!(account.get_executable_byte(), 0); // Wow, not crafted_executable!
-            }
+            av.get_stored_account_no_data_callback(0, |account| {
+                assert_eq!(*account.ref_executable_byte(), 0);
+            })
+            .unwrap();
+            av.get_stored_account_no_data_callback(offset_1, |account| {
+                assert_eq!(*account.ref_executable_byte(), 1);
+            })
+            .unwrap();
 
             av.flush().unwrap();
             av.len()
         };
-        let result = AppendVec::new_from_file(path, accounts_len);
+
+        // Assert that the file is currently valid.
+        {
+            let av =
+                ManuallyDrop::new(AppendVec::new_from_file(path, accounts_len, storage_access));
+            assert!(av.is_ok());
+        }
+
+        // Manually manipulate the `executable` byte of the first account.
+        {
+            const ACCOUNT_0_EXECUTABLE_OFFSET: u64 = (core::mem::size_of::<StoredMeta>()
+                + core::mem::offset_of!(AccountMeta, executable))
+                as u64;
+            let crafted_executable = u8::MAX - 1;
+
+            let mut file = OpenOptions::new().write(true).open(path).unwrap();
+            file.seek(SeekFrom::Start(ACCOUNT_0_EXECUTABLE_OFFSET))
+                .unwrap();
+            file.write_all(&[crafted_executable]).unwrap();
+            file.flush().unwrap();
+        }
+
+        let result = AppendVec::new_from_file(path, accounts_len, storage_access);
         assert_matches!(result, Err(ref message) if message.to_string().contains("incorrect layout/length/data"));
     }
 
@@ -1336,5 +2107,467 @@ pub mod tests {
         assert_eq!(offset_of!(AccountMeta, owner), 0x10);
         assert_eq!(offset_of!(AccountMeta, executable), 0x30);
         assert_eq!(mem::size_of::<AccountMeta>(), 0x38);
+    }
+
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_get_account_shared_data_from_truncated_file(storage_access: StorageAccess) {
+        let file = get_append_vec_path("test_get_account_shared_data_from_truncated_file");
+        let path = &file.path;
+
+        {
+            // Set up a test account with data_len larger than PAGE_SIZE (i.e.
+            // AppendVec internal buffer size is PAGESIZE).
+            let data_len: usize = 2 * PAGE_SIZE;
+            let account = create_test_account_with(data_len);
+            // wrap AppendVec in ManuallyDrop to ensure we do not remove the backing file when dropped
+            let av = ManuallyDrop::new(AppendVec::new(
+                path,
+                true,
+                aligned_stored_size(data_len),
+                storage_access,
+            ));
+            av.append_account_test(&account).unwrap();
+            av.flush().unwrap();
+        }
+
+        // Truncate the AppendVec to PAGESIZE. This will cause get_account* to fail to load the account.
+        let truncated_accounts_len: usize = PAGE_SIZE;
+        let av = AppendVec::new_from_file_unchecked(path, truncated_accounts_len, storage_access)
+            .unwrap();
+        let account = av.get_account_shared_data(0);
+        assert!(account.is_none()); // Expect None to be returned.
+
+        let result = av.get_stored_account_meta_callback(0, |_| true);
+        assert!(result.is_none()); // Expect None to be returned.
+    }
+
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_get_account_sizes(storage_access: StorageAccess) {
+        const NUM_ACCOUNTS: usize = 37;
+        let pubkeys: Vec<_> = std::iter::repeat_with(Pubkey::new_unique)
+            .take(NUM_ACCOUNTS)
+            .collect();
+
+        let mut rng = thread_rng();
+        let mut accounts = Vec::with_capacity(pubkeys.len());
+        let mut stored_sizes = Vec::with_capacity(pubkeys.len());
+        for _ in &pubkeys {
+            let lamports = rng.gen();
+            let data_len = rng.gen_range(0..MAX_PERMITTED_DATA_LENGTH) as usize;
+            let account = AccountSharedData::new(lamports, data_len, &Pubkey::default());
+            accounts.push(account);
+            stored_sizes.push(aligned_stored_size(data_len));
+        }
+        let accounts = accounts;
+        let stored_sizes = stored_sizes;
+        let total_stored_size = stored_sizes.iter().sum();
+
+        let temp_file = get_append_vec_path("test_get_account_sizes");
+        let account_offsets = {
+            let append_vec =
+                AppendVec::new(&temp_file.path, true, total_stored_size, storage_access);
+            // wrap AppendVec in ManuallyDrop to ensure we do not remove the backing file when dropped
+            let append_vec = ManuallyDrop::new(append_vec);
+            let slot = 77; // the specific slot does not matter
+            let storable_accounts: Vec<_> = std::iter::zip(&pubkeys, &accounts).collect();
+            let stored_accounts_info = append_vec
+                .append_accounts(&(slot, storable_accounts.as_slice()), 0)
+                .unwrap();
+            append_vec.flush().unwrap();
+            stored_accounts_info.offsets
+        };
+
+        // now open the append vec with the given storage access method
+        // then get the account sizes to ensure they are correct
+        let (append_vec, _) =
+            AppendVec::new_from_file(&temp_file.path, total_stored_size, storage_access).unwrap();
+
+        let account_sizes = append_vec
+            .get_account_data_lens(account_offsets.as_slice())
+            .iter()
+            .map(|len| AppendVec::calculate_stored_size(*len))
+            .sum::<usize>();
+        assert_eq!(account_sizes, total_stored_size);
+    }
+
+    /// A helper function for testing different scenario for scan_*.
+    ///
+    /// `modify_fn` is used to (optionally) modify the append vec before checks are performed.
+    /// `check_fn` performs the check for the scan.
+    fn test_scan_helper(
+        storage_access: StorageAccess,
+        modify_fn: impl Fn(&PathBuf, usize) -> usize,
+        check_fn: impl Fn(&AppendVec, &[Pubkey], &[usize], &[AccountSharedData]),
+    ) {
+        const NUM_ACCOUNTS: usize = 37;
+        let pubkeys: Vec<_> = std::iter::repeat_with(solana_pubkey::new_rand)
+            .take(NUM_ACCOUNTS)
+            .collect();
+
+        let mut rng = ChaChaRng::seed_from_u64(1337);
+        let mut accounts = Vec::with_capacity(pubkeys.len());
+        let mut total_stored_size = 0;
+        for _ in &pubkeys {
+            let lamports = rng.gen();
+            let data_len = rng.gen_range(0..MAX_PERMITTED_DATA_LENGTH) as usize;
+            let account = AccountSharedData::new(lamports, data_len, &Pubkey::default());
+            accounts.push(account);
+            total_stored_size += aligned_stored_size(data_len);
+        }
+        let accounts = accounts;
+        let total_stored_size = total_stored_size;
+
+        let temp_file = get_append_vec_path("test_scan");
+        let account_offsets = {
+            // wrap AppendVec in ManuallyDrop to ensure we do not remove the backing file when dropped
+            let append_vec = ManuallyDrop::new(AppendVec::new(
+                &temp_file.path,
+                true,
+                total_stored_size,
+                storage_access,
+            ));
+            let slot = 42; // the specific slot does not matter
+            let storable_accounts: Vec<_> = std::iter::zip(&pubkeys, &accounts).collect();
+            let stored_accounts_info = append_vec
+                .append_accounts(&(slot, storable_accounts.as_slice()), 0)
+                .unwrap();
+            append_vec.flush().unwrap();
+            stored_accounts_info.offsets
+        };
+
+        let total_stored_size = modify_fn(&temp_file.path, total_stored_size);
+        // now open the append vec with the given storage access method
+        // then perform the scan and check it is correct
+        let append_vec = ManuallyDrop::new(
+            AppendVec::new_from_file_unchecked(&temp_file.path, total_stored_size, storage_access)
+                .unwrap(),
+        );
+
+        check_fn(&append_vec, &pubkeys, &account_offsets, &accounts);
+    }
+
+    /// A helper fn to test `scan_pubkeys`.
+    fn test_scan_pubkeys_helper(
+        storage_access: StorageAccess,
+        modify_fn: impl Fn(&PathBuf, usize) -> usize,
+    ) {
+        test_scan_helper(
+            storage_access,
+            modify_fn,
+            |append_vec, pubkeys, _account_offsets, _accounts| {
+                let mut i = 0;
+                append_vec
+                    .scan_pubkeys(|pubkey| {
+                        assert_eq!(pubkey, pubkeys.get(i).unwrap());
+                        i += 1;
+                    })
+                    .expect("must scan accounts storage");
+                assert_eq!(i, pubkeys.len());
+            },
+        )
+    }
+
+    /// Test `scan_pubkey` for a valid account storage.
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_scan_pubkeys(storage_access: StorageAccess) {
+        test_scan_pubkeys_helper(storage_access, |_, size| size);
+    }
+
+    /// Test `scan_pubkey` for storage with incomplete account meta data.
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_scan_pubkeys_incomplete_data(storage_access: StorageAccess) {
+        test_scan_pubkeys_helper(storage_access, |path, size| {
+            // Append 1 byte of data at the end of the storage file to simulate
+            // incomplete account's meta data.
+            let mut f = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            f.write_all(&[0xFF]).unwrap();
+            size + 1
+        });
+    }
+
+    /// Test `scan_pubkey` for storage which is missing the last account data
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_scan_pubkeys_missing_account_data(storage_access: StorageAccess) {
+        test_scan_pubkeys_helper(storage_access, |path, size| {
+            let fake_stored_meta = StoredMeta {
+                write_version_obsolete: 0,
+                data_len: 100,
+                pubkey: solana_pubkey::new_rand(),
+            };
+            let fake_account_meta = AccountMeta {
+                lamports: 100,
+                rent_epoch: 10,
+                owner: solana_pubkey::new_rand(),
+                executable: false,
+            };
+
+            let stored_meta_slice: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    (&fake_stored_meta as *const StoredMeta) as *const u8,
+                    mem::size_of::<StoredMeta>(),
+                )
+            };
+            let account_meta_slice: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    (&fake_account_meta as *const AccountMeta) as *const u8,
+                    mem::size_of::<AccountMeta>(),
+                )
+            };
+
+            let mut f = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+
+            f.write_all(stored_meta_slice).unwrap();
+            f.write_all(account_meta_slice).unwrap();
+
+            size + mem::size_of::<StoredMeta>() + mem::size_of::<AccountMeta>()
+        });
+    }
+
+    /// A helper fn to test scan_stored_accounts_no_data
+    fn test_scan_stored_accounts_no_data_helper(
+        storage_access: StorageAccess,
+        modify_fn: impl Fn(&PathBuf, usize) -> usize,
+    ) {
+        test_scan_helper(
+            storage_access,
+            modify_fn,
+            |append_vec, pubkeys, account_offsets, accounts| {
+                let mut i = 0;
+                append_vec
+                    .scan_stored_accounts_no_data(|stored_account| {
+                        let pubkey = pubkeys.get(i).unwrap();
+                        let account = accounts.get(i).unwrap();
+                        let offset = account_offsets.get(i).unwrap();
+
+                        assert_eq!(
+                            stored_account.stored_size,
+                            aligned_stored_size(account.data().len()),
+                        );
+                        assert_eq!(stored_account.offset(), *offset);
+                        assert_eq!(stored_account.pubkey(), pubkey);
+                        assert_eq!(stored_account.lamports(), account.lamports());
+                        assert_eq!(stored_account.data_len(), account.data().len() as u64);
+
+                        i += 1;
+                    })
+                    .expect("must scan accounts storage");
+                assert_eq!(i, accounts.len());
+            },
+        )
+    }
+
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_scan_stored_accounts_no_data(storage_access: StorageAccess) {
+        test_scan_stored_accounts_no_data_helper(storage_access, |_, size| size);
+    }
+
+    /// Test `scan_stored_accounts_no_data` for storage with incomplete account meta data.
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_scan_stored_accounts_no_data_incomplete_data(storage_access: StorageAccess) {
+        test_scan_stored_accounts_no_data_helper(storage_access, |path, size| {
+            // Append 1 byte of data at the end of the storage file to simulate
+            // incomplete account's meta data.
+            let mut f = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            f.write_all(&[0xFF]).unwrap();
+            size + 1
+        });
+    }
+
+    /// Test `scan_stored_accounts_no_data` for storage which is missing the last account data
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_scan_stored_accounts_no_data_missing_account_data(storage_access: StorageAccess) {
+        test_scan_stored_accounts_no_data_helper(storage_access, |path, size| {
+            let fake_stored_meta = StoredMeta {
+                write_version_obsolete: 0,
+                data_len: 100,
+                pubkey: solana_pubkey::new_rand(),
+            };
+            let fake_account_meta = AccountMeta {
+                lamports: 100,
+                rent_epoch: 10,
+                owner: solana_pubkey::new_rand(),
+                executable: false,
+            };
+
+            let stored_meta_slice: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    (&fake_stored_meta as *const StoredMeta) as *const u8,
+                    mem::size_of::<StoredMeta>(),
+                )
+            };
+            let account_meta_slice: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    (&fake_account_meta as *const AccountMeta) as *const u8,
+                    mem::size_of::<AccountMeta>(),
+                )
+            };
+
+            let mut f = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+
+            f.write_all(stored_meta_slice).unwrap();
+            f.write_all(account_meta_slice).unwrap();
+
+            size + mem::size_of::<StoredMeta>() + mem::size_of::<AccountMeta>()
+        });
+    }
+
+    /// A helper fn to test scan_accounts_stored_meta
+    ///
+    /// `modify_fn` is used to (optionally) modify the append vec before checks are performed.
+    fn test_scan_accounts_stored_meta_helper(
+        storage_access: StorageAccess,
+        modify_fn: impl Fn(&PathBuf, usize) -> usize,
+    ) {
+        test_scan_helper(
+            storage_access,
+            modify_fn,
+            |append_vec, pubkeys, account_offsets, accounts| {
+                let mut reader = new_scan_accounts_reader();
+                let mut i = 0;
+                append_vec
+                    .scan_accounts_stored_meta(&mut reader, |stored_account| {
+                        let pubkey = pubkeys.get(i).unwrap();
+                        let offset = account_offsets.get(i).unwrap();
+                        let account = accounts.get(i).unwrap();
+
+                        assert_eq!(stored_account.pubkey(), pubkey);
+                        assert_eq!(stored_account.offset(), *offset);
+                        assert!(accounts_equal(&stored_account, account));
+
+                        i += 1;
+                    })
+                    .expect("must scan accounts storage");
+                assert_eq!(i, accounts.len());
+            },
+        )
+    }
+
+    /// Test `scan_accounts_stored_meta` for a normal/good storage.
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_scan_accounts_stored_meta(storage_access: StorageAccess) {
+        test_scan_accounts_stored_meta_helper(storage_access, |_, size| size);
+    }
+
+    /// Test `scan_accounts_stored_meta` for a storage with incomplete account meta data.
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_scan_accounts_stored_meta_incomplete_meta_data(storage_access: StorageAccess) {
+        test_scan_accounts_stored_meta_helper(storage_access, |path, size| {
+            // Append 1 byte of data at the end of the storage file to simulate
+            // incomplete account's meta data.
+            let mut f = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            f.write_all(&[0xFF]).unwrap();
+            size + 1
+        });
+    }
+
+    /// Test `scan_accounts_stored_meta` for a storage that is missing the last account data.
+    #[test_case(StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_scan_accounts_stored_meta_missing_account_data(storage_access: StorageAccess) {
+        test_scan_accounts_stored_meta_helper(storage_access, |path, size| {
+            let fake_stored_meta = StoredMeta {
+                write_version_obsolete: 0,
+                data_len: 100,
+                pubkey: solana_pubkey::new_rand(),
+            };
+            let fake_account_meta = AccountMeta {
+                lamports: 100,
+                rent_epoch: 10,
+                owner: solana_pubkey::new_rand(),
+                executable: false,
+            };
+
+            let stored_meta_slice: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    (&fake_stored_meta as *const StoredMeta) as *const u8,
+                    mem::size_of::<StoredMeta>(),
+                )
+            };
+            let account_meta_slice: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    (&fake_account_meta as *const AccountMeta) as *const u8,
+                    mem::size_of::<AccountMeta>(),
+                )
+            };
+
+            let mut f = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+
+            f.write_all(stored_meta_slice).unwrap();
+            f.write_all(account_meta_slice).unwrap();
+
+            size + mem::size_of::<StoredMeta>() + mem::size_of::<AccountMeta>()
+        });
+    }
+
+    // Test to make sure that `is_dirty` is tracked properly
+    // * `reopen_as_readonly()` moves `is_dirty`
+    // * `flush()` clears `is_dirty`
+    #[test_matrix([false, true], [StorageAccess::Mmap, StorageAccess::File])]
+    fn test_is_dirty(begins_dirty: bool, storage_access: StorageAccess) {
+        let file = get_append_vec_path("test_is_dirty");
+
+        let mut av1 = AppendVec::new(&file.path, true, 1024 * 1024, storage_access);
+        // don't delete the file when the AppendVec is dropped (let TempFile do it)
+        *av1.remove_file_on_drop.get_mut() = false;
+
+        // ensure the append vec begins not dirty
+        assert!(!*av1.is_dirty.get_mut());
+
+        if begins_dirty {
+            av1.append_account_test(&create_test_account(10)).unwrap();
+        }
+        assert_eq!(*av1.is_dirty.get_mut(), begins_dirty);
+
+        let mut av2 = av1.reopen_as_readonly_file_io().unwrap();
+        // don't delete the file when the AppendVec is dropped (let TempFile do it)
+        *av2.remove_file_on_drop.get_mut() = false;
+
+        // ensure `is_dirty` is moved
+        assert!(!*av1.is_dirty.get_mut());
+        assert_eq!(*av2.is_dirty.get_mut(), begins_dirty);
+
+        // ensure we can flush the new append vec
+        assert!(av2.flush().is_ok());
+        // and now should not be dirty
+        assert!(!*av2.is_dirty.get_mut());
+
+        // ensure we can flush the old append vec too
+        assert!(av1.flush().is_ok());
+        // and now should not be dirty
+        assert!(!*av1.is_dirty.get_mut());
     }
 }

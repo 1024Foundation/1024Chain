@@ -23,6 +23,7 @@ ignores=(
   .cargo
   target
   node_modules
+  ci/xtask
 )
 
 not_paths=()
@@ -93,7 +94,7 @@ check)
   exit 0
   ;;
 -*)
-  if [[ $1 =~ ^-[A-Za-z0-9]*$ ]]; then
+  if [[ $1 =~ ^-[\.A-Za-z0-9]*$ ]]; then
     SPECIAL="$1"
   else
     echo "Error: Unsupported characters found in $1"
@@ -121,15 +122,15 @@ newVersion="$MAJOR.$MINOR.$PATCH$SPECIAL"
 
 # Update all the Cargo.toml files
 for Cargo_toml in "${Cargo_tomls[@]}"; do
-  # ignore when version inheritant from workspace (exclude programs/sbf/Cargo.toml)
-  if grep "^version = { workspace = true }" "$Cargo_toml" &>/dev/null && Cargo_toml && ! [[ $Cargo_toml =~ programs/sbf/Cargo.toml ]]; then
+  if ! grep "$currentVersion" "$Cargo_toml"; then
+    echo "$Cargo_toml (skipped)"
     continue
   fi
 
   # Set new crate version
   (
     set -x
-    sed -i "$Cargo_toml" -e "0,/^version =/{s/^version = \"[^\"]*\"$/version = \"$newVersion\"/}"
+    sed -i "$Cargo_toml" -e "s/^version = \"$currentVersion\"$/version = \"$newVersion\"/"
   )
 
   # Fix up the version references to other internal crates
