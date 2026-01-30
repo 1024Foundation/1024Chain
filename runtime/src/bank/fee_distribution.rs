@@ -97,13 +97,37 @@ impl Bank {
         FeeDistribution { deposit, burn }
     }
 
-    const fn burn_percent(&self) -> u64 {
-        // NOTE: burn percent is statically 50%, in case it needs to change in the future,
-        // burn_percent can be bank property that being passed down from bank to bank, without
-        // needing fee-rate-governor
-        static_assertions::const_assert!(solana_fee_calculator::DEFAULT_BURN_PERCENT <= 100);
+    /// Returns the fee burn percentage based on active Feature Gates.
+    /// 
+    /// 1024Chain Economic Model:
+    /// - Default: 0% burn (100% to Leader)
+    /// - Can be adjusted via Feature Gate activation
+    /// 
+    /// Priority order (highest active wins):
+    /// 100% > 75% > 50% > 25% > 10% > 0%
+    fn burn_percent(&self) -> u64 {
+        use agave_feature_set::{
+            fee_burn_10_percent, fee_burn_25_percent,
+            fee_burn_50_percent, fee_burn_75_percent, fee_burn_100_percent,
+        };
 
-        solana_fee_calculator::DEFAULT_BURN_PERCENT as u64
+        // Check from highest to lowest, first active wins
+        // Note: fee_burn_0_percent is not checked as it's the default
+        if self.feature_set.is_active(&fee_burn_100_percent::id()) {
+            100
+        } else if self.feature_set.is_active(&fee_burn_75_percent::id()) {
+            75
+        } else if self.feature_set.is_active(&fee_burn_50_percent::id()) {
+            50
+        } else if self.feature_set.is_active(&fee_burn_25_percent::id()) {
+            25
+        } else if self.feature_set.is_active(&fee_burn_10_percent::id()) {
+            10
+        } else {
+            // 1024Chain default: 0% burn (100% to Leader)
+            // This differs from Solana's default of 50%
+            0
+        }
     }
 
     /// Attempts to deposit the given `deposit` amount into the fee collector account.
@@ -357,15 +381,31 @@ pub mod tests {
 
     #[test]
     fn test_distribute_transaction_fee_details_normal() {
+        use agave_feature_set::{
+            fee_burn_10_percent, fee_burn_25_percent,
+            fee_burn_50_percent, fee_burn_75_percent, fee_burn_100_percent,
+        };
+
         let genesis = create_genesis_config(0);
         let mut bank = Bank::new_for_tests(&genesis.genesis_config);
+        
+        // Disable all fee burn features to test 1024Chain default (0% burn)
+        let mut feature_set = (*bank.feature_set).clone();
+        feature_set.deactivate(&fee_burn_10_percent::id());
+        feature_set.deactivate(&fee_burn_25_percent::id());
+        feature_set.deactivate(&fee_burn_50_percent::id());
+        feature_set.deactivate(&fee_burn_75_percent::id());
+        feature_set.deactivate(&fee_burn_100_percent::id());
+        bank.feature_set = std::sync::Arc::new(feature_set);
+
         let transaction_fee = 100;
         let priority_fee = 200;
         bank.collector_fee_details = RwLock::new(CollectorFeeDetails {
             transaction_fee,
             priority_fee,
         });
-        let expected_burn = transaction_fee * bank.burn_percent() / 100;
+        // 1024Chain default: 0% burn (all fees go to leader)
+        let expected_burn = 0;
         let expected_rewards = transaction_fee - expected_burn + priority_fee;
 
         let initial_capitalization = bank.capitalization();
@@ -453,5 +493,62 @@ pub mod tests {
             locked_rewards.is_empty(),
             "There should be no rewards distributed"
         );
+    }
+
+    #[test]
+    fn test_fee_burn_feature_gate() {
+        use agave_feature_set::{
+            fee_burn_10_percent, fee_burn_25_percent,
+            fee_burn_50_percent, fee_burn_75_percent, fee_burn_100_percent,
+        };
+
+        let genesis = create_genesis_config(0);
+        let fee_details = CollectorFeeDetails {
+            transaction_fee: 1000,
+            priority_fee: 500,
+        };
+
+        // Test default (0% burn for 1024Chain) - need to disable all fee burn features
+        let mut bank = Bank::new_for_tests(&genesis.genesis_config);
+        let mut feature_set = (*bank.feature_set).clone();
+        feature_set.deactivate(&fee_burn_10_percent::id());
+        feature_set.deactivate(&fee_burn_25_percent::id());
+        feature_set.deactivate(&fee_burn_50_percent::id());
+        feature_set.deactivate(&fee_burn_75_percent::id());
+        feature_set.deactivate(&fee_burn_100_percent::id());
+        bank.feature_set = std::sync::Arc::new(feature_set);
+
+        let distribution = bank.calculate_reward_and_burn_fee_details(&fee_details);
+        // Default: 0% burn, so all transaction fee goes to leader
+        assert_eq!(distribution.burn, 0);
+        assert_eq!(distribution.deposit, 1500); // 1000 + 500
+
+        // Test with only 50% burn feature activated
+        let mut bank_50 = Bank::new_for_tests(&genesis.genesis_config);
+        let mut feature_set_50 = (*bank_50.feature_set).clone();
+        feature_set_50.deactivate(&fee_burn_10_percent::id());
+        feature_set_50.deactivate(&fee_burn_25_percent::id());
+        // Keep 50% active
+        feature_set_50.deactivate(&fee_burn_75_percent::id());
+        feature_set_50.deactivate(&fee_burn_100_percent::id());
+        bank_50.feature_set = std::sync::Arc::new(feature_set_50);
+
+        let distribution_50 = bank_50.calculate_reward_and_burn_fee_details(&fee_details);
+        assert_eq!(distribution_50.burn, 500); // 50% of 1000
+        assert_eq!(distribution_50.deposit, 1000); // 500 remaining + 500 priority
+
+        // Test priority: higher burn percentage takes precedence (75% vs 25%)
+        let mut bank_priority = Bank::new_for_tests(&genesis.genesis_config);
+        let mut feature_set_priority = (*bank_priority.feature_set).clone();
+        feature_set_priority.deactivate(&fee_burn_10_percent::id());
+        // Keep 25% active
+        feature_set_priority.deactivate(&fee_burn_50_percent::id());
+        // Keep 75% active - this should win
+        feature_set_priority.deactivate(&fee_burn_100_percent::id());
+        bank_priority.feature_set = std::sync::Arc::new(feature_set_priority);
+
+        let distribution_priority = bank_priority.calculate_reward_and_burn_fee_details(&fee_details);
+        assert_eq!(distribution_priority.burn, 750); // 75% of 1000
+        assert_eq!(distribution_priority.deposit, 750); // 250 remaining + 500 priority
     }
 }

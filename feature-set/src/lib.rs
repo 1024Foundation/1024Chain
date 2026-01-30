@@ -1203,6 +1203,38 @@ pub mod relax_programdata_account_check_migration {
     solana_pubkey::declare_id!("rexav5eNTUSNT1K2N7cfRjnthwhcP5BC25v2tA4rW4h");
 }
 
+// =============================================================================
+// 1024Chain Fee Burn Features
+// =============================================================================
+// Control the percentage of transaction fees that are burned vs rewarded to leader.
+// Only one should be active at a time; highest active percentage takes precedence.
+// Default: 0% burn (100% to Leader) - 1024Chain's initial economic model
+// =============================================================================
+
+pub mod fee_burn_0_percent {
+    solana_pubkey::declare_id!("FeFi2g1S6k5TDhuMh7JRLfUdRUSC9YLPZgyb9VnfhA85");
+}
+
+pub mod fee_burn_10_percent {
+    solana_pubkey::declare_id!("ANckpf1r4tY7c7xawj5jurmSt3LvgNrKKhH1CHjfw7jd");
+}
+
+pub mod fee_burn_25_percent {
+    solana_pubkey::declare_id!("6P5LdPJMEPCdiire95wQdYKZCeoEieNfG567FWYyrBhm");
+}
+
+pub mod fee_burn_50_percent {
+    solana_pubkey::declare_id!("ConozrJBymmHkY96sVYW8aY8JFKQ72N19DVsSZaVWyoh");
+}
+
+pub mod fee_burn_75_percent {
+    solana_pubkey::declare_id!("3TqTnCxdkJEZ4GRWNhX8QCVJNMPih1HUnTc7TA1eCss8");
+}
+
+pub mod fee_burn_100_percent {
+    solana_pubkey::declare_id!("5a6eYqtytjSsWkUsL5BJwCpJJZz8jjA4B5kE6GYJxWnh");
+}
+
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
     [
         (secp256k1_program_enabled::id(), "secp256k1 program"),
@@ -2157,6 +2189,31 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             relax_programdata_account_check_migration::id(),
             "SIMD-0444: Relax program data account check in migration",
+        ),
+        // 1024Chain Fee Burn Features
+        (
+            fee_burn_0_percent::id(),
+            "1024Chain: 0% fee burn (100% to Leader) - default",
+        ),
+        (
+            fee_burn_10_percent::id(),
+            "1024Chain: 10% fee burn (90% to Leader)",
+        ),
+        (
+            fee_burn_25_percent::id(),
+            "1024Chain: 25% fee burn (75% to Leader)",
+        ),
+        (
+            fee_burn_50_percent::id(),
+            "1024Chain: 50% fee burn (50% to Leader) - Solana default",
+        ),
+        (
+            fee_burn_75_percent::id(),
+            "1024Chain: 75% fee burn (25% to Leader)",
+        ),
+        (
+            fee_burn_100_percent::id(),
+            "1024Chain: 100% fee burn (0% to Leader)",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
     ]
