@@ -1572,7 +1572,7 @@ impl fmt::Display for CliStakeHistory {
                 if self.use_lamports_unit {
                     "lamports"
                 } else {
-                    "SOL"
+                    "N1024"
                 }
             )?;
         }
@@ -2057,7 +2057,7 @@ impl fmt::Display for CliAccountBalances {
                 "{:<44}  {}",
                 account.address,
                 &format!(
-                    "{} SOL",
+                    "{} N1024",
                     build_balance_message(account.lamports, false, false)
                 ),
             )?;
@@ -2097,13 +2097,13 @@ impl fmt::Display for CliSupply {
         writeln_name_value(
             f,
             "Total:",
-            &format!("{} SOL", build_balance_message(self.total, false, false)),
+            &format!("{} N1024", build_balance_message(self.total, false, false)),
         )?;
         writeln_name_value(
             f,
             "Circulating:",
             &format!(
-                "{} SOL",
+                "{} N1024",
                 build_balance_message(self.circulating, false, false)
             ),
         )?;
@@ -2111,7 +2111,7 @@ impl fmt::Display for CliSupply {
             f,
             "Non-Circulating:",
             &format!(
-                "{} SOL",
+                "{} N1024",
                 build_balance_message(self.non_circulating, false, false)
             ),
         )?;
@@ -3573,7 +3573,7 @@ mod tests {
         };
         #[rustfmt::skip]
         let expected_output_common =
-            "Account Balance: 0.00001 SOL\n\
+            "Account Balance: 0.00001 N1024\n\
              Validator Identity: 11111111111111111111111111111111\n\
              Vote Authority: None\n\
              Withdraw Authority: \n\
@@ -3583,7 +3583,7 @@ mod tests {
              Inflation Rewards Collector: \n\
              Block Revenue Collector: \n\
              Block Revenue Commission: 0 basis points\n\
-             Pending Delegator Rewards: 0 SOL\n\
+             Pending Delegator Rewards: 0 N1024\n\
              Root Slot: ~\n\
              Recent Timestamp: 1970-01-01T00:00:00Z from slot 0\n";
 

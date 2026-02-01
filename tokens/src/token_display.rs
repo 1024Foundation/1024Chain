@@ -7,11 +7,12 @@ use {
     },
 };
 
-const SOL_SYMBOL: &str = "◎";
+/// N1024 native token symbol (same as Solana's ◎ symbol)
+const N1024_SYMBOL: &str = "◎";
 
 #[derive(PartialEq, Eq)]
 pub enum TokenType {
-    Sol,
+    N1024,
     SplToken,
 }
 
@@ -24,9 +25,9 @@ pub struct Token {
 impl Token {
     fn write_with_symbol(&self, f: &mut Formatter) -> Result {
         match &self.token_type {
-            TokenType::Sol => {
+            TokenType::N1024 => {
                 let amount = build_balance_message(self.amount, false, false);
-                write!(f, "{SOL_SYMBOL}{amount}")
+                write!(f, "{N1024_SYMBOL}{amount}")
             }
             TokenType::SplToken => {
                 let amount = real_number_string_trimmed(self.amount, self.decimals);
@@ -35,11 +36,11 @@ impl Token {
         }
     }
 
-    pub fn sol(amount: u64) -> Self {
+    pub fn n1024(amount: u64) -> Self {
         Self {
             amount,
             decimals: 9,
-            token_type: TokenType::Sol,
+            token_type: TokenType::N1024,
         }
     }
 

@@ -270,7 +270,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let balances = get_balances(&client, addresses)?;
             let lamports: u64 = balances.into_iter().map(|(_, bal)| bal).sum();
             let sol = build_balance_message(lamports, false, false);
-            println!("{sol} SOL");
+            println!("{sol} N1024");
         }
         Command::Authorize(args) => {
             process_authorize_stake_accounts(&client, &args)?;

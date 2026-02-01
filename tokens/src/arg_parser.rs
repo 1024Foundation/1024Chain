@@ -50,7 +50,7 @@ where
         )
         .subcommand(
             SubCommand::with_name("distribute-tokens")
-                .about("Distribute SOL")
+                .about("Distribute N1024")
                 .arg(
                     Arg::with_name("db_path")
                         .long("db-path")
@@ -77,7 +77,7 @@ where
                         .takes_value(true)
                         .value_name("AMOUNT")
                         .validator(is_amount)
-                        .help("The amount to send to each recipient, in SOL"),
+                        .help("The amount to send to each recipient, in N1024"),
                 )
                 .arg(
                     Arg::with_name("dry_run")
@@ -161,8 +161,8 @@ where
                         .default_value("1.0")
                         .long("unlocked-sol")
                         .takes_value(true)
-                        .value_name("SOL_AMOUNT")
-                        .help("Amount of SOL to put in system account to pay for fees"),
+                        .value_name("N1024_AMOUNT")
+                        .help("Amount of N1024 to put in system account to pay for fees"),
                 )
                 .arg(
                     Arg::with_name("lockup_authority")
@@ -241,8 +241,8 @@ where
                         .default_value("1.0")
                         .long("unlocked-sol")
                         .takes_value(true)
-                        .value_name("SOL_AMOUNT")
-                        .help("Amount of SOL to put in system account to pay for fees"),
+                        .value_name("N1024_AMOUNT")
+                        .help("Amount of N1024 to put in system account to pay for fees"),
                 )
                 .arg(
                     Arg::with_name("stake_authority")

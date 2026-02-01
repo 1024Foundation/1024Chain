@@ -100,7 +100,7 @@ impl WalletSubCommands for App<'_, '_> {
                     Arg::with_name("lamports")
                         .long("lamports")
                         .takes_value(false)
-                        .help("Display balance in lamports instead of SOL"),
+                        .help("Display balance in lamports instead of N1024"),
                 ),
         )
         .subcommand(
@@ -115,7 +115,7 @@ impl WalletSubCommands for App<'_, '_> {
         )
         .subcommand(
             SubCommand::with_name("airdrop")
-                .about("Request SOL from a faucet")
+                .about("Request N1024 from a faucet")
                 .arg(
                     Arg::with_name("amount")
                         .index(1)
@@ -123,7 +123,7 @@ impl WalletSubCommands for App<'_, '_> {
                         .takes_value(true)
                         .validator(is_amount)
                         .required(true)
-                        .help("The airdrop amount to request, in SOL"),
+                        .help("The airdrop amount to request, in N1024"),
                 )
                 .arg(pubkey!(
                     Arg::with_name("to")
@@ -145,7 +145,7 @@ impl WalletSubCommands for App<'_, '_> {
                     Arg::with_name("lamports")
                         .long("lamports")
                         .takes_value(false)
-                        .help("Display balance in lamports instead of SOL"),
+                        .help("Display balance in lamports instead of N1024"),
                 ),
         )
         .subcommand(
@@ -274,7 +274,7 @@ impl WalletSubCommands for App<'_, '_> {
                         .takes_value(true)
                         .validator(is_amount_or_all)
                         .required(true)
-                        .help("The amount to send, in SOL; accepts keyword ALL"),
+                        .help("The amount to send, in N1024; accepts keyword ALL"),
                 )
                 .arg(pubkey!(
                     Arg::with_name("from")

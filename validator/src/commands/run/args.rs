@@ -842,7 +842,7 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                  identities. Overriding the amount of stake this validator considers as valid for \
                  other peers in network. The stake amount is used for calculating the number of \
                  QUIC streams permitted from the peer and vote packet sender stage. Format of the \
-                 file: `staked_map_id: {<pubkey>: <SOL stake amount>}",
+                 file: `staked_map_id: {<pubkey>: <N1024 stake amount>}",
             ),
     )
     .arg(

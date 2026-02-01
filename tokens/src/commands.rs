@@ -139,7 +139,7 @@ pub enum Error {
     ProgramError(#[from] ProgramError),
     #[error("Exit signal received")]
     ExitSignal,
-    #[error("Bad input data for SOL value: {input}")]
+    #[error("Bad input data for N1024 value: {input}")]
     BadInputNumberError { input: String },
 }
 
@@ -531,7 +531,7 @@ fn read_allocations(
             })
             .collect::<Result<Vec<TypedAllocation>, Error>>()?
     } else if with_lockup {
-        // We only support SOL token in "require lockup" mode.
+        // We only support N1024 token in "require lockup" mode.
         rdr.deserialize()
             .map(|recipient| {
                 let (recipient, amount, lockup_date): (String, String, String) = recipient?;

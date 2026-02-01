@@ -337,7 +337,7 @@ impl VoteSubCommands for App<'_, '_> {
                     Arg::with_name("lamports")
                         .long("lamports")
                         .takes_value(false)
-                        .help("Display balance in lamports instead of SOL"),
+                        .help("Display balance in lamports instead of N1024"),
                 )
                 .arg(
                     Arg::with_name("with_rewards")
@@ -388,7 +388,7 @@ impl VoteSubCommands for App<'_, '_> {
                         .index(2)
                         .value_name("RECIPIENT_ADDRESS")
                         .required(true),
-                    "The recipient of withdrawn SOL."
+                    "The recipient of withdrawn N1024."
                 ))
                 .arg(
                     Arg::with_name("amount")
@@ -398,7 +398,7 @@ impl VoteSubCommands for App<'_, '_> {
                         .required(true)
                         .validator(is_amount_or_all)
                         .help(
-                            "The amount to withdraw, in SOL; accepts keyword ALL, which for this \
+                            "The amount to withdraw, in N1024; accepts keyword ALL, which for this \
                              command means account balance minus rent-exempt minimum",
                         ),
                 )
@@ -431,7 +431,7 @@ impl VoteSubCommands for App<'_, '_> {
                         .index(2)
                         .value_name("RECIPIENT_ADDRESS")
                         .required(true),
-                    "The recipient of all withdrawn SOL."
+                    "The recipient of all withdrawn N1024."
                 ))
                 .arg(
                     Arg::with_name("authorized_withdrawer")
@@ -1440,7 +1440,7 @@ pub fn process_withdraw_from_vote_account(
             let balance_remaining = current_balance.saturating_sub(withdraw_amount);
             if balance_remaining < minimum_balance && balance_remaining != 0 {
                 return Err(CliError::BadParameter(format!(
-                    "Withdraw amount too large. The vote account balance must be at least {} SOL \
+                    "Withdraw amount too large. The vote account balance must be at least {} N1024 \
                      to remain rent exempt",
                     build_balance_message(minimum_balance, false, false)
                 ))

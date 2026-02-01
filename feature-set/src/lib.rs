@@ -1547,7 +1547,7 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         ),
         (
             stake_raise_minimum_delegation_to_1_sol::id(),
-            "Raise minimum stake delegation to 1.0 SOL #24357",
+            "Raise minimum stake delegation to 1.0 N1024 #24357",
         ),
         (
             stake_minimum_delegation_for_rewards::id(),
