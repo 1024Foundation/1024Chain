@@ -1235,6 +1235,51 @@ pub mod fee_burn_100_percent {
     solana_pubkey::declare_id!("5a6eYqtytjSsWkUsL5BJwCpJJZz8jjA4B5kE6GYJxWnh");
 }
 
+// =============================================================================
+// 1024Chain Inflation Rate Features
+// =============================================================================
+// Control the annual inflation rate for staking rewards.
+// Only one should be active at a time; highest active percentage takes precedence.
+// Default: 0% inflation - 1024Chain's initial fixed supply model
+// Range: 0% to 8% (Solana's initial rate was ~8%)
+// =============================================================================
+
+pub mod inflation_0_percent {
+    solana_pubkey::declare_id!("13Vh1uZ612226nRFiZSstazZTs7i4FVcf7JLEXrc9y7E");
+}
+
+pub mod inflation_1_percent {
+    solana_pubkey::declare_id!("FWfRPonW7WeUQA6P4DUdqF67wvE5hRLCzfhF7vc6Ui3K");
+}
+
+pub mod inflation_2_percent {
+    solana_pubkey::declare_id!("6WC9EM8txWnRxoDM9TuCtmr2hFozvYgBr54PxtvcAt5F");
+}
+
+pub mod inflation_3_percent {
+    solana_pubkey::declare_id!("Hjzg7vpUrXdJrpp2i5Y9upcb81S1gG555pFddKTphbj2");
+}
+
+pub mod inflation_4_percent {
+    solana_pubkey::declare_id!("4rST9erMM8vqiiJFcYBTD3A5KChtwcvf1c3MaPmdRhjU");
+}
+
+pub mod inflation_5_percent {
+    solana_pubkey::declare_id!("41dv26iXQEoXUBMZKHsDykTQyuYqqfs7967DtjjfKC7V");
+}
+
+pub mod inflation_6_percent {
+    solana_pubkey::declare_id!("5rDp4xDV8JKNzYsy2TwJ5ZMUGcaeRxU1EitWHN1XMzzb");
+}
+
+pub mod inflation_7_percent {
+    solana_pubkey::declare_id!("2hZidg6bh7p5X4XD7b6t9qy3WBy2L38QHhj8JGgEgWHu");
+}
+
+pub mod inflation_8_percent {
+    solana_pubkey::declare_id!("GdGigpJq754LvPmFwtys6Yjz4LMbarAW6ZFEw2U9ihPV");
+}
+
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
     [
         (secp256k1_program_enabled::id(), "secp256k1 program"),
@@ -2214,6 +2259,43 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             fee_burn_100_percent::id(),
             "1024Chain: 100% fee burn (0% to Leader)",
+        ),
+        // 1024Chain Inflation Rate Features
+        (
+            inflation_0_percent::id(),
+            "1024Chain: 0% annual inflation - fixed supply (default)",
+        ),
+        (
+            inflation_1_percent::id(),
+            "1024Chain: 1% annual inflation",
+        ),
+        (
+            inflation_2_percent::id(),
+            "1024Chain: 2% annual inflation",
+        ),
+        (
+            inflation_3_percent::id(),
+            "1024Chain: 3% annual inflation",
+        ),
+        (
+            inflation_4_percent::id(),
+            "1024Chain: 4% annual inflation",
+        ),
+        (
+            inflation_5_percent::id(),
+            "1024Chain: 5% annual inflation",
+        ),
+        (
+            inflation_6_percent::id(),
+            "1024Chain: 6% annual inflation",
+        ),
+        (
+            inflation_7_percent::id(),
+            "1024Chain: 7% annual inflation",
+        ),
+        (
+            inflation_8_percent::id(),
+            "1024Chain: 8% annual inflation - Solana initial rate",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
     ]

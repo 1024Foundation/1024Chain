@@ -5344,6 +5344,33 @@ impl Bank {
             self.rent_collector.rent.burn_percent = 50; // 50% rent burn
         }
 
+        // =============================================================================
+        // 1024Chain Inflation Feature Gates
+        // =============================================================================
+        // Check from highest to lowest rate, first activated feature wins.
+        // This allows dynamic adjustment of inflation rate via Feature Gates.
+        // Default: 0% inflation (fixed supply)
+        // =============================================================================
+        if new_feature_activations.contains(&feature_set::inflation_8_percent::id()) {
+            *self.inflation.write().unwrap() = Inflation::new_fixed(0.08);
+        } else if new_feature_activations.contains(&feature_set::inflation_7_percent::id()) {
+            *self.inflation.write().unwrap() = Inflation::new_fixed(0.07);
+        } else if new_feature_activations.contains(&feature_set::inflation_6_percent::id()) {
+            *self.inflation.write().unwrap() = Inflation::new_fixed(0.06);
+        } else if new_feature_activations.contains(&feature_set::inflation_5_percent::id()) {
+            *self.inflation.write().unwrap() = Inflation::new_fixed(0.05);
+        } else if new_feature_activations.contains(&feature_set::inflation_4_percent::id()) {
+            *self.inflation.write().unwrap() = Inflation::new_fixed(0.04);
+        } else if new_feature_activations.contains(&feature_set::inflation_3_percent::id()) {
+            *self.inflation.write().unwrap() = Inflation::new_fixed(0.03);
+        } else if new_feature_activations.contains(&feature_set::inflation_2_percent::id()) {
+            *self.inflation.write().unwrap() = Inflation::new_fixed(0.02);
+        } else if new_feature_activations.contains(&feature_set::inflation_1_percent::id()) {
+            *self.inflation.write().unwrap() = Inflation::new_fixed(0.01);
+        } else if new_feature_activations.contains(&feature_set::inflation_0_percent::id()) {
+            *self.inflation.write().unwrap() = Inflation::new_disabled();
+        }
+
         self.apply_new_builtin_program_feature_transitions(&new_feature_activations);
 
         if new_feature_activations.contains(&feature_set::raise_block_limits_to_100m::id()) {

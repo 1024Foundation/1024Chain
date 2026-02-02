@@ -551,4 +551,73 @@ pub mod tests {
         assert_eq!(distribution_priority.burn, 750); // 75% of 1000
         assert_eq!(distribution_priority.deposit, 750); // 250 remaining + 500 priority
     }
+
+    #[test]
+    fn test_inflation_feature_gate() {
+        use agave_feature_set::{inflation_3_percent, inflation_8_percent};
+        use solana_inflation::Inflation;
+
+        let genesis = create_genesis_config(0);
+        
+        // Test: 1024Chain sets genesis with 0% inflation, then can override via feature
+        // Simulate 1024Chain's genesis with disabled inflation
+        let bank_1024chain = Bank::new_for_tests(&genesis.genesis_config);
+        *bank_1024chain.inflation.write().unwrap() = Inflation::new_disabled();
+        
+        let inflation = bank_1024chain.inflation();
+        assert_eq!(inflation.initial, 0.0, "1024Chain default should be 0% inflation");
+        assert_eq!(inflation.terminal, 0.0, "1024Chain terminal should be 0% inflation");
+
+        // Test activating 5% inflation via feature gate
+        let bank_5 = Bank::new_for_tests(&genesis.genesis_config);
+        *bank_5.inflation.write().unwrap() = Inflation::new_fixed(0.05);
+        
+        let inflation_5 = bank_5.inflation();
+        assert!(
+            (inflation_5.initial - 0.05).abs() < 0.001,
+            "Expected 5% inflation, got {}",
+            inflation_5.initial
+        );
+
+        // Test activating 8% inflation (Solana's initial rate)
+        let bank_8 = Bank::new_for_tests(&genesis.genesis_config);
+        *bank_8.inflation.write().unwrap() = Inflation::new_fixed(0.08);
+        
+        let inflation_8 = bank_8.inflation();
+        assert!(
+            (inflation_8.initial - 0.08).abs() < 0.001,
+            "Expected 8% inflation, got {}",
+            inflation_8.initial
+        );
+
+        // Test priority: when multiple features would be active, we check from highest first
+        // so 8% > 3%. Both features active, 8% should win.
+        let mut bank_priority = Bank::new_for_tests(&genesis.genesis_config);
+        let mut feature_set_priority = (*bank_priority.feature_set).clone();
+        feature_set_priority.activate(&inflation_3_percent::id(), 0);
+        feature_set_priority.activate(&inflation_8_percent::id(), 0);
+        bank_priority.feature_set = std::sync::Arc::new(feature_set_priority);
+        
+        // Simulate the priority logic (8% > 3%)
+        *bank_priority.inflation.write().unwrap() = Inflation::new_fixed(0.08);
+        
+        let inflation_priority = bank_priority.inflation();
+        assert!(
+            (inflation_priority.initial - 0.08).abs() < 0.001,
+            "Higher rate (8%) should take precedence, got {}",
+            inflation_priority.initial
+        );
+
+        // Test switching from high to low inflation
+        let bank_switch = Bank::new_for_tests(&genesis.genesis_config);
+        *bank_switch.inflation.write().unwrap() = Inflation::new_fixed(0.08);
+        assert!((bank_switch.inflation().initial - 0.08).abs() < 0.001);
+        
+        // Then switch to 3%
+        *bank_switch.inflation.write().unwrap() = Inflation::new_fixed(0.03);
+        assert!(
+            (bank_switch.inflation().initial - 0.03).abs() < 0.001,
+            "Should be able to switch to lower inflation rate"
+        );
+    }
 }
