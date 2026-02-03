@@ -1212,27 +1212,27 @@ pub mod relax_programdata_account_check_migration {
 // =============================================================================
 
 pub mod fee_burn_0_percent {
-    solana_pubkey::declare_id!("FeFi2g1S6k5TDhuMh7JRLfUdRUSC9YLPZgyb9VnfhA85");
+    solana_pubkey::declare_id!("3faSe6dPoHafnUBpb9FvvEtLd5G51ree1j8b1q2wxGar");
 }
 
 pub mod fee_burn_10_percent {
-    solana_pubkey::declare_id!("ANckpf1r4tY7c7xawj5jurmSt3LvgNrKKhH1CHjfw7jd");
+    solana_pubkey::declare_id!("DU6ErN98HJq3NhRM8KPCGvHLvmLttnMBVCUZBNr1Xzq1");
 }
 
 pub mod fee_burn_25_percent {
-    solana_pubkey::declare_id!("6P5LdPJMEPCdiire95wQdYKZCeoEieNfG567FWYyrBhm");
+    solana_pubkey::declare_id!("2mdkADzQBHisAUNzmhjjvK9TXd8MggZwxxe7gtbqpcPS");
 }
 
 pub mod fee_burn_50_percent {
-    solana_pubkey::declare_id!("ConozrJBymmHkY96sVYW8aY8JFKQ72N19DVsSZaVWyoh");
+    solana_pubkey::declare_id!("FjjyDCxNU68mbXxFYqzAagZ7Xfo133ZMnAEY3hb3PZ9J");
 }
 
 pub mod fee_burn_75_percent {
-    solana_pubkey::declare_id!("3TqTnCxdkJEZ4GRWNhX8QCVJNMPih1HUnTc7TA1eCss8");
+    solana_pubkey::declare_id!("2JeZuuqhVtScqAVae128ELq8shF9XnU9enhA9RegvQNc");
 }
 
 pub mod fee_burn_100_percent {
-    solana_pubkey::declare_id!("5a6eYqtytjSsWkUsL5BJwCpJJZz8jjA4B5kE6GYJxWnh");
+    solana_pubkey::declare_id!("DPqBFsCEHm3gK1c5BSXbJZRVAfo8LSXov6uSwYuKjpvg");
 }
 
 // =============================================================================
@@ -1245,39 +1245,39 @@ pub mod fee_burn_100_percent {
 // =============================================================================
 
 pub mod inflation_0_percent {
-    solana_pubkey::declare_id!("13Vh1uZ612226nRFiZSstazZTs7i4FVcf7JLEXrc9y7E");
+    solana_pubkey::declare_id!("FMc1LgWuqpNxSu98fVJNC3uudc7ihYUCdk9HR7EVHfHL");
 }
 
 pub mod inflation_1_percent {
-    solana_pubkey::declare_id!("FWfRPonW7WeUQA6P4DUdqF67wvE5hRLCzfhF7vc6Ui3K");
+    solana_pubkey::declare_id!("6CEKMGj6QVsk1acFTUETmEV8E3f3Y6uEh3zzmKUn341Z");
 }
 
 pub mod inflation_2_percent {
-    solana_pubkey::declare_id!("6WC9EM8txWnRxoDM9TuCtmr2hFozvYgBr54PxtvcAt5F");
+    solana_pubkey::declare_id!("JBPddemhKS5ZgApwiMShxsouS1VCibGyddmoVxLE6QZC");
 }
 
 pub mod inflation_3_percent {
-    solana_pubkey::declare_id!("Hjzg7vpUrXdJrpp2i5Y9upcb81S1gG555pFddKTphbj2");
+    solana_pubkey::declare_id!("6qPB6eoKuzuHPmrWfedGTPeVQD8AjXjuC7fjzpbrPkSa");
 }
 
 pub mod inflation_4_percent {
-    solana_pubkey::declare_id!("4rST9erMM8vqiiJFcYBTD3A5KChtwcvf1c3MaPmdRhjU");
+    solana_pubkey::declare_id!("9bAy2uH7guLfweinCcharjdfMk2xqpWpnaAsYi7zhATf");
 }
 
 pub mod inflation_5_percent {
-    solana_pubkey::declare_id!("41dv26iXQEoXUBMZKHsDykTQyuYqqfs7967DtjjfKC7V");
+    solana_pubkey::declare_id!("2oWJpQ9L15MzpZKaoW2oPRhc4sEJWUeDvkjR1br8vtnB");
 }
 
 pub mod inflation_6_percent {
-    solana_pubkey::declare_id!("5rDp4xDV8JKNzYsy2TwJ5ZMUGcaeRxU1EitWHN1XMzzb");
+    solana_pubkey::declare_id!("ZgvAFaZptQoXdbdwcGoZccQJ5wod6LTUkaFQPKn3k4D");
 }
 
 pub mod inflation_7_percent {
-    solana_pubkey::declare_id!("2hZidg6bh7p5X4XD7b6t9qy3WBy2L38QHhj8JGgEgWHu");
+    solana_pubkey::declare_id!("zZG3vCF62WWcVeWYAAJZUzXWWRvpiStNtXBBsU6jMYV");
 }
 
 pub mod inflation_8_percent {
-    solana_pubkey::declare_id!("GdGigpJq754LvPmFwtys6Yjz4LMbarAW6ZFEw2U9ihPV");
+    solana_pubkey::declare_id!("2FQA5f8vietAJxexqqqcqzS2UB2Nva29yxMmUxERSALE");
 }
 
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
